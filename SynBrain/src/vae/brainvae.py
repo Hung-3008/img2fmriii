@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from functools import partial
-from module import *
+from .module import *
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution_2D
 
 
