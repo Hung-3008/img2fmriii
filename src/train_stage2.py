@@ -33,6 +33,7 @@ from torchcfm.conditional_flow_matching import ConditionalFlowMatcher
 
 from src.model.aligned_flow_mlp import AlignedFlowSiT, AlignedFlowSiTConfig
 from src.model.fmri_mlp_vae import FmriMLPVAE, FmriMLPVAEConfig
+from src.utils.roi_utils import ROIDecomposer
 
 
 # ─── Dataset ──────────────────────────────────────────────────────────────────
@@ -164,7 +165,8 @@ class ODEWrapper(torch.nn.Module):
 
 @torch.no_grad()
 def validate(model, vae, val_loader, fm, device, ode_steps=50,
-             cfg_scale=1.0, num_trials=3, prior_sigma=1.0):
+             cfg_scale=1.0, num_trials=3, prior_sigma=1.0,
+             decomposer=None):
     from torchdiffeq import odeint
 
     model.eval()
@@ -221,7 +223,7 @@ def validate(model, vae, val_loader, fm, device, ode_steps=50,
     z_gen_cross_var = z_gens.var(dim=0).mean().item()
     z_true_cross_var = z_trues.var(dim=0).mean().item()
 
-    return {
+    metrics = {
         "val_flow_loss": total_flow_loss / max(n_batches, 1),
         "val_v_cos": sum(all_v_cos) / len(all_v_cos),
         "val_latent_mse": F.mse_loss(z_gens, z_trues).item(),
@@ -232,6 +234,18 @@ def validate(model, vae, val_loader, fm, device, ode_steps=50,
         "val_fmri_pcc": pearson_corr_voxelwise(preds, trues),
         "val_fmri_spcc": pearson_corr_samplewise(preds, trues),
     }
+
+    # Per-ROI metrics
+    if decomposer is not None:
+        for roi in decomposer.rois:
+            if roi.n_voxels > 10:
+                p = preds[:, roi.indices]
+                t = trues[:, roi.indices]
+                metrics[f"roi_{roi.name}_spcc"] = pearson_corr_samplewise(p, t)
+            else:
+                metrics[f"roi_{roi.name}_spcc"] = 0.0
+
+    return metrics
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -279,6 +293,13 @@ def main():
     )
     logger = logging.getLogger('stage2')
     logger.info(f"Config: {cfg}")
+
+    # ── ROI Decomposer ──
+    roi_dir = data_cfg.get("roi_dir",
+                           "Data/nsddata/ppdata/subj01/func1pt8mm/roi")
+    decomposer = ROIDecomposer(roi_dir)
+    roi_names = decomposer.get_roi_names()
+    logger.info(f"\n{decomposer.summary()}")
 
     # ── Data ──
     subject = data_cfg.get("subject", "subj01")
@@ -330,6 +351,7 @@ def main():
 
     # ── History ──
     history_path = os.path.join(output_dir, "history.csv")
+    roi_fields = [f"roi_{n}_spcc" for n in roi_names]
     fields = [
         "epoch", "train_loss", "lr",
         "grad_avg", "grad_max",
@@ -337,7 +359,7 @@ def main():
         "val_latent_mse", "val_latent_pcc",
         "val_zgen_std", "val_zgen_crossvar_ratio",
         "val_fmri_mse", "val_fmri_pcc", "val_fmri_spcc",
-    ]
+    ] + roi_fields
     with open(history_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=fields).writeheader()
 
@@ -423,7 +445,8 @@ def main():
         # ── Eval ──
         if epoch % eval_interval == 0 or epoch == 1:
             val = validate(ema_model, vae, val_loader, fm, device,
-                           ode_steps, cfg_scale, num_trials, prior_sigma)
+                           ode_steps, cfg_scale, num_trials, prior_sigma,
+                           decomposer=decomposer)
 
             row = {"epoch": epoch,
                    "train_loss": f"{avg_flow:.6f}",
@@ -444,6 +467,10 @@ def main():
                 f"f_spcc={spcc:.4f} | "
                 f"zgen: std={val['val_zgen_std']:.4f} var_ratio={val['val_zgen_crossvar_ratio']:.4f}"
                 f"{' ★' if is_best else ''}")
+            # Log per-ROI PCC
+            roi_str = " | ".join(
+                f"{n}={val.get(f'roi_{n}_spcc', 0):.3f}" for n in roi_names)
+            logger.info(f"  ROI | {roi_str}")
 
             if is_best:
                 best_pcc = spcc
