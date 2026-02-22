@@ -1,5 +1,5 @@
-# Stage 2: Aligned Flow Matching with Cross-Attention SiT
-# DINOv2 (257,1024) → AlignmentMLP → z_approx → SiT → z_fmri → VAE → fMRI
+# Stage 2: Aligned Flow Matching with Attention Pooling Alignment
+# DINOv2 (257,1024) → AttentionPool (4 queries) → z_approx → SiT → z_fmri → VAE → fMRI
 
 data:
   root: "Data/nsd"
@@ -12,12 +12,14 @@ model:
   n_context_tokens: 257     # DINOv2: CLS + 256 patches
   n_latent_tokens: 16       # patchify: 1024 / 16 = 64 per token
   hidden_dim: 512           # SiT hidden dim
-  depth: 6                  # SiT blocks (self-attn + cross-attn + FFN each)
+  depth: 6                  # SiT blocks
   num_heads: 8              # attention heads
   mlp_ratio: 4.0
   dropout: 0.1
-  align_hidden: 1024        # Alignment MLP hidden (smaller to avoid overfit)
-  align_layers: 2           # Alignment MLP depth
+  align_type: "attn_pool"   # attention pooling (uses all 257 tokens)
+  align_hidden: 1024        # hidden dim for alignment projections
+  align_layers: 2           # unused for attn_pool, kept for compat
+  align_n_queries: 4        # number of learnable alignment queries
 
 training:
   num_epochs: 3000
@@ -36,8 +38,8 @@ training:
   save_every: 50
   eval_interval: 5
   align_weight: 1.0
-  contrastive_weight: 0.5      # InfoNCE weight in alignment loss
-  align_temp: 0.07             # InfoNCE temperature
-  prior_sigma: 1.0             # noise scale for informative prior: x0 = z_approx + sigma*noise
+  contrastive_weight: 0.5
+  align_temp: 0.07
+  prior_sigma: 1.0
 
-output_dir: "results/stage2_aligned_flow"
+output_dir: "results/stage2_attn_pool"
