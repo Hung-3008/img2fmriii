@@ -1,0 +1,40 @@
+# fMRI Conv2D VAE — Stage 1 Configuration
+# Encodes fMRI (15724) → latent (4, 16, 16) via Conv2D VAE
+# Latent space designed for Stage 2 Flow Matching
+
+# ── Data ──
+data:
+  root: "NSD/data/mindeye_nsd"
+  subject: "subj01"
+  train_mode: "averaged"       # "averaged" (9000) or "single_trial" (27000)
+  test_mode: "averaged"
+
+# ── Model ──
+model:
+  n_voxels: 15724
+  target_size: 128             # H = W = 128; pad to 16384
+  latent_channels: 4           # Latent channels
+  base_channels: 64            # Base channel count
+  channel_mult: [1, 2, 4, 8]  # → 64, 128, 256, 512
+  attn_at_bottleneck: true
+
+# ── Loss ──
+loss:
+  beta_max: 0.001              # KL weight (annealed)
+  beta_anneal_epochs: 30       # Linear β-annealing
+  lambda_pcc: 0.5              # PCC loss weight (0 to disable)
+
+# ── Training ──
+training:
+  epochs: 200
+  lr: 1.0e-4
+  weight_decay: 0.01
+  batch_size: 64
+  grad_clip: 1.0
+  seed: 42
+  num_workers: 4
+  save_dir: "results/fmri_vae"
+  log_interval: 20
+  val_interval: 1
+  use_amp: true
+  early_stopping_patience: 50

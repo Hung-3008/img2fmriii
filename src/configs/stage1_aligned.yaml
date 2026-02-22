@@ -1,0 +1,30 @@
+# Stage 1: Aligned fMRI Autoencoder
+
+data:
+  train_fmri: "NSD/data/mindeye_nsd/processed/subj01_train_avg.npy"
+  test_fmri: "NSD/data/mindeye_nsd/processed/subj01_test_avg.npy"
+  train_feat_idx: "NSD/data/mindeye_nsd/processed/subj01_train_avg_feat_idx.npy"
+  test_feat_idx: "NSD/data/mindeye_nsd/processed/subj01_test_avg_feat_idx.npy"
+  clip_path: "NSD/data/features/clip_vitl14_openai_subj01.npy"
+
+model:
+  n_voxels: 15724
+  bottleneck: 256
+  n_tokens: 257
+  token_inner: 64
+  repr_dim: 256
+  clip_dim: 1024
+  n_blocks: 4
+  dropout: 0.1
+
+training:
+  num_epochs: 300
+  batch_size: 128
+  lr: 3.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  warmup_epochs: 5
+  lambda_align: 1.0
+  temperature: 0.07
+
+output_dir: "results/stage1_aligned"
