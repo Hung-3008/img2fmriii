@@ -43,7 +43,7 @@ OPEN_CLIP_MODEL_PATH = os.path.abspath(os.path.join(BASE_DIR, '../checkpoints/sd
 SUBJECTS = [1, 2, 5, 7]
 
 # Batch size (matching the original notebook)
-BATCH_SIZE = 1000
+BATCH_SIZE = 300
 
 # ==============================================================================
 # Import SGM modules
@@ -141,6 +141,8 @@ for subj in SUBJECTS:
             else:
                 zs = torch.cat((zs, z.detach().cpu()), dim=0)
                 zs_pool = torch.cat((zs_pool, z_pool.detach().cpu()), dim=0)
+
+            torch.cuda.empty_cache()
 
         if zs is not None:
             out_clip = os.path.join(save_path, f'nsd_sdxl_clip_{mode}_sub{subj}.npy')
