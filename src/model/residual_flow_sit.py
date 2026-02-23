@@ -421,3 +421,20 @@ class ResidualFlowSiT(nn.Module):
         flow_p = total - reg_p - shared_p
         return {"reg_M": reg_p / 1e6, "shared_M": shared_p / 1e6,
                 "flow_M": flow_p / 1e6, "total_M": total / 1e6}
+
+    def freeze_regression(self):
+        """Freeze shared context pooling and regression head for Phase 2."""
+        # 1. Shared Context
+        self.context_projs.eval()
+        for p in self.context_projs.parameters():
+            p.requires_grad = False
+            
+        self.pool_queries.requires_grad = False
+        self.pool_attn.eval()
+        for p in self.pool_attn.parameters():
+            p.requires_grad = False
+            
+        # 2. Regression Head
+        self.regressor.eval()
+        for p in self.regressor.parameters():
+            p.requires_grad = False

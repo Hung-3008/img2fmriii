@@ -406,8 +406,15 @@ def main():
         current_lr = cosine_lr(
             optimizer, epoch - 1, num_epochs, warmup_epochs, lr)
 
-        # Determine if we're in regression-only warmup phase
+        # Determine training phase
         use_flow = (epoch > reg_warmup_epochs)
+
+        # Freeze regression components at the start of Phase 2
+        if epoch == reg_warmup_epochs + 1:
+            logger.info(">>> Phase 2: Freezing Regression Head and Shared Context <<<")
+            model.freeze_regression()
+            if use_ema:
+                ema_model.freeze_regression()
 
         ep_reg, ep_flow, ep_total, n_steps = 0, 0, 0, 0
         grads_all, grads_max_all = [], []
@@ -421,14 +428,26 @@ def main():
             with torch.no_grad():
                 z1, _, _ = vae.encode(fmri, sample_posterior=False)
 
-            # ── Phase 1: Regression ──
-            z_bar = model.forward_regression(dino)
-            loss_reg = F.mse_loss(z_bar, z1)
-
-            if use_flow:
-                # ── Phase 2: Flow on residual ──
-                # Detach z_bar so flow gradient doesn't affect regression
+            if not use_flow:
+                # ── Phase 1: Regression Only ──
+                # Train regression head to predict z1
+                z_bar = model.forward_regression(dino)
+                loss_reg = F.mse_loss(z_bar, z1)
+                
+                loss_flow = torch.tensor(0.0)
+                loss = loss_reg
                 delta_z = (z1 - z_bar).detach()
+                delta_stds.append(delta_z.std().item())
+                v_pred, ut = None, None
+
+            else:
+                # ── Phase 2: Flow on static residual ──
+                # Regression is frozen, get z_bar without gradients
+                with torch.no_grad():
+                    z_bar = model.forward_regression(dino)
+                    loss_reg = F.mse_loss(z_bar, z1)
+                    delta_z = (z1 - z_bar)
+                
                 delta_stds.append(delta_z.std().item())
 
                 # CFG dropout on context
@@ -457,10 +476,7 @@ def main():
                 v_pred = model.forward_flow(t, xt, context)
                 loss_flow = F.mse_loss(v_pred, ut)
 
-                loss = loss_reg + flow_weight * loss_flow
-            else:
-                loss_flow = torch.tensor(0.0)
-                loss = loss_reg
+                loss = loss_reg.detach() + flow_weight * loss_flow
 
             optimizer.zero_grad()
             loss.backward()
