@@ -1,25 +1,26 @@
-# Multi-Layer DINOv2 Flow Matching — V3 (Anti-Overfit + Logit-Normal)
-# Changes from V2:
-#   - depth: 6 → 4 (reduce capacity 33%)
-#   - dropout: 0.1 → 0.25 (strong regularization)
-#   - weight_decay: 0.01 → 0.05 (5x stronger)
-#   - latent_noise_std: 0.05 → 0.1 (2x more target noise)
-#   - timestep_sampling: logit_normal (SD3-style, focus on mid-range t)
+# Multi-Layer DINOv2 Flow Matching — V4 (ViT-B/14 768d + Logit-Normal)
+# Based on V3 with:
+#   - DINOv2 ViT-B/14 (768d) instead of ViT-L/14 (1024d)
+#   - VAE latent_dim: 768
+#   - context_dim: 768, n_latent_tokens: 12 (768/64=12)
+#   - Logit-Normal timestep sampling
 
 data:
   root: "Data/nsd"
   subject: "subj01"
-  vae_checkpoint: "results/fmri_mlp_vae/best.pt"
+  vae_checkpoint: "results/fmri_mlp_vae_768/best.pt"
   roi_dir: "Data/nsddata/ppdata/subj01/func1pt8mm/roi"
+  dino_suffix: "dinov2_vitb14_multilayer"
 
-dino_layers: [6, 12, 18, 24]
+# DINOv2 layers extracted (for logging only)
+dino_layers: [3, 6, 9, 12]
 
 model:
-  latent_dim: 1024
-  context_dim: 1024
+  latent_dim: 768
+  context_dim: 768
   n_context_tokens: 257
   n_dino_layers: 4
-  n_latent_tokens: 16
+  n_latent_tokens: 12       # 768 / 64 = 12
   hidden_dim: 512
   depth: 4
   num_heads: 8
@@ -49,4 +50,4 @@ training:
   logit_normal_mu: 0.0
   logit_normal_sigma: 1.0
 
-output_dir: "results/stage2_multilayer_v3"
+output_dir: "results/stage2_multilayer_v4"

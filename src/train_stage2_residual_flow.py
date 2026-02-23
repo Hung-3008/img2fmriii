@@ -35,7 +35,7 @@ from src.utils.roi_utils import ROIDecomposer
 
 
 class FmriMultiLayerDataset(Dataset):
-    """Dataset pairing fMRI with multi-layer DINOv2 features (B, L, 257, 1024)."""
+    """Dataset pairing fMRI with multi-layer DINOv2 features."""
 
     def __init__(self, fmri_path, dino_path, split="train", max_samples=0):
         print(f"\nFmriMultiLayerDataset [{split}]: Loading...")
@@ -59,7 +59,12 @@ class FmriMultiLayerDataset(Dataset):
         if max_samples > 0:
             self.fmri = self.fmri[:max_samples]
             self.n_samples = min(max_samples, self.n_samples)
-        print(f"  {split}: {self.n_samples} samples, fMRI {self.fmri.shape}")
+
+        print(f"  Raw fMRI: {raw_fmri.shape if 'raw_fmri' in dir() else '(freed)'} dtype={fmri.dtype}")
+        print(f"  DINOv2: {self.dino_mmap.shape} (multi-layer, mmap)")
+        print(f"  {split}: {self.n_samples} samples")
+        if max_samples > 0:
+            print(f"  Debug: limited to {max_samples}")
 
     def __len__(self):
         return self.n_samples
@@ -268,6 +273,9 @@ def main():
     prior_sigma = train_cfg.get("prior_sigma", 1.0)
     flow_weight = train_cfg.get("flow_weight", 1.0)
     reg_warmup_epochs = train_cfg.get("reg_warmup_epochs", 0)
+    timestep_sampling = train_cfg.get("timestep_sampling", "uniform")
+    logit_normal_mu = train_cfg.get("logit_normal_mu", 0.0)
+    logit_normal_sigma = train_cfg.get("logit_normal_sigma", 1.0)
 
     output_dir = cfg.get("output_dir", "results/stage2_residual_flow")
     os.makedirs(output_dir, exist_ok=True)
@@ -298,7 +306,7 @@ def main():
     sub_num = int(subject.replace("subj", "").lstrip("0"))
     root = data_cfg["root"]
 
-    dino_suffix = "dinov2_vitl14_multilayer"
+    dino_suffix = data_cfg.get("dino_suffix", "dinov2_vitl14_multilayer")
     debug_n = 128 if args.debug else 0
     train_ds = FmriMultiLayerDataset(
         os.path.join(root, subject,
@@ -342,6 +350,7 @@ def main():
     pc = model.param_count()
     logger.info(
         f"ResidualFlowSiT: reg={pc['reg_M']:.1f}M "
+        f"shared={pc.get('shared_M', 0):.1f}M "
         f"flow={pc['flow_M']:.1f}M total={pc['total_M']:.1f}M"
         f" | EMA={'ON' if use_ema else 'OFF'}")
 
@@ -385,7 +394,10 @@ def main():
         csv.DictWriter(f, fieldnames=mixing_fields).writeheader()
 
     # ── Training ──
-    logger.info(f"Training {num_epochs} epochs, eval every {eval_interval}")
+    ts_info = f"timestep_sampling={timestep_sampling}"
+    if timestep_sampling == "logit_normal":
+        ts_info += f" (mu={logit_normal_mu}, sigma={logit_normal_sigma})"
+    logger.info(f"Training {num_epochs} epochs, eval every {eval_interval} | {ts_info}")
     if reg_warmup_epochs > 0:
         logger.info(f"Regression warmup: {reg_warmup_epochs} epochs")
 
@@ -428,8 +440,20 @@ def main():
                         context[drop] = 0.0
 
                 x0 = prior_sigma * torch.randn_like(delta_z)
-                t, xt, ut = fm.sample_location_and_conditional_flow(
-                    x0, delta_z)
+
+                # Timestep sampling
+                if timestep_sampling == "logit_normal":
+                    u = torch.randn(B, device=device)
+                    t_sample = torch.sigmoid(
+                        logit_normal_mu + logit_normal_sigma * u)
+                    xt = t_sample[:, None] * delta_z + (
+                        1 - t_sample[:, None]) * x0
+                    ut = delta_z - x0
+                    t = t_sample
+                else:
+                    t, xt, ut = fm.sample_location_and_conditional_flow(
+                        x0, delta_z)
+
                 v_pred = model.forward_flow(t, xt, context)
                 loss_flow = F.mse_loss(v_pred, ut)
 

@@ -21,8 +21,6 @@ model:
   num_heads: 8
   mlp_ratio: 4.0
   dropout: 0.1
-  align_hidden: 1024
-  align_layers: 2
 
 training:
   num_epochs: 3000

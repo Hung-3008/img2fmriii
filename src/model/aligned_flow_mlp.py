@@ -1,17 +1,16 @@
 """
-Aligned Flow SiT — Stage 2 backbone with Cross-Attention.
+Flow SiT — Stage 2 backbone with Cross-Attention.
 
 Architecture:
-    1. Alignment MLP: DINOv2 CLS → z_approx (1024) — rough fMRI latent estimate
-    2. Patchify: z_t (1024) → (n_latent_tokens, token_dim) latent tokens
-    3. SiT Blocks: Self-Attention among latent tokens +
-                   Cross-Attention to DINOv2 patch tokens (257, 1024)
-    4. Depatchify: latent tokens → flat velocity (1024)
+    1. Patchify: z_t (latent_dim) → (n_latent_tokens, token_dim) latent tokens
+    2. SiT Blocks: Self-Attention among latent tokens +
+                   Cross-Attention to DINOv2 patch tokens (257, D_ctx)
+    3. Depatchify: latent tokens → flat velocity (latent_dim)
 
 Inspired by SynBrain's SiT but adapted for:
-    - Image→Brain direction (CLIP→fMRI vs fMRI→CLIP)
-    - Cross-attention (SynBrain only does self-attention since input=output dim)
-    - Patchified 1D latent (SynBrain operates on native 2D patches)
+    - Image→Brain direction (DINOv2→fMRI)
+    - Cross-attention to DINOv2 tokens
+    - Patchified 1D latent
 """
 
 import math
@@ -66,91 +65,7 @@ class AlignedFlowSiTConfig:
     num_heads: int = 8            # attention heads
     mlp_ratio: float = 4.0       # FFN expansion
     dropout: float = 0.1
-    # Alignment
-    align_hidden: int = 1024
-    align_layers: int = 2
-    align_type: str = 'mlp'       # 'mlp' (CLS only) or 'attn_pool' (full tokens)
-    align_n_queries: int = 4      # number of learnable queries for attn_pool
 
-
-# ─── Alignment MLP ────────────────────────────────────────────────────────────
-
-class AlignmentMLP(nn.Module):
-    """DINOv2 CLS → z_approx (1024). Small to avoid overfitting."""
-
-    def __init__(self, in_dim, out_dim, hidden, n_layers, dropout=0.1):
-        super().__init__()
-        layers = []
-        d = in_dim
-        for _ in range(n_layers - 1):
-            layers += [nn.Linear(d, hidden), nn.GELU(), nn.Dropout(dropout)]
-            d = hidden
-        layers.append(nn.Linear(d, out_dim))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class AttentionPoolAlignment(nn.Module):
-    """DINOv2 full tokens (257, 1024) → z_approx (1024) via learned attention pooling.
-
-    Architecture:
-        1. Learnable queries cross-attend to all DINOv2 tokens (spatial selection)
-        2. FFN refines pooled representation
-        3. Flatten + MLP maps to z_approx
-    """
-
-    def __init__(self, token_dim=1024, latent_dim=1024, hidden=1024,
-                 n_queries=4, n_heads=8, dropout=0.1):
-        super().__init__()
-        self.n_queries = n_queries
-
-        # Learnable queries: "what spatial features matter for fMRI?"
-        self.queries = nn.Parameter(torch.randn(1, n_queries, token_dim) * 0.02)
-
-        # Cross-attention: queries attend to DINOv2 tokens
-        self.norm_q = nn.LayerNorm(token_dim)
-        self.norm_kv = nn.LayerNorm(token_dim)
-        self.cross_attn = nn.MultiheadAttention(
-            token_dim, n_heads, batch_first=True, dropout=dropout)
-
-        # FFN after attention
-        self.norm_ff = nn.LayerNorm(token_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(token_dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, token_dim),
-            nn.Dropout(dropout),
-        )
-
-        # Final projection: flatten queries → latent_dim
-        self.out_proj = nn.Sequential(
-            nn.LayerNorm(n_queries * token_dim),
-            nn.Linear(n_queries * token_dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, latent_dim),
-        )
-
-    def forward(self, dino_tokens):
-        """(B, 257, 1024) → (B, 1024)"""
-        B = dino_tokens.shape[0]
-        q = self.queries.expand(B, -1, -1)        # (B, n_queries, 1024)
-
-        # Cross-attention
-        q_normed = self.norm_q(q)
-        kv_normed = self.norm_kv(dino_tokens)
-        attn_out, _ = self.cross_attn(q_normed, kv_normed, kv_normed)
-        q = q + attn_out                          # residual
-
-        # FFN
-        q = q + self.ffn(self.norm_ff(q))          # (B, n_queries, 1024)
-
-        # Flatten and project
-        pooled = q.reshape(B, -1)                  # (B, n_queries * 1024)
-        return self.out_proj(pooled)                # (B, latent_dim)
 
 
 # ─── SiT Block ────────────────────────────────────────────────────────────────
@@ -241,9 +156,8 @@ class FinalLayer(nn.Module):
 
 class AlignedFlowSiT(nn.Module):
     """
-    Aligned Flow Matching with SiT cross-attention backbone.
+    Flow Matching with SiT cross-attention backbone.
 
-    forward_align(dino_tokens) → z_approx
     forward_flow(t, z_t, dino_tokens) → velocity
     """
 
@@ -256,19 +170,6 @@ class AlignedFlowSiT(nn.Module):
         n_lat = config.n_latent_tokens
         token_dim = config.latent_dim // n_lat  # e.g. 1024/16 = 64
         D = config.hidden_dim
-
-        # ── Alignment ──
-        if config.align_type == 'attn_pool':
-            self.align = AttentionPoolAlignment(
-                token_dim=config.context_dim, latent_dim=config.latent_dim,
-                hidden=config.align_hidden, n_queries=config.align_n_queries,
-                n_heads=config.num_heads, dropout=config.dropout)
-            self._align_type = 'attn_pool'
-        else:
-            self.align = AlignmentMLP(
-                config.context_dim, config.latent_dim,
-                config.align_hidden, config.align_layers, config.dropout)
-            self._align_type = 'mlp'
 
         # ── Patchify / Depatchify ──
         self.latent_proj_in = nn.Linear(token_dim, D)   # 64 → D
@@ -335,21 +236,6 @@ class AlignedFlowSiT(nn.Module):
         """(B, n_tokens, token_dim) → (B, latent_dim)"""
         return tokens.reshape(tokens.shape[0], -1)
 
-    def forward_align(self, dino_tokens):
-        """DINOv2 tokens (B, 257, 1024) or CLS (B, 1024) → z_approx (B, 1024)."""
-        if self._align_type == 'attn_pool':
-            # Attention pooling uses all tokens
-            if dino_tokens.ndim == 2:
-                dino_tokens = dino_tokens.unsqueeze(1)  # fallback
-            return self.align(dino_tokens)
-        else:
-            # MLP uses CLS only
-            if dino_tokens.ndim == 3:
-                cls = dino_tokens[:, 0, :]
-            else:
-                cls = dino_tokens
-            return self.align(cls)
-
     def forward_flow(self, t, z_t, dino_tokens):
         """
         Predict velocity v(z_t, t | dino_tokens).
@@ -395,7 +281,5 @@ class AlignedFlowSiT(nn.Module):
         return v_uncond + cfg_scale * (v_cond - v_uncond)
 
     def param_count(self):
-        align_p = sum(p.numel() for p in self.align.parameters())
         total = sum(p.numel() for p in self.parameters())
-        flow_p = total - align_p
-        return {"align_M": align_p/1e6, "flow_M": flow_p/1e6, "total_M": total/1e6}
+        return {"total_M": total/1e6}

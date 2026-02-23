@@ -1,0 +1,39 @@
+# fMRI MLP VAE — Stage 1 Configuration (768d latent)
+# Encodes fMRI (15724) → latent (768) via MLP VAE
+# Smaller latent for easier Flow Matching convergence
+
+# ── Data ──
+data:
+  root: "Data/nsd"                    # path to NSD data directory
+  subject: "subj01"                   # subject folder name
+  train_rep_mode: "single_trial"      # 'average' | 'single_trial' | 'first'
+  test_rep_mode: "average"            # test always averaged for stable eval
+
+# ── Model ──
+model:
+  n_voxels: 15724
+  hidden_dim: 2048
+  latent_dim: 768
+  n_res_blocks: 4
+  dropout: 0.1
+
+# ── Loss ──
+loss:
+  beta_max: 0.01
+  beta_anneal_epochs: 30
+  lambda_pcc: 0.5
+
+# ── Training ──
+training:
+  epochs: 200
+  lr: 1.0e-4
+  weight_decay: 0.01
+  batch_size: 128
+  grad_clip: 1.0
+  seed: 42
+  num_workers: 4
+  save_dir: "results/fmri_mlp_vae_768"
+  log_interval: 50
+  val_interval: 1
+  use_amp: true
+  early_stopping_patience: 50

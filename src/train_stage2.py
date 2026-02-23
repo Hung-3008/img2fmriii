@@ -340,7 +340,7 @@ def main():
     model = AlignedFlowSiT(AlignedFlowSiTConfig(**model_cfg)).to(device)
     ema_model = copy.deepcopy(model)
     pc = model.param_count()
-    logger.info(f"AlignedFlowSiT: align={pc['align_M']:.1f}M flow={pc['flow_M']:.1f}M total={pc['total_M']:.1f}M")
+    logger.info(f"AlignedFlowSiT: {pc['total_M']:.1f}M params")
 
     # ── Flow Matcher ──
     fm = ConditionalFlowMatcher(sigma=train_cfg.get("sigma", 0.0))

@@ -6,6 +6,7 @@ Extends train_stage2.py with:
     - MultiLayerFlowSiT with per-block learned layer mixing
     - Layer mixing analysis logging
     - Per-ROI evaluation
+    - Logit-Normal timestep sampling (SD3-style)
 
 Usage:
     python -m src.train_stage2_multilayer --config src/configs/stage2_multilayer.yaml
@@ -106,6 +107,25 @@ def ema_update(source, target, decay):
     with torch.no_grad():
         for s, t in zip(source.parameters(), target.parameters()):
             t.data.mul_(decay).add_(s.data, alpha=1 - decay)
+
+
+def logit_normal_sample(batch_size, mu=0.0, sigma=1.0, device='cuda'):
+    """Logit-Normal timestep sampling (Stable Diffusion 3 style).
+
+    Samples t from a logit-normal distribution that focuses on mid-range
+    timesteps (~0.5) where the denoising task is hardest.
+
+    t = sigmoid(N(mu, sigma^2))
+
+    Args:
+        mu: Mean of the underlying normal. 0.0 centers on t=0.5.
+        sigma: Std of the underlying normal. Smaller = more concentrated.
+    """
+    u = torch.randn(batch_size, device=device) * sigma + mu
+    t = torch.sigmoid(u)
+    # Clamp to avoid exact 0 or 1
+    t = t.clamp(1e-5, 1 - 1e-5)
+    return t
 
 
 def cosine_lr(optimizer, epoch, total, warmup, base_lr, min_lr=1e-6):
@@ -257,6 +277,9 @@ def main():
     eval_interval = 1 if args.debug else train_cfg.get("eval_interval", 5)
     prior_sigma = train_cfg.get("prior_sigma", 1.0)
     latent_noise_std = train_cfg.get("latent_noise_std", 0.0)
+    timestep_sampling = train_cfg.get("timestep_sampling", "uniform")
+    logit_normal_mu = train_cfg.get("logit_normal_mu", 0.0)
+    logit_normal_sigma = train_cfg.get("logit_normal_sigma", 1.0)
 
     output_dir = cfg.get("output_dir", "results/stage2_multilayer")
     os.makedirs(output_dir, exist_ok=True)
@@ -287,8 +310,8 @@ def main():
     sub_num = int(subject.replace("subj", "").lstrip("0"))
     root = data_cfg["root"]
 
-    # Multi-layer DINOv2 file naming
-    dino_suffix = "dinov2_vitl14_multilayer"
+    # Multi-layer DINOv2 file naming (configurable for different backbones)
+    dino_suffix = data_cfg.get("dino_suffix", "dinov2_vitl14_multilayer")
 
     debug_n = 128 if args.debug else 0
     train_ds = FmriMultiLayerDataset(
@@ -332,8 +355,7 @@ def main():
     ema_model = copy.deepcopy(model) if use_ema else None
     pc = model.param_count()
     logger.info(
-        f"MultiLayerFlowSiT: align={pc['align_M']:.1f}M "
-        f"flow={pc['flow_M']:.1f}M total={pc['total_M']:.1f}M"
+        f"MultiLayerFlowSiT: {pc['total_M']:.1f}M params"
         f" | EMA={'ON' if use_ema else 'OFF'}")
 
     # ── Flow Matcher ──
@@ -362,17 +384,23 @@ def main():
     patience_counter = 0
     patience = train_cfg.get("patience", 200)
 
-    # ── Layer mixing weight log ──
-    mixing_log_path = os.path.join(output_dir, "layer_mixing.csv")
+    # ── Layer mixing weight log (cross_attention or attention_pool mode) ──
+    context_mode = model_cfg.get("context_mode", "cross_attention")
     dino_layer_names = cfg.get("dino_layers", [6, 12, 18, 24])
-    mixing_fields = ["epoch"] + [
-        f"block{b}_layer{l}" for b in range(model_cfg["depth"])
-        for l in dino_layer_names]
-    with open(mixing_log_path, "w", newline="") as f:
-        csv.DictWriter(f, fieldnames=mixing_fields).writeheader()
+    if context_mode in ["cross_attention", "attention_pool"]:
+        mixing_log_path = os.path.join(output_dir, "layer_mixing.csv")
+        mixing_fields = ["epoch"] + [
+            f"block{b}_layer{l}" for b in range(model_cfg["depth"])
+            for l in dino_layer_names]
+        with open(mixing_log_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=mixing_fields).writeheader()
+    logger.info(f"Context mode: {context_mode}")
 
     # ── Training ──
-    logger.info(f"Training {num_epochs} epochs, eval every {eval_interval}")
+    ts_info = f"timestep_sampling={timestep_sampling}"
+    if timestep_sampling == "logit_normal":
+        ts_info += f" (mu={logit_normal_mu}, sigma={logit_normal_sigma})"
+    logger.info(f"Training {num_epochs} epochs, eval every {eval_interval} | {ts_info}")
 
     for epoch in range(1, num_epochs + 1):
         model.train()
@@ -400,7 +428,14 @@ def main():
                     context[drop] = 0.0
 
             x0 = prior_sigma * torch.randn_like(z1)
-            t, xt, ut = fm.sample_location_and_conditional_flow(x0, z1)
+            if timestep_sampling == "logit_normal":
+                t = logit_normal_sample(
+                    B, mu=logit_normal_mu, sigma=logit_normal_sigma,
+                    device=device)
+                xt = (1 - t[:, None]) * x0 + t[:, None] * z1
+                ut = z1 - x0
+            else:
+                t, xt, ut = fm.sample_location_and_conditional_flow(x0, z1)
             v_pred = model.forward_flow(t, xt, context)
             loss = F.mse_loss(v_pred, ut)
 
@@ -474,20 +509,22 @@ def main():
                 for n in roi_names)
             logger.info(f"  ROI | {roi_str}")
 
-            # Layer mixing weights
-            mix_w = eval_model.get_layer_mixing_weights()  # (depth, n_layers)
-            mix_row = {"epoch": epoch}
-            for b in range(mix_w.shape[0]):
-                for li, l in enumerate(dino_layer_names):
-                    mix_row[f"block{b}_layer{l}"] = f"{mix_w[b,li]:.4f}"
-            with open(mixing_log_path, "a", newline="") as f:
-                csv.DictWriter(f, fieldnames=mixing_fields).writerow(mix_row)
+            # Layer mixing weights (cross_attention/attention_pool mode only)
+            mix_w = eval_model.get_layer_mixing_weights()
+            if mix_w is not None:
+                mix_row = {"epoch": epoch}
+                for b in range(mix_w.shape[0]):
+                    for li, l in enumerate(dino_layer_names):
+                        mix_row[f"block{b}_layer{l}"] = f"{mix_w[b,li]:.4f}"
+                with open(mixing_log_path, "a", newline="") as f:
+                    csv.DictWriter(f, fieldnames=mixing_fields).writerow(
+                        mix_row)
 
-            mix_str = " | ".join(
-                f"B{b}:[" + ",".join(
-                    f"{mix_w[b,i]:.2f}" for i in range(mix_w.shape[1])
-                ) + "]" for b in range(mix_w.shape[0]))
-            logger.info(f"  MIX | {mix_str}")
+                mix_str = " | ".join(
+                    f"B{b}:[" + ",".join(
+                        f"{mix_w[b,i]:.2f}" for i in range(mix_w.shape[1])
+                    ) + "]" for b in range(mix_w.shape[0]))
+                logger.info(f"  MIX | {mix_str}")
 
             if is_best:
                 best_pcc = spcc
@@ -496,8 +533,9 @@ def main():
                     "epoch": epoch,
                     "model_state_dict": eval_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "best_pcc": best_pcc, "config": cfg,
-                    "layer_mixing": mix_w.numpy()}
+                    "best_pcc": best_pcc, "config": cfg}
+                if mix_w is not None:
+                    save_dict["layer_mixing"] = mix_w.numpy()
                 torch.save(save_dict,
                     os.path.join(output_dir, "best_model.pt"))
                 logger.info(f"  ★ Saved best (PCC={best_pcc:.4f})")

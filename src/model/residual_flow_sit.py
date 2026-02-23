@@ -1,17 +1,15 @@
 """
-ResidualFlowSiT — Residual Flow Matching with multi-layer DINOv2.
+ResidualFlowSiT V2 — Residual Flow Matching with multi-layer DINOv2.
 
 Two-stage architecture:
-    1. Regression Head: Multi-layer DINOv2 → z̄ (deterministic mean prediction)
-       - Learnable queries cross-attend to multi-layer DINOv2 features
-       - Per-block learned layer mixing (like MultiLayerFlowSiT)
+    1. Regression Head: Multi-layer DINOv2 → z̄ (deterministic mean)
     2. Flow Network: Learns residual Δz = z_true − z̄
-       - Multi-layer SiT blocks with cross-attention
-       - Same architecture as MultiLayerFlowSiT but for residuals
 
-The regression head captures the deterministic ~36.5% variance while
-the flow network only needs to model the remaining residual distribution
-(lower variance → easier to learn, less overfitting).
+Improvements over V1:
+    - Attention Pooling: 257 → n_pool_tokens per DINOv2 layer
+    - Shared context projections between reg + flow
+    - Stochastic Depth for regularization
+    - Context noise augmentation
 """
 
 import math
@@ -33,64 +31,82 @@ from src.model.aligned_flow_mlp import (
 @dataclass
 class ResidualFlowSiTConfig:
     # ── Shared ──
-    latent_dim: int = 1024
-    context_dim: int = 1024        # DINOv2 token dim per layer
+    latent_dim: int = 768
+    context_dim: int = 768         # DINOv2 token dim per layer
     n_context_tokens: int = 257    # CLS + 256 patches
-    n_dino_layers: int = 4         # number of DINOv2 layers extracted
+    n_dino_layers: int = 4
+    n_pool_tokens: int = 32        # pool 257 → 32 tokens per layer
 
     # ── Regression Head ──
-    reg_n_queries: int = 16        # learnable query tokens
-    reg_depth: int = 4             # regression transformer depth
+    reg_n_queries: int = 16
+    reg_depth: int = 3
     reg_hidden_dim: int = 512
     reg_num_heads: int = 8
     reg_mlp_ratio: float = 4.0
-    reg_dropout: float = 0.1
+    reg_dropout: float = 0.15
 
     # ── Flow Network ──
-    n_latent_tokens: int = 16
+    n_latent_tokens: int = 12      # 768 / 64 = 12
     hidden_dim: int = 512
     depth: int = 4
     num_heads: int = 8
     mlp_ratio: float = 4.0
-    dropout: float = 0.25
+    dropout: float = 0.15
+
+    # ── Regularization ──
+    stochastic_depth_rate: float = 0.2   # max drop rate (linearly scaled)
+    context_noise_std: float = 0.1       # noise augmentation on DINOv2
 
 
-# ─── Multi-Layer Cross-Attention Block (shared by regression + flow) ─────────
+# ─── Stochastic Depth ────────────────────────────────────────────────────────
+
+def drop_path(x, drop_prob: float, training: bool):
+    """Drop entire samples (batch dimension) for stochastic depth."""
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor = torch.floor(random_tensor + keep_prob)
+    return x * random_tensor / keep_prob
+
+
+# ─── Cross-Attention Block with Layer Mixing ──────────────────────────────────
 
 class MultiLayerCrossBlock(nn.Module):
     """
-    Transformer block with per-block learned layer mixing for multi-layer DINOv2.
-
-    Learnable softmax weights α ∈ R^n_layers mix the projected DINOv2 layers
-    before cross-attention. This enables automatic discovery of which DINOv2
-    layer is most useful at each processing stage.
+    Transformer block with per-block learned layer mixing.
+    Supports: adaLN (flow) or standard pre-norm (regression).
+    Supports: stochastic depth.
     """
 
-    def __init__(self, dim, context_dim, num_heads, n_layers,
-                 mlp_ratio=4.0, dropout=0.0, use_adaln=False):
+    def __init__(self, dim, num_heads, n_layers,
+                 mlp_ratio=4.0, dropout=0.0, use_adaln=False,
+                 drop_path_rate=0.0):
         super().__init__()
         self.use_adaln = use_adaln
+        self.drop_path_rate = drop_path_rate
 
-        # Learnable layer mixing weights (initialized uniform)
+        # Learnable layer mixing weights
         self.layer_logits = nn.Parameter(torch.zeros(n_layers))
 
-        # Cross-attention: queries attend to mixed multi-layer DINOv2
+        # Cross-attention
         self.norm_q = nn.LayerNorm(dim, elementwise_affine=not use_adaln,
-                                   eps=1e-6)
-        self.norm_kv = nn.LayerNorm(dim, elementwise_affine=not use_adaln,
                                     eps=1e-6)
+        self.norm_kv = nn.LayerNorm(dim, elementwise_affine=not use_adaln,
+                                     eps=1e-6)
         self.cross_attn = nn.MultiheadAttention(
             dim, num_heads, batch_first=True, dropout=dropout)
 
-        # Self-attention among tokens
+        # Self-attention
         self.norm_sa = nn.LayerNorm(dim, elementwise_affine=not use_adaln,
-                                    eps=1e-6)
+                                     eps=1e-6)
         self.self_attn = nn.MultiheadAttention(
             dim, num_heads, batch_first=True, dropout=dropout)
 
         # FFN
         self.norm_ff = nn.LayerNorm(dim, elementwise_affine=not use_adaln,
-                                    eps=1e-6)
+                                     eps=1e-6)
         ffn_dim = int(dim * mlp_ratio)
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim),
@@ -100,23 +116,14 @@ class MultiLayerCrossBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # adaLN modulation (only for flow blocks, not regression)
         if use_adaln:
             self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(dim, 9 * dim))
 
     def get_layer_weights(self):
-        """Return softmax weights α for analysis."""
         return F.softmax(self.layer_logits, dim=0)
 
     def forward(self, x, multi_ctx, c=None):
-        """
-        Args:
-            x: (B, T, D)                    tokens (queries or latent)
-            multi_ctx: list of (B, T_ctx, D)  per-layer projected contexts
-            c: (B, D) optional               time conditioning (flow only)
-        """
-        # Mix layers: α = softmax(logits), ctx = Σ αᵢ * ctxᵢ
-        alpha = F.softmax(self.layer_logits, dim=0)  # (n_layers,)
+        alpha = F.softmax(self.layer_logits, dim=0)
         ctx = sum(a * ctx_l for a, ctx_l in zip(alpha, multi_ctx))
 
         if self.use_adaln and c is not None:
@@ -128,31 +135,33 @@ class MultiLayerCrossBlock(nn.Module):
             # Self-Attention with adaLN
             h = modulate(self.norm_sa(x), s_sa, sc_sa)
             sa_out, _ = self.self_attn(h, h, h)
-            x = x + g_sa.unsqueeze(1) * sa_out
+            x = x + g_sa.unsqueeze(1) * drop_path(
+                sa_out, self.drop_path_rate, self.training)
 
             # Cross-Attention with adaLN
             q = modulate(self.norm_q(x), s_ca, sc_ca)
             kv = self.norm_kv(ctx)
             ca_out, _ = self.cross_attn(q, kv, kv)
-            x = x + g_ca.unsqueeze(1) * ca_out
+            x = x + g_ca.unsqueeze(1) * drop_path(
+                ca_out, self.drop_path_rate, self.training)
 
             # FFN with adaLN
             h = modulate(self.norm_ff(x), s_ff, sc_ff)
-            x = x + g_ff.unsqueeze(1) * self.ffn(h)
+            x = x + g_ff.unsqueeze(1) * drop_path(
+                self.ffn(h), self.drop_path_rate, self.training)
         else:
-            # Standard pre-norm (for regression head)
-            # Self-Attention
+            # Standard pre-norm (regression)
             sa_in = self.norm_sa(x)
-            x = x + self.self_attn(sa_in, sa_in, sa_in,
-                                    need_weights=False)[0]
+            sa_out, _ = self.self_attn(sa_in, sa_in, sa_in)
+            x = x + drop_path(sa_out, self.drop_path_rate, self.training)
 
-            # Cross-Attention
             q = self.norm_q(x)
             kv = self.norm_kv(ctx)
-            x = x + self.cross_attn(q, kv, kv, need_weights=False)[0]
+            ca_out, _ = self.cross_attn(q, kv, kv)
+            x = x + drop_path(ca_out, self.drop_path_rate, self.training)
 
-            # FFN
-            x = x + self.ffn(self.norm_ff(x))
+            x = x + drop_path(
+                self.ffn(self.norm_ff(x)), self.drop_path_rate, self.training)
 
         return x
 
@@ -160,33 +169,26 @@ class MultiLayerCrossBlock(nn.Module):
 # ─── Regression Head ─────────────────────────────────────────────────────────
 
 class MultiLayerRegressor(nn.Module):
-    """
-    Multi-layer DINOv2 → z̄ (deterministic mean prediction).
-
-    Learnable queries cross-attend to multi-layer DINOv2 features with
-    per-block learned layer mixing. No time conditioning.
-    """
+    """Multi-layer DINOv2 → z̄ (deterministic mean prediction)."""
 
     def __init__(self, config: ResidualFlowSiTConfig):
         super().__init__()
         D = config.reg_hidden_dim
         L = config.n_dino_layers
+        sd_rate = config.stochastic_depth_rate
 
         # Learnable query tokens
         self.queries = nn.Parameter(
             torch.randn(1, config.reg_n_queries, D) * 0.02)
 
-        # Per-layer DINOv2 projections (separate from flow network)
-        self.context_projs = nn.ModuleList([
-            nn.Linear(config.context_dim, D) for _ in range(L)
-        ])
-
-        # Transformer blocks with multi-layer mixing
+        # Transformer blocks with stochastic depth
+        depth = config.reg_depth
         self.blocks = nn.ModuleList([
             MultiLayerCrossBlock(
-                D, config.context_dim, config.reg_num_heads, L,
-                config.reg_mlp_ratio, config.reg_dropout, use_adaln=False)
-            for _ in range(config.reg_depth)
+                D, config.reg_num_heads, L,
+                config.reg_mlp_ratio, config.reg_dropout, use_adaln=False,
+                drop_path_rate=sd_rate * i / max(depth - 1, 1))
+            for i in range(depth)
         ])
 
         # Output: flatten queries → z̄
@@ -198,32 +200,19 @@ class MultiLayerRegressor(nn.Module):
             nn.Linear(D, config.latent_dim),
         )
 
-    def forward(self, dino_multilayer):
-        """
-        dino_multilayer: (B, L, 257, 1024) → z̄ (B, latent_dim)
-        """
-        B = dino_multilayer.shape[0]
-        L = dino_multilayer.shape[1]
+    def forward(self, multi_ctx):
+        """multi_ctx: list of (B, n_pool, D) → z̄ (B, latent_dim)"""
+        B = multi_ctx[0].shape[0]
 
-        # Project each DINOv2 layer
-        multi_ctx = []
-        for i in range(L):
-            layer_tokens = dino_multilayer[:, i, :, :].float()
-            ctx = self.context_projs[i](layer_tokens)
-            multi_ctx.append(ctx)
-
-        # Learnable queries attend to multi-layer context
         x = self.queries.expand(B, -1, -1)
         for block in self.blocks:
             x = block(x, multi_ctx)
 
         x = self.norm_out(x)
         x = x.reshape(B, -1)
-        z_bar = self.head(x)
-        return z_bar
+        return self.head(x)
 
     def get_layer_mixing_weights(self):
-        """Return (reg_depth, n_layers) matrix."""
         weights = []
         for block in self.blocks:
             weights.append(block.get_layer_weights().detach().cpu())
@@ -234,14 +223,12 @@ class MultiLayerRegressor(nn.Module):
 
 class ResidualFlowSiT(nn.Module):
     """
-    Residual Flow Matching with multi-layer DINOv2.
+    Residual Flow Matching V2.
 
-    Two modules:
-        1. regression: DINOv2 → z̄ (deterministic mean, ~36.5% variance)
-        2. flow: learns Δz = z_true − z̄ via conditional flow matching
-
-    At inference:
-        z_gen = z̄ + ODE(flow, x0, DINOv2)
+    Architecture:
+        1. Shared context: DINOv2 → project → attention pool → pooled tokens
+        2. Regression: pooled tokens → z̄ (deterministic)
+        3. Flow: learns Δz = z_true − z̄ via conditional flow matching
 
     Key methods:
         forward_regression(dino)  → z̄
@@ -260,12 +247,33 @@ class ResidualFlowSiT(nn.Module):
         L = config.n_dino_layers
         n_lat = config.n_latent_tokens
         token_dim = config.latent_dim // n_lat
+        sd_rate = config.stochastic_depth_rate
+
+        # ── Shared Context Processing ──
+        # Project each DINOv2 layer (shared between reg + flow)
+        self.context_projs = nn.ModuleList([
+            nn.Linear(config.context_dim, D) for _ in range(L)
+        ])
+        self.register_buffer('context_pos_embed',
+            torch.from_numpy(
+                get_1d_sincos_pos_embed(D, config.n_context_tokens)
+            ).unsqueeze(0))
+
+        # Attention pooling: 257 → n_pool_tokens per layer
+        self.pool_queries = nn.Parameter(
+            torch.randn(L, config.n_pool_tokens, D))
+        self.pool_attn = nn.ModuleList([
+            nn.MultiheadAttention(
+                D, config.num_heads, batch_first=True,
+                dropout=config.dropout)
+            for _ in range(L)
+        ])
+        nn.init.normal_(self.pool_queries, std=0.02)
 
         # ── Regression Head ──
         self.regressor = MultiLayerRegressor(config)
 
         # ── Flow Network ──
-        # Patchify / Depatchify
         self.latent_proj_in = nn.Linear(token_dim, D)
         self.latent_proj_out = nn.Linear(D, token_dim)
         self.n_latent_tokens = n_lat
@@ -279,21 +287,14 @@ class ResidualFlowSiT(nn.Module):
         self.t_embed = nn.Sequential(
             nn.Linear(D, D), nn.SiLU(), nn.Linear(D, D))
 
-        # Per-layer DINOv2 projections (separate from regressor)
-        self.flow_context_projs = nn.ModuleList([
-            nn.Linear(config.context_dim, D) for _ in range(L)
-        ])
-        self.register_buffer('context_pos_embed',
-            torch.from_numpy(
-                get_1d_sincos_pos_embed(D, config.n_context_tokens)
-            ).unsqueeze(0))
-
-        # Flow SiT blocks with multi-layer mixing + adaLN
+        # Flow SiT blocks with stochastic depth
+        flow_depth = config.depth
         self.flow_blocks = nn.ModuleList([
             MultiLayerCrossBlock(
-                D, config.context_dim, config.num_heads, L,
-                config.mlp_ratio, config.dropout, use_adaln=True)
-            for _ in range(config.depth)
+                D, config.num_heads, L,
+                config.mlp_ratio, config.dropout, use_adaln=True,
+                drop_path_rate=sd_rate * i / max(flow_depth - 1, 1))
+            for i in range(flow_depth)
         ])
         self.final_layer = FinalLayer(D)
 
@@ -307,7 +308,7 @@ class ResidualFlowSiT(nn.Module):
                     nn.init.zeros_(module.bias)
         self.apply(_basic_init)
 
-        # Gate biases → 0.1 so residual paths are active
+        # Gate biases → 0.1
         D = self.config.hidden_dim
         for block in self.flow_blocks:
             if block.use_adaln:
@@ -333,37 +334,50 @@ class ResidualFlowSiT(nn.Module):
     def _depatchify(self, tokens):
         return tokens.reshape(tokens.shape[0], -1)
 
+    def _pool_context(self, dino_multilayer):
+        """Shared context: project + pool 257 → n_pool_tokens per layer.
+        Returns list of (B, n_pool, D)."""
+        B = dino_multilayer.shape[0]
+        L = self.config.n_dino_layers
+
+        # Optional noise augmentation during training
+        if self.training and self.config.context_noise_std > 0:
+            dino_multilayer = dino_multilayer + (
+                torch.randn_like(dino_multilayer) *
+                self.config.context_noise_std)
+
+        multi_ctx = []
+        for i in range(L):
+            layer_tokens = dino_multilayer[:, i, :, :].float()
+            ctx = self.context_projs[i](layer_tokens)   # (B, 257, D)
+            ctx = ctx + self.context_pos_embed[:, :ctx.shape[1], :]
+
+            # Attention pool: 257 → n_pool_tokens
+            q = self.pool_queries[i].unsqueeze(0).expand(B, -1, -1)
+            ctx_pooled, _ = self.pool_attn[i](q, ctx, ctx)
+            multi_ctx.append(ctx_pooled)
+
+        return multi_ctx
+
     # ── Forward methods ──
 
     def forward_regression(self, dino_multilayer):
         """Deterministic prediction: DINOv2 → z̄.
-        dino_multilayer: (B, L, 257, 1024) → (B, latent_dim)"""
-        return self.regressor(dino_multilayer)
+        dino_multilayer: (B, L, 257, ctx_dim) → (B, latent_dim)"""
+        multi_ctx = self._pool_context(dino_multilayer)
+        return self.regressor(multi_ctx)
 
     def forward_flow(self, t, z_t, dino_multilayer):
-        """
-        Predict velocity v(z_t, t | DINOv2) for residual Δz.
-
-        Args:
-            t: (B,) timestep ∈ [0, 1]
-            z_t: (B, latent_dim) noisy residual
-            dino_multilayer: (B, L, 257, 1024) multi-layer features
-        """
+        """Predict velocity v(z_t, t | DINOv2) for residual Δz."""
         B = z_t.shape[0]
-        L = self.config.n_dino_layers
 
         # Patchify z_t (residual)
         lat_tokens = self._patchify(z_t)
         lat_tokens = self.latent_proj_in(lat_tokens)
         lat_tokens = lat_tokens + self.latent_pos_embed
 
-        # Project each DINOv2 layer separately
-        multi_ctx = []
-        for i in range(L):
-            layer_tokens = dino_multilayer[:, i, :, :].float()
-            ctx = self.flow_context_projs[i](layer_tokens)
-            ctx = ctx + self.context_pos_embed[:, :ctx.shape[1], :]
-            multi_ctx.append(ctx)
+        # Shared context
+        multi_ctx = self._pool_context(dino_multilayer)
 
         # Time conditioning
         t_emb = self.t_embed(
@@ -379,7 +393,6 @@ class ResidualFlowSiT(nn.Module):
         return self._depatchify(lat_tokens)
 
     def forward_flow_with_cfg(self, t, z_t, dino_multilayer, cfg_scale=1.0):
-        """Classifier-free guidance for flow network."""
         if cfg_scale == 1.0:
             return self.forward_flow(t, z_t, dino_multilayer)
         v_cond = self.forward_flow(t, z_t, dino_multilayer)
@@ -390,8 +403,7 @@ class ResidualFlowSiT(nn.Module):
     # ── Analysis ──
 
     def get_layer_mixing_weights(self):
-        """Return dict of mixing weights for regression and flow blocks.
-        'reg': (reg_depth, n_layers), 'flow': (depth, n_layers)"""
+        """Return dict: 'reg' → (reg_depth, L), 'flow' → (depth, L)."""
         return {
             'reg': self.regressor.get_layer_mixing_weights(),
             'flow': torch.stack([
@@ -402,7 +414,10 @@ class ResidualFlowSiT(nn.Module):
 
     def param_count(self):
         reg_p = sum(p.numel() for p in self.regressor.parameters())
+        shared_p = (sum(p.numel() for p in self.context_projs.parameters()) +
+                    sum(p.numel() for p in self.pool_attn.parameters()) +
+                    self.pool_queries.numel())
         total = sum(p.numel() for p in self.parameters())
-        flow_p = total - reg_p
-        return {"reg_M": reg_p / 1e6, "flow_M": flow_p / 1e6,
-                "total_M": total / 1e6}
+        flow_p = total - reg_p - shared_p
+        return {"reg_M": reg_p / 1e6, "shared_M": shared_p / 1e6,
+                "flow_M": flow_p / 1e6, "total_M": total / 1e6}
