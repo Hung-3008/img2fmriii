@@ -248,6 +248,7 @@ def main():
     lr = train_cfg["lr"]
     grad_clip = train_cfg.get("grad_clip", 1.0)
     ema_decay = train_cfg.get("ema_decay", 0.999)
+    use_ema = train_cfg.get("use_ema", True)
     warmup_epochs = train_cfg.get("warmup_epochs", 5)
     cfg_drop_prob = train_cfg.get("cfg_drop_prob", 0.1)
     cfg_scale = train_cfg.get("cfg_scale", 1.0)
@@ -255,6 +256,7 @@ def main():
     num_trials = train_cfg.get("num_trials", 1)
     eval_interval = 1 if args.debug else train_cfg.get("eval_interval", 5)
     prior_sigma = train_cfg.get("prior_sigma", 1.0)
+    latent_noise_std = train_cfg.get("latent_noise_std", 0.0)
 
     output_dir = cfg.get("output_dir", "results/stage2_multilayer")
     os.makedirs(output_dir, exist_ok=True)
@@ -327,11 +329,12 @@ def main():
     # ── Model ──
     model = MultiLayerFlowSiT(
         MultiLayerFlowSiTConfig(**model_cfg)).to(device)
-    ema_model = copy.deepcopy(model)
+    ema_model = copy.deepcopy(model) if use_ema else None
     pc = model.param_count()
     logger.info(
         f"MultiLayerFlowSiT: align={pc['align_M']:.1f}M "
-        f"flow={pc['flow_M']:.1f}M total={pc['total_M']:.1f}M")
+        f"flow={pc['flow_M']:.1f}M total={pc['total_M']:.1f}M"
+        f" | EMA={'ON' if use_ema else 'OFF'}")
 
     # ── Flow Matcher ──
     fm = ConditionalFlowMatcher(sigma=train_cfg.get("sigma", 0.0))
@@ -385,6 +388,9 @@ def main():
 
             with torch.no_grad():
                 z1, _, _ = vae.encode(fmri, sample_posterior=False)
+                # Fix 1: Add noise to z1 to prevent deterministic collapse
+                if latent_noise_std > 0:
+                    z1 = z1 + latent_noise_std * torch.randn_like(z1)
 
             context = dino
             if cfg_drop_prob > 0:
@@ -404,7 +410,8 @@ def main():
                 model.parameters(),
                 grad_clip if grad_clip > 0 else float('inf'))
             optimizer.step()
-            ema_update(model, ema_model, ema_decay)
+            if use_ema:
+                ema_update(model, ema_model, ema_decay)
 
             ep_flow += loss.item()
             grads_all.append(gn.item())
@@ -431,7 +438,8 @@ def main():
 
         # ── Eval ──
         if epoch % eval_interval == 0 or epoch == 1:
-            val = validate(ema_model, vae, val_loader, fm, device,
+            eval_model = ema_model if use_ema else model
+            val = validate(eval_model, vae, val_loader, fm, device,
                            ode_steps, cfg_scale, num_trials, prior_sigma,
                            decomposer=decomposer)
 
@@ -467,7 +475,7 @@ def main():
             logger.info(f"  ROI | {roi_str}")
 
             # Layer mixing weights
-            mix_w = ema_model.get_layer_mixing_weights()  # (depth, n_layers)
+            mix_w = eval_model.get_layer_mixing_weights()  # (depth, n_layers)
             mix_row = {"epoch": epoch}
             for b in range(mix_w.shape[0]):
                 for li, l in enumerate(dino_layer_names):
@@ -484,12 +492,13 @@ def main():
             if is_best:
                 best_pcc = spcc
                 patience_counter = 0
-                torch.save(
-                    {"epoch": epoch,
-                     "model_state_dict": ema_model.state_dict(),
-                     "optimizer_state_dict": optimizer.state_dict(),
-                     "best_pcc": best_pcc, "config": cfg,
-                     "layer_mixing": mix_w.numpy()},
+                save_dict = {
+                    "epoch": epoch,
+                    "model_state_dict": eval_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_pcc": best_pcc, "config": cfg,
+                    "layer_mixing": mix_w.numpy()}
+                torch.save(save_dict,
                     os.path.join(output_dir, "best_model.pt"))
                 logger.info(f"  ★ Saved best (PCC={best_pcc:.4f})")
             else:
@@ -500,12 +509,14 @@ def main():
                 break
 
         if epoch % train_cfg.get("save_every", 50) == 0:
-            torch.save(
-                {"epoch": epoch,
-                 "model_state_dict": model.state_dict(),
-                 "ema_state_dict": ema_model.state_dict(),
-                 "optimizer_state_dict": optimizer.state_dict(),
-                 "best_pcc": best_pcc, "config": cfg},
+            save_dict = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "best_pcc": best_pcc, "config": cfg}
+            if use_ema:
+                save_dict["ema_state_dict"] = ema_model.state_dict()
+            torch.save(save_dict,
                 os.path.join(output_dir, "latest.pt"))
 
     logger.info(f"Done! Best PCC: {best_pcc:.4f}")

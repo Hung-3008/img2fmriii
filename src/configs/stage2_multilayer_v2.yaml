@@ -1,0 +1,51 @@
+# Multi-Layer DINOv2 Flow Matching — V2 (Variance Collapse Fixes)
+# Changes from V1:
+#   - sigma: 0.0 → 0.01 (stochastic interpolation path)
+#   - latent_noise_std: 0.05 (noise on z1 targets)
+#   - use_ema: false (disable EMA)
+#   - cfg_drop_prob: 0.1 → 0.15
+
+data:
+  root: "Data/nsd"
+  subject: "subj01"
+  vae_checkpoint: "results/fmri_mlp_vae/best.pt"
+  roi_dir: "Data/nsddata/ppdata/subj01/func1pt8mm/roi"
+
+# DINOv2 layers extracted (for logging only)
+dino_layers: [6, 12, 18, 24]
+
+model:
+  latent_dim: 1024
+  context_dim: 1024
+  n_context_tokens: 257
+  n_dino_layers: 4
+  n_latent_tokens: 16
+  hidden_dim: 512
+  depth: 6
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.1
+  align_hidden: 1024
+  align_layers: 2
+
+training:
+  num_epochs: 3000
+  batch_size: 256
+  lr: 3.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  warmup_epochs: 10
+  use_ema: false
+  ema_decay: 0.999
+  cfg_drop_prob: 0.15
+  cfg_scale: 1.0
+  sigma: 0.01
+  latent_noise_std: 0.05
+  ode_steps: 50
+  num_trials: 1
+  patience: 200
+  save_every: 50
+  eval_interval: 5
+  prior_sigma: 1.0
+
+output_dir: "results/stage2_multilayer_v2"
