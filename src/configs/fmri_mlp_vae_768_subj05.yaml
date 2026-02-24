@@ -1,0 +1,34 @@
+# fMRI MLP VAE — Stage 1 (Subject 05, 768d latent)
+# n_voxels: 13039
+
+data:
+  root: "Data/nsd"
+  subject: "subj05"
+  train_rep_mode: "single_trial"
+  test_rep_mode: "average"
+
+model:
+  n_voxels: 13039
+  hidden_dim: 2048
+  latent_dim: 768
+  n_res_blocks: 4
+  dropout: 0.1
+
+loss:
+  beta_max: 0.01
+  beta_anneal_epochs: 30
+  lambda_pcc: 0.5
+
+training:
+  epochs: 200
+  lr: 1.0e-4
+  weight_decay: 0.01
+  batch_size: 128
+  grad_clip: 1.0
+  seed: 42
+  num_workers: 4
+  save_dir: "results/subj05/stage1_vae"
+  log_interval: 50
+  val_interval: 1
+  use_amp: true
+  early_stopping_patience: 50

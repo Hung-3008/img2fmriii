@@ -25,10 +25,16 @@ from torchvision import transforms
 from PIL import Image
 import os
 
+import argparse
+
 # ==============================================================================
 # Configuration
 # ==============================================================================
-sub = 1
+parser = argparse.ArgumentParser(description="Extract PNG images and create evaluation tensor.")
+parser.add_argument('--sub', type=int, default=1, help="Subject number (e.g., 1, 2, 5, 7)")
+args = parser.parse_args()
+
+sub = args.sub
 
 # Paths (relative to this script's location)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
