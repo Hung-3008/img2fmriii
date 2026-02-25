@@ -32,55 +32,12 @@ from torch.utils.data import DataLoader, Dataset
 
 from torchcfm.conditional_flow_matching import ConditionalFlowMatcher
 
-from src.model.residual_flow_sit import ResidualFlowSiT, ResidualFlowSiTConfig
-from src.model.simple_adaln_flow import SimpleAdaLNFlow, SimpleFlowConfig
+
 from src.model.brain_flow_dit import BrainFlowDiT, BrainFlowDiTConfig
 from src.model.fmri_mlp_vae import FmriMLPVAE, FmriMLPVAEConfig
 from src.model.fmri_moe_vae import FmriMoEVAE, FmriMoEVAEConfig
 from src.utils.roi_utils import ROIDecomposer
 
-
-# ─── Hybrid Model (Regression + Simple Flow) ─────────────────────────────────
-
-
-class InformedFlowModel(torch.nn.Module):
-    """Wraps regression head (from ResidualFlowSiT) + SimpleAdaLNFlow.
-
-    Provides same interface as ResidualFlowSiT: forward_regression(),
-    forward_flow(), get_layer_mixing_weights().
-    """
-
-    def __init__(self, reg_model, flow_model):
-        super().__init__()
-        self.reg_model = reg_model   # ResidualFlowSiT (only regression used)
-        self.flow_model = flow_model  # SimpleAdaLNFlow
-
-    def forward_regression(self, dino_multilayer):
-        return self.reg_model.forward_regression(dino_multilayer)
-
-    def forward_flow(self, t, z_t, dino_multilayer):
-        return self.flow_model(t, z_t, dino_multilayer)
-
-    def forward_flow_with_cfg(self, t, z_t, dino_multilayer, cfg_scale=1.0):
-        if cfg_scale == 1.0:
-            return self.forward_flow(t, z_t, dino_multilayer)
-        v_cond = self.forward_flow(t, z_t, dino_multilayer)
-        v_uncond = self.forward_flow(
-            t, z_t, torch.zeros_like(dino_multilayer))
-        return v_uncond + cfg_scale * (v_cond - v_uncond)
-
-    def get_layer_mixing_weights(self):
-        return self.reg_model.get_layer_mixing_weights()
-
-    def param_count(self):
-        reg_p = sum(p.numel() for p in self.reg_model.parameters())
-        flow_p = sum(p.numel() for p in self.flow_model.parameters())
-        return {
-            'reg_M': reg_p / 1e6,
-            'flow_M': flow_p / 1e6,
-            'shared_M': 0.0,
-            'total_M': (reg_p + flow_p) / 1e6,
-        }
 
 
 # ─── Dataset ──────────────────────────────────────────────────────────────────
@@ -416,23 +373,7 @@ def main():
     logger.info(f"VAE loaded from {vae_ckpt}")
 
     # ── Model ──
-    flow_model_type = cfg.get('flow_model', 'residual_sit')
-
-    if flow_model_type == 'simple_adaln':
-        # Hybrid: ResidualFlowSiT for regression + SimpleAdaLNFlow for flow
-        flow_cfg = cfg.get('simple_flow', {})
-        reg_model = ResidualFlowSiT(
-            ResidualFlowSiTConfig(**model_cfg)).to(device)
-        simple_flow = SimpleAdaLNFlow(
-            SimpleFlowConfig(**flow_cfg)).to(device)
-        model = InformedFlowModel(reg_model, simple_flow).to(device)
-        ema_model = copy.deepcopy(model) if use_ema else None
-        pc = model.param_count()
-        logger.info(
-            f"InformedFlowModel [simple_adaln]: "
-            f"reg={pc['reg_M']:.1f}M flow={pc['flow_M']:.1f}M "
-            f"total={pc['total_M']:.1f}M | EMA={'ON' if use_ema else 'OFF'}")
-    elif flow_model_type == 'brain_flow_dit':
+    if flow_model_type == 'brain_flow_dit':
         model = BrainFlowDiT(BrainFlowDiTConfig(**model_cfg)).to(device)
         ema_model = copy.deepcopy(model) if use_ema else None
         pc = model.param_count()
@@ -441,15 +382,7 @@ def main():
             f"flow={pc['flow_M']:.1f}M total={pc['total_M']:.1f}M"
             f" | EMA={'ON' if use_ema else 'OFF'}")
     else:
-        model = ResidualFlowSiT(
-            ResidualFlowSiTConfig(**model_cfg)).to(device)
-        ema_model = copy.deepcopy(model) if use_ema else None
-        pc = model.param_count()
-        logger.info(
-            f"ResidualFlowSiT (informed prior): reg={pc['reg_M']:.1f}M "
-            f"shared={pc.get('shared_M', 0):.1f}M "
-            f"flow={pc['flow_M']:.1f}M total={pc['total_M']:.1f}M"
-            f" | EMA={'ON' if use_ema else 'OFF'}")
+        raise ValueError(f"Unknown flow_model_type: {flow_model_type}")
 
     # ── Flow Matcher ──
     fm = ConditionalFlowMatcher(sigma=train_cfg.get("sigma", 0.0))
