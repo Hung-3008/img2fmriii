@@ -34,6 +34,7 @@ from torchcfm.conditional_flow_matching import ConditionalFlowMatcher
 
 from src.model.residual_flow_sit import ResidualFlowSiT, ResidualFlowSiTConfig
 from src.model.simple_adaln_flow import SimpleAdaLNFlow, SimpleFlowConfig
+from src.model.brain_flow_dit import BrainFlowDiT, BrainFlowDiTConfig
 from src.model.fmri_mlp_vae import FmriMLPVAE, FmriMLPVAEConfig
 from src.model.fmri_moe_vae import FmriMoEVAE, FmriMoEVAEConfig
 from src.utils.roi_utils import ROIDecomposer
@@ -431,6 +432,14 @@ def main():
             f"InformedFlowModel [simple_adaln]: "
             f"reg={pc['reg_M']:.1f}M flow={pc['flow_M']:.1f}M "
             f"total={pc['total_M']:.1f}M | EMA={'ON' if use_ema else 'OFF'}")
+    elif flow_model_type == 'brain_flow_dit':
+        model = BrainFlowDiT(BrainFlowDiTConfig(**model_cfg)).to(device)
+        ema_model = copy.deepcopy(model) if use_ema else None
+        pc = model.param_count()
+        logger.info(
+            f"BrainFlowDiT: reg={pc.get('reg_M', 0):.1f}M "
+            f"flow={pc['flow_M']:.1f}M total={pc['total_M']:.1f}M"
+            f" | EMA={'ON' if use_ema else 'OFF'}")
     else:
         model = ResidualFlowSiT(
             ResidualFlowSiTConfig(**model_cfg)).to(device)
