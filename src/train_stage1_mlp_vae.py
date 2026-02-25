@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 
 from src.model.fmri_mlp_vae import FmriMLPVAE, create_fmri_mlp_vae
+from src.model.fmri_moe_vae import FmriMoEVAE, create_fmri_moe_vae
 from src.utils.metrics import pearson_correlation
 from src.utils.training import (
     EarlyStopping, CosineAnnealingWithWarmup,
@@ -257,10 +258,17 @@ def main():
 
     # ── Model ──
     model_cfg = cfg["model"]
-    model = create_fmri_mlp_vae(**model_cfg).to(device)
+    model_type = cfg.get("model_type", "mlp")
+
+    if model_type == "moe":
+        model = create_fmri_moe_vae(**model_cfg).to(device)
+        model_name = "FmriMoEVAE"
+    else:
+        model = create_fmri_mlp_vae(**model_cfg).to(device)
+        model_name = "FmriMLPVAE"
 
     params = model.param_count()
-    logger.info(f"FmriMLPVAE: {params['total']:,} params ({params['total_mb']:.1f} MB)")
+    logger.info(f"{model_name}: {params['total']:,} params ({params['total_mb']:.1f} MB)")
 
     # ── Optimizer + Scheduler ──
     optimizer = torch.optim.AdamW(

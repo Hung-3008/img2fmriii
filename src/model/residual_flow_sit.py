@@ -44,6 +44,7 @@ class ResidualFlowSiTConfig:
     reg_num_heads: int = 8
     reg_mlp_ratio: float = 4.0
     reg_dropout: float = 0.15
+    reg_output_norm: bool = False    # LayerNorm on regression output (fix shrinkage)
 
     # ── Flow Network ──
     n_latent_tokens: int = 12      # 768 / 64 = 12
@@ -200,6 +201,11 @@ class MultiLayerRegressor(nn.Module):
             nn.Linear(D, config.latent_dim),
         )
 
+        # Output normalization: fix shrinkage (z̄ std≈0.3 → std≈1.0)
+        self.output_norm = (nn.LayerNorm(config.latent_dim)
+                           if getattr(config, 'reg_output_norm', False)
+                           else nn.Identity())
+
     def forward(self, multi_ctx):
         """multi_ctx: list of (B, n_pool, D) → z̄ (B, latent_dim)"""
         B = multi_ctx[0].shape[0]
@@ -210,7 +216,7 @@ class MultiLayerRegressor(nn.Module):
 
         x = self.norm_out(x)
         x = x.reshape(B, -1)
-        return self.head(x)
+        return self.output_norm(self.head(x))
 
     def get_layer_mixing_weights(self):
         weights = []

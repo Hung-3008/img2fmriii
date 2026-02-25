@@ -1,21 +1,18 @@
 """
 fMRI MLP VAE — Stage 1 for Latent Flow Matching.
 
-Architecture:
-    fMRI (15724) → MLP Encoder → z ~ N(μ, σ²) (latent_dim)
-    z (latent_dim) → MLP Decoder → fMRI (15724)
+Architecture (v2 — progressive):
+    fMRI (15724) → Linear(4096) → ResBlock×N → Linear(2048) → ResBlock×N → μ,logvar (768)
+    z (768) → Linear(2048) → ResBlock×N → Linear(4096) → ResBlock×N → Linear(15724)
 
-Key improvements over Conv2D VAE:
-    1. Direct 1D processing — no artificial 2D reshape/padding
-    2. MLP with residual blocks — correct inductive bias for fMRI
-    3. Higher β — enforces Gaussian prior for flow matching
-    4. Dropout — prevents latent collapse
-
-Inspired by MindEye2's MLP backbone (Linear→ResBlock×4).
+Key improvements over v1:
+    1. Progressive compression — gradual dim reduction, not abrupt
+    2. Wider ResBlocks — expansion ratio for more expressivity
+    3. Backward compatible — single hidden_dim still works
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -25,16 +22,20 @@ import torch.nn.functional as F
 # ─── Building Blocks ──────────────────────────────────────────────────────────
 
 class MLPResBlock(nn.Module):
-    """Residual MLP block: LayerNorm → Linear → GELU → Dropout → Linear → Dropout + skip."""
+    """Residual MLP block: LayerNorm → Linear → GELU → Dropout → Linear → Dropout + skip.
+    
+    Supports expansion ratio: dim → dim*expansion → dim.
+    """
 
-    def __init__(self, dim: int, dropout: float = 0.1):
+    def __init__(self, dim: int, expansion: int = 1, dropout: float = 0.1):
         super().__init__()
+        hidden = dim * expansion
         self.net = nn.Sequential(
             nn.LayerNorm(dim),
-            nn.Linear(dim, dim),
+            nn.Linear(dim, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(dim, dim),
+            nn.Linear(hidden, dim),
             nn.Dropout(dropout),
         )
 
@@ -48,9 +49,11 @@ class MLPResBlock(nn.Module):
 class FmriMLPVAEConfig:
     """Configuration for FmriMLPVAE."""
     n_voxels: int = 15724
-    hidden_dim: int = 2048
-    latent_dim: int = 1024
-    n_res_blocks: int = 4
+    hidden_dim: int = 2048           # used if hidden_dims is empty (backward compat)
+    hidden_dims: List[int] = field(default_factory=list)  # progressive: [4096, 2048]
+    latent_dim: int = 768
+    n_res_blocks: int = 4            # per hidden level (v1) or per stage (v2)
+    expansion: int = 1               # ResBlock expansion ratio (1 = original, 2 = wider)
     dropout: float = 0.1
 
 
@@ -61,9 +64,13 @@ class FmriMLPVAE(nn.Module):
     Encodes flat fMRI vectors (n_voxels,) into compact latent codes (latent_dim,)
     suitable for downstream Flow Matching.
 
-    Architecture:
-        Encoder: Linear(n_voxels → hidden) → ResBlock × N → Linear(hidden → 2*latent)
-        Decoder: Linear(latent → hidden) → ResBlock × N → Linear(hidden → n_voxels)
+    Architecture (progressive mode, hidden_dims=[4096, 2048]):
+        Encoder: 15724 → 4096 → ResBlock×N(4096) → 2048 → ResBlock×N(2048) → μ,logvar(768)
+        Decoder: 768 → 2048 → ResBlock×N(2048) → 4096 → ResBlock×N(4096) → 15724
+
+    Architecture (legacy mode, hidden_dim=2048):
+        Encoder: 15724 → 2048 → ResBlock×N(2048) → μ,logvar(768)
+        Decoder: 768 → 2048 → ResBlock×N(2048) → 15724
     """
 
     def __init__(self, config: Optional[FmriMLPVAEConfig] = None, **kwargs):
@@ -74,33 +81,44 @@ class FmriMLPVAE(nn.Module):
         self.config = config
 
         n_voxels = config.n_voxels
-        hidden = config.hidden_dim
         latent = config.latent_dim
         n_blocks = config.n_res_blocks
         dropout = config.dropout
+        expansion = config.expansion
 
-        # ── Encoder ──
-        encoder_layers = [
-            nn.Linear(n_voxels, hidden),
-            nn.LayerNorm(hidden),
-            nn.GELU(),
-        ]
-        for _ in range(n_blocks):
-            encoder_layers.append(MLPResBlock(hidden, dropout))
+        # Determine hidden dim progression
+        if config.hidden_dims:
+            dims = config.hidden_dims  # e.g. [4096, 2048]
+        else:
+            dims = [config.hidden_dim]  # e.g. [2048] — backward compat
+
+        # ── Encoder: n_voxels → dims[0] → dims[1] → ... → latent ──
+        encoder_layers = []
+        prev_dim = n_voxels
+        for d in dims:
+            encoder_layers.append(nn.Linear(prev_dim, d))
+            encoder_layers.append(nn.LayerNorm(d))
+            encoder_layers.append(nn.GELU())
+            for _ in range(n_blocks):
+                encoder_layers.append(MLPResBlock(d, expansion, dropout))
+            prev_dim = d
 
         self.encoder = nn.Sequential(*encoder_layers)
-        self.fc_mu = nn.Linear(hidden, latent)
-        self.fc_logvar = nn.Linear(hidden, latent)
+        self.fc_mu = nn.Linear(prev_dim, latent)
+        self.fc_logvar = nn.Linear(prev_dim, latent)
 
-        # ── Decoder ──
-        decoder_layers = [
-            nn.Linear(latent, hidden),
-            nn.LayerNorm(hidden),
-            nn.GELU(),
-        ]
-        for _ in range(n_blocks):
-            decoder_layers.append(MLPResBlock(hidden, dropout))
-        decoder_layers.append(nn.Linear(hidden, n_voxels))
+        # ── Decoder: latent → dims[-1] → ... → dims[0] → n_voxels ──
+        decoder_layers = []
+        rev_dims = list(reversed(dims))  # e.g. [2048, 4096]
+        prev_dim = latent
+        for d in rev_dims:
+            decoder_layers.append(nn.Linear(prev_dim, d))
+            decoder_layers.append(nn.LayerNorm(d))
+            decoder_layers.append(nn.GELU())
+            for _ in range(n_blocks):
+                decoder_layers.append(MLPResBlock(d, expansion, dropout))
+            prev_dim = d
+        decoder_layers.append(nn.Linear(prev_dim, n_voxels))
 
         self.decoder = nn.Sequential(*decoder_layers)
 
