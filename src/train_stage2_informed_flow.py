@@ -191,7 +191,7 @@ def validate(model, vae, val_loader, fm, device, ode_steps=50,
         z_gen = torch.zeros_like(z1)
         for _ in range(num_trials):
             x0_trial = z_bar + prior_sigma * torch.randn_like(z1)
-            traj = odeint(ode_fn, x0_trial, t_span, method="euler")
+            traj = odeint(ode_fn, x0_trial, t_span, method="midpoint")
             z_gen = z_gen + traj[-1]
         z_gen = z_gen / num_trials
 
@@ -373,6 +373,7 @@ def main():
     logger.info(f"VAE loaded from {vae_ckpt}")
 
     # ── Model ──
+    flow_model_type = cfg.get('flow_model', 'brain_flow_dit')
     if flow_model_type == 'brain_flow_dit':
         model = BrainFlowDiT(BrainFlowDiTConfig(**model_cfg)).to(device)
         ema_model = copy.deepcopy(model) if use_ema else None

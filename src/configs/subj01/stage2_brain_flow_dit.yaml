@@ -18,8 +18,8 @@ model:
   depth: 6
   num_heads: 12
   mlp_ratio: 4.0
-  dropout: 0.15
-  drop_path_rate: 0.1
+  dropout: 0.1
+  drop_path_rate: 0.0
   use_regressor: true
   regressor_depth: 2
 
@@ -27,19 +27,19 @@ training:
   num_epochs: 500
   batch_size: 256
   lr: 0.0003
-  weight_decay: 0.05
+  weight_decay: 0.01
   grad_clip: 1.0
   warmup_epochs: 20
   
   # Flow matching
   sigma: 0.01          # Not used for CFG yet but for matching if using standard
-  prior_sigma: 0.5     # Use 0.5 to force flow to learn more
-  ode_steps: 50
+  prior_sigma: 0.3     # Use 0.3 to let regression head lead more
+  ode_steps: 100
   num_trials: 1
   
   # Losses
   flow_weight: 1.0
-  reg_weight: 0.5      # Downweight regression to prevent it from ignoring flow
+  reg_weight: 1.0
   
   # Sampling
   timestep_sampling: "logit_normal"
