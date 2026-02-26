@@ -35,7 +35,7 @@ from torchcfm.conditional_flow_matching import ConditionalFlowMatcher
 
 from src.model.brain_flow_dit import BrainFlowDiT, BrainFlowDiTConfig
 from src.model.fmri_mlp_vae import FmriMLPVAE, FmriMLPVAEConfig
-from src.model.fmri_moe_vae import FmriMoEVAE, FmriMoEVAEConfig
+from src.model.fmri_vit_vae import FmriViTVAE, create_fmri_vit_vae
 from src.utils.roi_utils import ROIDecomposer
 
 
@@ -348,9 +348,8 @@ def main():
         # Try subject-specific config in src/configs/
         subject = data_cfg.get("subject", "subj01")
         for alt in [
-            f"src/configs/{subject}/stage1_moe_vae.yaml",
+            f"src/configs/{subject}/stage1_vit_vae.yaml",
             f"src/configs/exp/fmri_mlp_vae_768_{subject}.yaml",
-            f"src/configs/exp/fmri_moe_vae_768_{subject}.yaml",
         ]:
             if os.path.exists(alt):
                 config_path = alt
@@ -360,9 +359,9 @@ def main():
     with open(config_path) as f:
         vae_cfg = yaml.safe_load(f)
     vae_model_type = vae_cfg.get("model_type", "mlp")
-    if vae_model_type == "moe":
-        vae = FmriMoEVAE(FmriMoEVAEConfig(**vae_cfg["model"])).to(device).eval()
-        logger.info("VAE type: MoE")
+    if vae_model_type == "vit":
+        vae = create_fmri_vit_vae(**vae_cfg["model"]).to(device).eval()
+        logger.info("VAE type: ViT")
     else:
         vae = FmriMLPVAE(FmriMLPVAEConfig(**vae_cfg["model"])).to(device).eval()
         logger.info("VAE type: MLP")
