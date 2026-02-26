@@ -169,8 +169,9 @@ class BrainFlowDiT(nn.Module):
         C = config.context_dim
         
         # ─── 1. DINOv2 Layer Mixing ───
-        # Learnable sum of the specified DINOv2 layers
-        self.layer_weights = nn.Parameter(torch.ones(config.n_dino_layers))
+        # Decoupled learnable sum of the specified DINOv2 layers
+        self.reg_layer_weights = nn.Parameter(torch.ones(config.n_dino_layers))
+        self.flow_layer_weights = nn.Parameter(torch.ones(config.n_dino_layers))
         
         # ─── 2. Conditional Encoders ───
         # Global Conditioning: t_emb + CLS
@@ -220,11 +221,12 @@ class BrainFlowDiT(nn.Module):
         nn.init.zeros_(self.final_adaLN[1].bias)
         self.output_proj = nn.Linear(D, self.token_dim)
         
-        # ─── 6. Lightweight Informed Regressor (Optional) ───
+        # ─── 6. Upgraded Informed Regressor (Optional) ───
         if config.use_regressor:
             # Multi-layer MLP
             reg_layers = []
-            in_dim = C
+            # In upgraded version, input is CLS + Mean(Spatial) -> 2 * C
+            in_dim = C * 2 
             for _ in range(config.regressor_depth):
                 reg_layers.extend([
                     nn.Linear(in_dim, D),
@@ -246,17 +248,17 @@ class BrainFlowDiT(nn.Module):
             nn.init.zeros_(self.regressor[-1].weight)
             nn.init.zeros_(self.regressor[-1].bias)
 
-    def _process_context(self, dino_multilayer):
+    def _process_context(self, dino_multilayer, layer_weights):
         """
-        Process the multi-layer DINOv2 features.
+        Process the multi-layer DINOv2 features using specific layer weights.
         dino_multilayer: (B, L, 257, C)
         Returns:
             cls_token: (B, C) - CLS token
             spatial_patches: (B, 256, C) - Spatial patches
         """
         # Softmax over layer weights ensures stability
-        w = F.softmax(self.layer_weights, dim=0) # (L,)
-        w = w.view(1, -1, 1, 1)                  # (1, L, 1, 1)
+        w = F.softmax(layer_weights, dim=0)    # (L,)
+        w = w.view(1, -1, 1, 1)                # (1, L, 1, 1)
         
         # Weighted sum of layers
         dino_mixed = (dino_multilayer * w).sum(dim=1) # (B, 257, C)
@@ -268,12 +270,20 @@ class BrainFlowDiT(nn.Module):
 
     def forward_regression(self, dino_multilayer):
         """
-        Predict the conditional mean z_bar. Lightweight approach.
+        Predict the conditional mean z_bar.
+        Upgraded: Uses both CLS token and Mean-Pooled Spatial Patches.
         Returns: z_bar (B, latent_dim)
         """
         assert self.config.use_regressor, "Regressor not enabled in config."
-        cls_token, _ = self._process_context(dino_multilayer)
-        return self.regressor(cls_token)
+        cls_token, spatial_patches = self._process_context(dino_multilayer, self.reg_layer_weights)
+        
+        # Mean pool spatial patches -> (B, C)
+        pooled_spatial = spatial_patches.mean(dim=1)
+        
+        # Concat CLS + Pooled Spatial -> (B, 2C)
+        reg_input = torch.cat([cls_token, pooled_spatial], dim=1)
+        
+        return self.regressor(reg_input)
 
     def forward_flow(self, t, z_t, dino_multilayer):
         """
@@ -284,8 +294,8 @@ class BrainFlowDiT(nn.Module):
         """
         B = z_t.shape[0]
         
-        # 1. Context embedding
-        cls_token, spatial_patches = self._process_context(dino_multilayer)
+        # 1. Context embedding using Flow-specific layer weights
+        cls_token, spatial_patches = self._process_context(dino_multilayer, self.flow_layer_weights)
         
         t_emb = timestep_embedding(t * 1000, self.config.hidden_dim)
         global_cond = self.t_embedder(t_emb) + self.cls_embedder(cls_token) # (B, D)
@@ -323,11 +333,12 @@ class BrainFlowDiT(nn.Module):
     def get_layer_mixing_weights(self):
         """Returns the layer weights dict for consistent logging format."""
         with torch.no_grad():
-            w = F.softmax(self.layer_weights, dim=0).unsqueeze(0).cpu() # (1, L)
-        # We simulate block weights format for compatibility: shape (blocks, layers)
+            w_reg = F.softmax(self.reg_layer_weights, dim=0).unsqueeze(0).cpu() # (1, L)
+            w_flow = F.softmax(self.flow_layer_weights, dim=0).unsqueeze(0).cpu() # (1, L)
+            
         return {
-            'reg': w.repeat(self.config.regressor_depth, 1),
-            'flow': w.repeat(self.config.depth, 1)
+            'reg': w_reg.repeat(self.config.regressor_depth, 1),
+            'flow': w_flow.repeat(self.config.depth, 1)
         }
 
     def param_count(self):

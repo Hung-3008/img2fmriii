@@ -18,7 +18,7 @@ model:
   depth: 4
   num_heads: 8
   mlp_ratio: 4.0
-  dropout: 0.1
+  dropout: 0.25
   drop_path_rate: 0.15
   use_regressor: true
   regressor_depth: 2
@@ -27,7 +27,7 @@ training:
   num_epochs: 500
   batch_size: 256
   lr: 3.0e-4
-  weight_decay: 0.05
+  weight_decay: 0.1
   grad_clip: 1.0
   warmup_epochs: 10
   use_ema: true
