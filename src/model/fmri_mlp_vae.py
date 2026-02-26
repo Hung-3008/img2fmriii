@@ -132,6 +132,10 @@ class FmriMLPVAE(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        # Bug fix: fc_logvar should start near 0 so initial posterior ≈ N(0,1)
+        # Xavier init could produce large logvar → exp(logvar) blows up → KL/NaN
+        nn.init.zeros_(self.fc_logvar.weight)
+        nn.init.zeros_(self.fc_logvar.bias)
 
     def encode(
         self, x: torch.Tensor, sample_posterior: bool = True,
@@ -151,6 +155,11 @@ class FmriMLPVAE(nn.Module):
         h = self.encoder(x)
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
+
+        # Bug fix: clamp logvar to prevent exp() overflow/underflow
+        # logvar=30 → std=e^15 ≈ 3.3M (gradient explosion)
+        # logvar=-30 → std≈0 (vanishing gradients, posterior collapse)
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
 
         if sample_posterior:
             std = torch.exp(0.5 * logvar)

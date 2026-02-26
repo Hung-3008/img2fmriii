@@ -25,6 +25,7 @@ from torch.utils.data import Dataset, DataLoader, Subset
 
 from src.model.fmri_mlp_vae import FmriMLPVAE, create_fmri_mlp_vae
 from src.model.fmri_moe_vae import FmriMoEVAE, create_fmri_moe_vae
+from src.model.fmri_vit_vae import FmriViTVAE, create_fmri_vit_vae
 from src.utils.metrics import pearson_correlation
 from src.utils.training import (
     EarlyStopping, CosineAnnealingWithWarmup,
@@ -88,10 +89,14 @@ class FmriFlatDataset(Dataset):
 # ─── Beta Schedule ────────────────────────────────────────────────────────────
 
 def get_beta(epoch: int, beta_max: float, beta_anneal_epochs: int) -> float:
-    """Linear β-annealing: 0 → beta_max over beta_anneal_epochs."""
+    """Linear β-annealing: beta_min → beta_max over beta_anneal_epochs.
+
+    Bug fix: uses (epoch+1) instead of epoch so epoch-0 gets a non-zero beta.
+    With epoch=0 the old formula gave beta=0 → pure autoencoder → posterior collapse.
+    """
     if beta_anneal_epochs <= 0:
         return beta_max
-    return min(beta_max, beta_max * epoch / beta_anneal_epochs)
+    return min(beta_max, beta_max * (epoch + 1) / beta_anneal_epochs)
 
 
 # ─── Validation ───────────────────────────────────────────────────────────────
@@ -136,10 +141,13 @@ def train_one_epoch(
     model.train()
 
     total = defaultdict(float)
-    n_batches = 0
+    # Bug fix: track n_samples (not n_batches) so train metrics are per-sample,
+    # consistent with validate() which also aggregates per-sample.
+    n_samples = 0
 
     for batch_idx, batch in enumerate(train_loader):
         fmri = batch["fmri"].to(device)
+        bs = fmri.shape[0]
 
         optimizer.zero_grad()
 
@@ -152,7 +160,7 @@ def train_one_epoch(
             if logger:
                 logger.warning(f"  NaN/Inf loss at batch {batch_idx+1}, skipping")
             optimizer.zero_grad()
-            n_batches += 1
+            n_samples += bs  # still count samples to avoid skewing the average
             continue
 
         scaler.scale(loss).backward()
@@ -169,10 +177,10 @@ def train_one_epoch(
 
         for k, v in losses.items():
             if isinstance(v, torch.Tensor):
-                total[k] += v.item()
+                total[k] += v.item() * bs
             else:
-                total[k] += v
-        n_batches += 1
+                total[k] += v * bs
+        n_samples += bs
 
         if logger and (batch_idx + 1) % log_interval == 0:
             logger.info(
@@ -181,7 +189,7 @@ def train_one_epoch(
                 f"kl={losses['kl'].item():.2f} pcc={losses['pcc'].item():.4f} β={beta:.4f}"
             )
 
-    return {k: v / max(n_batches, 1) for k, v in total.items()}
+    return {k: v / max(n_samples, 1) for k, v in total.items()}
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -263,6 +271,9 @@ def main():
     if model_type == "moe":
         model = create_fmri_moe_vae(**model_cfg).to(device)
         model_name = "FmriMoEVAE"
+    elif model_type == "vit":
+        model = create_fmri_vit_vae(**model_cfg).to(device)
+        model_name = "FmriViTVAE"
     else:
         model = create_fmri_mlp_vae(**model_cfg).to(device)
         model_name = "FmriMLPVAE"
@@ -298,6 +309,10 @@ def main():
         model.load_state_dict(ckpt["model_state_dict"])
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        # Bug fix: restore scheduler state so LR continues from where it left off.
+        # Without this the scheduler resets to warmup, causing an LR spike on resume.
+        if "scheduler_state_dict" in ckpt and scheduler is not None:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_epoch = ckpt.get("epoch", 0) + 1
         best_val_pcc = ckpt.get("best_val_pcc", -float("inf"))
         logger.info(f"Resumed from epoch {start_epoch}")
@@ -374,12 +389,16 @@ def main():
             logger.info(f"Early stopping at epoch {epoch}")
             break
 
-    # Final checkpoint
-    save_checkpoint(
-        model, optimizer, epoch, train_metrics,
-        save_dir / "final.pt", scheduler=scheduler,
-        extra={"best_val_pcc": best_val_pcc},
-    )
+    # Bug fix: guard against NameError when the training loop never ran
+    # (e.g. start_epoch == total_epochs on resume).
+    if 'epoch' in dir() or 'epoch' in locals():
+        save_checkpoint(
+            model, optimizer, epoch, train_metrics,
+            save_dir / "final.pt", scheduler=scheduler,
+            extra={"best_val_pcc": best_val_pcc},
+        )
+    else:
+        logger.warning("No epochs were run; skipping final checkpoint.")
 
     logger.info(f"Training complete. Best val PCC: {best_val_pcc:.4f}")
     logger.info(f"Saved to {save_dir}")

@@ -167,6 +167,10 @@ class FmriMoEVAEConfig:
     dropout: float = 0.1
     load_balance_weight: float = 0.01  # weight for load balancing loss
 
+    # V4 Asymmetric Decoder
+    n_res_blocks_decoder: Optional[int] = None
+    decoder_expansion_dims: List[int] = field(default_factory=list)
+
 
 class FmriMoEVAE(nn.Module):
     """
@@ -215,12 +219,29 @@ class FmriMoEVAE(nn.Module):
             nn.LayerNorm(hidden),
             nn.GELU(),
         ]
-        for _ in range(config.n_res_blocks):
+        
+        n_dec_blocks = config.n_res_blocks_decoder if config.n_res_blocks_decoder is not None else config.n_res_blocks
+        
+        for _ in range(n_dec_blocks):
             decoder_layers.append(MoEResBlock(
                 hidden, config.n_experts, config.top_k,
                 config.expansion, dropout,
             ))
-        decoder_layers.append(nn.Linear(hidden, n_voxels))
+            
+        prev_dim = hidden
+        for exp_dim in config.decoder_expansion_dims:
+            decoder_layers.extend([
+                nn.Linear(prev_dim, exp_dim),
+                nn.LayerNorm(exp_dim),
+                nn.GELU(),
+                MoEResBlock(
+                    exp_dim, config.n_experts, config.top_k,
+                    config.expansion, dropout,
+                )
+            ])
+            prev_dim = exp_dim
+            
+        decoder_layers.append(nn.Linear(prev_dim, n_voxels))
 
         self.decoder = nn.Sequential(*decoder_layers)
 

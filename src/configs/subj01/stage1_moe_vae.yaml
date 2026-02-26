@@ -12,6 +12,8 @@ model:
   hidden_dim: 2048
   latent_dim: 768
   n_res_blocks: 4
+  n_res_blocks_decoder: 6
+  decoder_expansion_dims: [4096, 8192]
   n_experts: 4
   top_k: 2
   expansion: 2
@@ -19,7 +21,7 @@ model:
   load_balance_weight: 0.01
 
 loss:
-  beta_max: 0.01
+  beta_max: 0.001
   beta_anneal_epochs: 30
   lambda_pcc: 0.5
 
