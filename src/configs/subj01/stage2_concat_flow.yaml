@@ -1,0 +1,39 @@
+data:
+  subject: "subj01"
+  root: "Data/nsd"
+  dino_suffix: "dinov2_vitb14_multilayer"
+  vae_checkpoint: "results/subj01/stage1_vit_vae/best.pt"
+
+output_dir: "results/subj01/stage2_concat_flow"
+
+model:
+  latent_dim: 768
+  n_latent_tokens: 12        # 768 / 12 = 64 per token
+  context_dim: 768
+  n_dino_layers: 4
+  n_context_tokens: 257      # 1 CLS + 256 patches (ViT-B/14)
+  hidden_dim: 512
+  depth: 6
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.1
+  drop_path_rate: 0.1
+
+training:
+  num_epochs: 150
+  batch_size: 128
+  lr: 3.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  warmup_epochs: 10
+
+  # Flow Matching
+  ode_steps: 20              # Euler steps for validation ODE solver
+
+  # EMA
+  use_ema: true
+  ema_decay: 0.999
+
+  eval_interval: 5
+  save_every: 50
+  patience: 0                # 0 = no early stopping
