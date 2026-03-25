@@ -8,20 +8,20 @@ DINOv2 ViT-L/14 specs:
     - Embedding dim: 1024
     - Patch size: 14
     - Input: 224x224 → 16x16 = 256 patch tokens + 1 CLS token = 257 tokens
-    - Output: (N, 257, 1024)
-
-Input:
-  - Data/nsd/subj0{sub}/train_img/{i}.png    (425x425 RGB PNGs)
-  - Data/nsd/subj0{sub}/test_img/{i}.png     (425x425 RGB PNGs)
+    - Total layers: 24
 
 Output (saved into Data/nsd/subj0{sub}/):
-  - nsd_dinov2_vitl14_train_sub{sub}.npy     (N_train, 257, 1024)  float16
-  - nsd_dinov2_vitl14_test_sub{sub}.npy      (N_test,  257, 1024)  float16
+  1. Pooled (CLS token, last layer):
+     - nsd_dinov2_vitl14_pool_{mode}_sub{sub}.npy   (N, 1024)      float16
+  2. Full tokens (CLS + patches, last layer):
+     - nsd_dinov2_vitl14_{mode}_sub{sub}.npy         (N, 257, 1024) float16
+  3. Multilayer CLS tokens (selected layers):
+     - nsd_dinov2_vitl14_multi_{mode}_sub{sub}.npy   (N, L, 1024)  float16
+     where L = number of selected layers
 
 Usage:
-  python SynBrain/data/extract_features_dinov2.py
-  python SynBrain/data/extract_features_dinov2.py --subjects 1
-  python SynBrain/data/extract_features_dinov2.py --subjects 1 2 5 7 --batch_size 128
+  python src/data/extract_features_dinov2.py --subjects 1
+  python src/data/extract_features_dinov2.py --subjects 1 --layers 5 11 17 23
 """
 
 import argparse
@@ -36,7 +36,7 @@ from torchvision import transforms
 # Configuration (paths relative to this script)
 # ==============================================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '../../Data'))
+BASE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '../../NSD/data'))
 PROCESSED_DATA_DIR = os.path.join(BASE_DIR, 'nsd')
 
 # Default subjects (matching the CLIP extraction script)
@@ -78,6 +78,11 @@ class DINOv2_Image_Dataset(Dataset):
 # ==============================================================================
 # Main extraction logic
 # ==============================================================================
+# Default layers to extract for multilayer features
+# DINOv2 ViT-L has 24 layers (0-23). Select layers spread across depth.
+DEFAULT_LAYERS = [5, 11, 17, 23]  # early, mid-early, mid-late, last
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Extract DINOv2 ViT-L/14 features")
     parser.add_argument('--subjects', type=int, nargs='+', default=DEFAULT_SUBJECTS,
@@ -86,6 +91,8 @@ def parse_args():
                         help=f'Batch size (default: {DEFAULT_BATCH_SIZE})')
     parser.add_argument('--device', type=str, default='',
                         help='Device (default: auto-detect)')
+    parser.add_argument('--layers', type=int, nargs='+', default=DEFAULT_LAYERS,
+                        help=f'Layer indices for multilayer extraction (default: {DEFAULT_LAYERS})')
     return parser.parse_args()
 
 
@@ -103,7 +110,9 @@ def main():
     print("Loading DINOv2 ViT-L/14 from torch.hub...")
     model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
     model = model.to(device).eval()
-    print(f"DINOv2 ViT-L/14 loaded. Embedding dim: {DINOV2_EMB_DIM}")
+    num_layers = len(model.blocks)
+    print(f"DINOv2 ViT-L/14 loaded. Embedding dim: {DINOV2_EMB_DIM}, Layers: {num_layers}")
+    print(f"Multilayer extraction layers: {args.layers}")
 
     # ── Preprocessing (DINOv2 standard) ──
     transform = transforms.Compose([
@@ -144,41 +153,64 @@ def main():
                 drop_last=False, num_workers=4, pin_memory=True,
             )
 
-            all_features = []
+            all_full = []      # (B, 257, 1024) — last layer CLS + patches
+            all_pooled = []    # (B, 1024)      — last layer CLS only
+            all_multi = []     # (B, L, 1024)   — multilayer CLS tokens
 
             for batch_i, images in enumerate(dataloader):
                 if batch_i % 10 == 0:
                     print(f"  Extracting Batch {batch_i}/{len(dataloader)} / {mode}...")
 
                 with torch.no_grad(), torch.amp.autocast('cuda', enabled=(device == 'cuda')):
-                    # DINOv2 forward_features returns dict with:
-                    #   'x_norm_clstoken': (B, D)
-                    #   'x_norm_patchtokens': (B, N_patches, D)
-                    output = model.forward_features(images.to(device))
+                    imgs = images.to(device)
 
+                    # --- Last layer: full tokens ---
+                    output = model.forward_features(imgs)
                     cls_token = output['x_norm_clstoken']        # (B, 1024)
                     patch_tokens = output['x_norm_patchtokens']  # (B, 256, 1024)
 
-                    # Concatenate: [CLS, patch_1, patch_2, ..., patch_256] → (B, 257, 1024)
-                    features = torch.cat([
+                    full_features = torch.cat([
                         cls_token.unsqueeze(1),  # (B, 1, 1024)
                         patch_tokens,            # (B, 256, 1024)
-                    ], dim=1)
+                    ], dim=1)  # (B, 257, 1024)
 
-                all_features.append(features.cpu().half())  # fp16 to save space
+                    # --- Multilayer: CLS tokens from selected layers ---
+                    # get_intermediate_layers returns list of (B, N_patches+1, D)
+                    # for each requested layer
+                    intermediate = model.get_intermediate_layers(
+                        imgs, n=args.layers, reshape=False
+                    )
+                    # Each element: (B, 257, 1024). Take CLS token [0] from each.
+                    multi_cls = torch.stack(
+                        [layer[:, 0, :] for layer in intermediate], dim=1
+                    )  # (B, L, 1024)
+
+                all_full.append(full_features.cpu().half())
+                all_pooled.append(cls_token.cpu().half())
+                all_multi.append(multi_cls.cpu().half())
                 torch.cuda.empty_cache()
 
-            if all_features:
-                all_features = torch.cat(all_features, dim=0).numpy()  # (N, 257, 1024), float16
+            if all_full:
+                # 1. Full tokens (last layer)
+                full_np = torch.cat(all_full, dim=0).numpy()
+                out_full = os.path.join(save_path, f'nsd_dinov2_vitl14_{mode}_sub{subj}.npy')
+                np.save(out_full, full_np)
+                print(f"  ✅ Full:    {out_full}  shape={full_np.shape}  {full_np.nbytes/1e6:.1f}MB")
+                del full_np, all_full
 
-                out_path = os.path.join(
-                    save_path, f'nsd_dinov2_vitl14_{mode}_sub{subj}.npy'
-                )
-                np.save(out_path, all_features)
-                print(f"  ✅ Saved: {out_path}")
-                print(f"     Shape: {all_features.shape}, Dtype: {all_features.dtype}")
-                print(f"     Size: {all_features.nbytes / 1e6:.1f} MB")
-                del all_features
+                # 2. Pooled (CLS token, last layer)
+                pool_np = torch.cat(all_pooled, dim=0).numpy()
+                out_pool = os.path.join(save_path, f'nsd_dinov2_vitl14_pool_{mode}_sub{subj}.npy')
+                np.save(out_pool, pool_np)
+                print(f"  ✅ Pooled:  {out_pool}  shape={pool_np.shape}  {pool_np.nbytes/1e6:.1f}MB")
+                del pool_np, all_pooled
+
+                # 3. Multilayer CLS tokens
+                multi_np = torch.cat(all_multi, dim=0).numpy()
+                out_multi = os.path.join(save_path, f'nsd_dinov2_vitl14_multi_{mode}_sub{subj}.npy')
+                np.save(out_multi, multi_np)
+                print(f"  ✅ Multi:   {out_multi}  shape={multi_np.shape}  {multi_np.nbytes/1e6:.1f}MB")
+                del multi_np, all_multi
 
     print(f"\n{'='*60}")
     print("Done. DINOv2 feature extraction completed successfully!")

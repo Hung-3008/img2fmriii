@@ -3,7 +3,7 @@ import sys
 
 # Determine the absolute path to the Data directory relative to the script
 script_dir = os.path.dirname(os.path.abspath(__file__))
-data_dir = os.path.abspath(os.path.join(script_dir, '../../Data'))
+data_dir = os.path.abspath(os.path.join(script_dir, '../../NSD/data'))
 os.chdir(data_dir)
 import sys
 import numpy as np
@@ -163,18 +163,22 @@ np.save('nsd/subj{:02d}/nsd_test_stim_sub{}.npy'.format(sub,sub),stim_array)
 print("Test data is saved.")
 
 
-annots_cur = np.load('annots/COCO_73k_annots_curated.npy')
+annot_path = 'annots/COCO_73k_annots_curated.npy'
+if os.path.exists(annot_path):
+    annots_cur = np.load(annot_path)
 
-captions_array = np.empty((num_train,5),dtype=annots_cur.dtype)
-for i,idx in enumerate(train_im_idx):
-    captions_array[i,:] = annots_cur[idx,:]
-    print(i)
-np.save('nsd/subj{:02d}/nsd_train_cap_sub{}.npy'.format(sub,sub),captions_array )
-    
-captions_array = np.empty((num_test,5),dtype=annots_cur.dtype)
-for i,idx in enumerate(test_im_idx):
-    captions_array[i,:] = annots_cur[idx,:]
-    print(i)
-np.save('nsd/subj{:02d}/nsd_test_cap_sub{}.npy'.format(sub,sub),captions_array )
+    captions_array = np.empty((num_train,5),dtype=annots_cur.dtype)
+    for i,idx in enumerate(train_im_idx):
+        captions_array[i,:] = annots_cur[idx,:]
+        print(i)
+    np.save('nsd/subj{:02d}/nsd_train_cap_sub{}.npy'.format(sub,sub),captions_array )
+        
+    captions_array = np.empty((num_test,5),dtype=annots_cur.dtype)
+    for i,idx in enumerate(test_im_idx):
+        captions_array[i,:] = annots_cur[idx,:]
+        print(i)
+    np.save('nsd/subj{:02d}/nsd_test_cap_sub{}.npy'.format(sub,sub),captions_array )
 
-print("Caption data are saved.")
+    print("Caption data are saved.")
+else:
+    print(f"Annotation file not found at {annot_path}. Skipping caption data extraction.")

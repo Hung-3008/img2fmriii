@@ -29,28 +29,37 @@ from PIL import Image
 import torchvision.transforms.functional as TF
 from torch.utils.data import DataLoader, Dataset
 
+import argparse
+
 # ==============================================================================
 # Configuration (paths relative to this script)
 # ==============================================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '../../Data'))
+BASE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '../../NSD/data'))
 PROCESSED_DATA_DIR = os.path.join(BASE_DIR, 'nsd')
 
 # Model checkpoint path
 OPEN_CLIP_MODEL_PATH = os.path.abspath(os.path.join(BASE_DIR, '../checkpoints/sdxl_unclip/open_clip_pytorch_model.bin'))
 
-# Subjects to process (matching the original notebook)
-SUBJECTS = [1, 2, 5, 7]
+DEFAULT_SUBJECTS = [1, 2, 5, 7]
+DEFAULT_BATCH_SIZE = 300
 
-# Batch size (matching the original notebook)
-BATCH_SIZE = 300
+parser = argparse.ArgumentParser(description="Extract SDXL OpenCLIP ViT-bigG-14 features")
+parser.add_argument('--subjects', type=int, nargs='+', default=DEFAULT_SUBJECTS,
+                    help='Subject numbers to process (default: 1 2 5 7)')
+parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE,
+                    help=f'Batch size (default: {DEFAULT_BATCH_SIZE})')
+args = parser.parse_args()
+
+SUBJECTS = args.subjects
+BATCH_SIZE = args.batch_size
 
 # ==============================================================================
 # Import SGM modules
 # ==============================================================================
 # Original notebook: sys.path.append('.../SynBrain/src/sdxl/generative_models')
 # Original notebook: from generative_models.sgm.modules.encoders.modules import FrozenOpenCLIPImageEmbedder
-SGM_MODULE_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, '../src/sdxl'))
+SGM_MODULE_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, '../../NSD/notes/SynBrain/src/sdxl'))
 sys.path.append(SGM_MODULE_PATH)
 
 try:
@@ -87,6 +96,41 @@ clip_seq_dim = 256
 clip_emb_dim = 1664
 
 # ==============================================================================
+# Multilayer extraction via hooks
+# ==============================================================================
+# ViT-bigG-14 has 48 transformer blocks
+# Select layers spread across depth for multilayer features
+EXTRACT_LAYERS = [11, 23, 35, 47]  # early, mid-early, mid-late, last
+
+# Access the underlying ViT transformer blocks
+try:
+    vit_model = clip_img_embedder.model.visual.transformer
+    resblocks = vit_model.resblocks
+    num_blocks = len(resblocks)
+    print(f"ViT-bigG-14: {num_blocks} transformer blocks")
+    print(f"Multilayer extraction layers: {EXTRACT_LAYERS}")
+except Exception as e:
+    print(f"Warning: Cannot access ViT internals for multilayer extraction: {e}")
+    print("Will only save tokens and pooled features.")
+    resblocks = None
+
+# Hook storage
+_intermediate_outputs = {}
+
+def make_hook(layer_idx):
+    def hook_fn(module, input, output):
+        _intermediate_outputs[layer_idx] = output.detach()
+    return hook_fn
+
+# Register hooks
+hooks = []
+if resblocks is not None:
+    for layer_idx in EXTRACT_LAYERS:
+        if layer_idx < num_blocks:
+            h = resblocks[layer_idx].register_forward_hook(make_hook(layer_idx))
+            hooks.append(h)
+
+# ==============================================================================
 # Dataset class (matching the original notebook exactly)
 # ==============================================================================
 class CLIP_Image_Dataset(Dataset):
@@ -102,7 +146,7 @@ class CLIP_Image_Dataset(Dataset):
         return len(self.img_data)
 
 # ==============================================================================
-# Extract features (matching the original notebook loop exactly)
+# Extract features
 # ==============================================================================
 for subj in SUBJECTS:
     save_path = os.path.join(PROCESSED_DATA_DIR, f'subj0{subj}')
@@ -126,31 +170,65 @@ for subj in SUBJECTS:
         dataset = CLIP_Image_Dataset(image_paths)
         dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, drop_last=False)
 
-        zs = None
-        zs_pool = None
+        all_tokens = []   # (B, 256, 1664)
+        all_pooled = []   # (B, 1664)
+        all_multi = []    # (B, L, 1664)
 
         for batch_i, image in enumerate(dataloader):
             print(f"  Extracting Batch {batch_i} / {mode}...")
 
+            _intermediate_outputs.clear()
+
             with torch.no_grad():
                 z, z_pool = clip_img_embedder(image.to(device))
 
-            if batch_i == 0:
-                zs = z.detach().cpu()
-                zs_pool = z_pool.detach().cpu()
-            else:
-                zs = torch.cat((zs, z.detach().cpu()), dim=0)
-                zs_pool = torch.cat((zs_pool, z_pool.detach().cpu()), dim=0)
+            all_tokens.append(z.detach().cpu())
+            all_pooled.append(z_pool.detach().cpu())
+
+            # Collect multilayer CLS tokens from hooks
+            if _intermediate_outputs:
+                # ViT outputs: (seq_len, batch, dim) — CLS is token[0]
+                multi_cls = []
+                for layer_idx in sorted(_intermediate_outputs.keys()):
+                    out = _intermediate_outputs[layer_idx]
+                    # OpenCLIP ViT transformer output: (seq_len, batch, dim)
+                    if out.dim() == 3 and out.shape[0] != image.shape[0]:
+                        # (seq_len, B, D) format — CLS is out[0]
+                        cls = out[0]  # (B, D)
+                    else:
+                        # (B, seq_len, D) format — CLS is out[:,0]
+                        cls = out[:, 0]  # (B, D)
+                    multi_cls.append(cls)
+                multi_cls = torch.stack(multi_cls, dim=1)  # (B, L, D)
+                all_multi.append(multi_cls.cpu())
 
             torch.cuda.empty_cache()
 
-        if zs is not None:
+        if all_tokens:
+            # 1. Tokens (256 patch tokens, last layer)
+            zs = torch.cat(all_tokens, dim=0)
             out_clip = os.path.join(save_path, f'nsd_sdxl_clip_{mode}_sub{subj}.npy')
-            out_pool = os.path.join(save_path, f'nsd_sdxl_clip_pool_{mode}_sub{subj}.npy')
             np.save(out_clip, zs.numpy())
+            print(f"  ✅ Tokens: {out_clip} shape={zs.shape}")
+            del zs, all_tokens
+
+            # 2. Pooled (CLS/pooled, last layer)
+            zs_pool = torch.cat(all_pooled, dim=0)
+            out_pool = os.path.join(save_path, f'nsd_sdxl_clip_pool_{mode}_sub{subj}.npy')
             np.save(out_pool, zs_pool.numpy())
-            print(f"  Saved: {out_clip} shape={zs.shape}")
-            print(f"  Saved: {out_pool} shape={zs_pool.shape}")
-            del zs, zs_pool
+            print(f"  ✅ Pooled: {out_pool} shape={zs_pool.shape}")
+            del zs_pool, all_pooled
+
+            # 3. Multilayer CLS tokens
+            if all_multi:
+                zs_multi = torch.cat(all_multi, dim=0)
+                out_multi = os.path.join(save_path, f'nsd_sdxl_clip_multi_{mode}_sub{subj}.npy')
+                np.save(out_multi, zs_multi.numpy())
+                print(f"  ✅ Multi:  {out_multi} shape={zs_multi.shape}")
+                del zs_multi, all_multi
+
+# Remove hooks
+for h in hooks:
+    h.remove()
 
 print("\nDone. Feature extraction completed successfully!")

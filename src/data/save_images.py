@@ -38,7 +38,7 @@ sub = args.sub
 
 # Paths (relative to this script's location)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '../../Data'))
+BASE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '../../NSD/data'))
 PROCESSED_DATA_DIR = os.path.join(BASE_DIR, 'nsd')
 EVAL_DIR = os.path.join(BASE_DIR, 'evals')
 os.makedirs(EVAL_DIR, exist_ok=True)

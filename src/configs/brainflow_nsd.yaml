@@ -1,0 +1,83 @@
+# =====================================================================
+# BrainFlow NSD — Flow Matching for NSD Discrete Image→fMRI
+# =====================================================================
+# 3 modalities (pooled features): DINOv2, SDXL-CLIP, Qwen3-VL
+# PCA: 15724 voxels → 1000 dimensions
+# No temporal context (T=1, discrete image-fMRI pairs)
+# =====================================================================
+
+data_dir: NSD/data/nsd
+subject: 1
+n_voxels: 15724
+
+# --- Feature files (pooled embeddings) ---
+# Files are at: {data_dir}/subj0{subject}/nsd_{feat}_{mode}_sub{subject}.npy
+features:
+  dinov2:
+    pool: nsd_dinov2_vitl14_pool_{mode}_sub{sub}.npy
+    dim: 1024
+  clip:
+    pool: nsd_sdxl_clip_pool_{mode}_sub{sub}.npy
+    dim: 1280
+  qwen:
+    pool: nsd_qwen3vl_pool_{mode}_sub{sub}.npy
+    dim: 2048
+
+modality_dims: [1024, 1280, 2048]   # dinov2, clip, qwen = 4352 total
+
+# --- fMRI ---
+fmri:
+  train: nsd_train_fmri_scale_sub{sub}.npy    # (9000, 3, 15724)
+  test: nsd_test_fmri_scale_sub{sub}.npy      # (1000, 3, 15724)
+  n_reps: 3                                    # average 3 repetitions
+
+# --- PCA ---
+# Removed PCA logic for direct fMRI prediction
+
+# =====================================================================
+# Model config
+# =====================================================================
+brainflow:
+  output_dim: 15724                # Full fMRI space
+  reg_weight: 1.0                  # Explicit weight for regression loss
+  contrastive_weight: 0.1          # InfoNCE contrastive loss weight
+  contrastive_temp: 0.1            # InfoNCE contrastive temp
+  n_subjects: 1
+
+  dit_net:                         # BrainDiT configuration inspired by mm-DiT
+    output_dim: 15724
+    hidden_dim: 768
+    proj_dim: 256
+    n_blocks: 6
+    n_heads: 12
+    dropout: 0.1
+    modality_dropout: 0.1
+
+# =====================================================================
+# Solver (validation inference)
+# =====================================================================
+solver_args:
+  method: midpoint
+  time_points: 50
+  cfg_scale: 0.0
+
+# =====================================================================
+# Training
+# =====================================================================
+training:
+  n_epochs: 200
+  lr: 5.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  min_lr: 1.0e-5
+  grad_clip: 1.0
+  use_amp: true
+  log_every_n_steps: 10
+  val_every_n_epochs: 5
+  ema_decay: 0.999
+  batch_size: 64
+  val_batch_size: 128
+  num_workers: 4
+
+# --- Output ---
+output_dir: outputs/brainflow_nsd

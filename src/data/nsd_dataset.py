@@ -1,174 +1,104 @@
+"""NSD Dataset — Simple PyTorch Dataset for NSD discrete image→fMRI pairs.
+
+Loads pre-extracted pooled features (DINOv2, CLIP, Qwen3-VL) and fMRI data.
+fMRI has 3 repetitions per image, averaged to get a single target per sample.
+PCA is fitted on training fMRI and applied to both train/test.
+
+Data shapes (subj01):
+  - fmri_train: (9000, 3, 15724) float64 → avg → (9000, 15724)
+  - fmri_test:  (1000, 3, 15724) float64 → avg → (1000, 15724)
+  - dinov2_pool: (N, 1024)   float16
+  - clip_pool:   (N, 1280)   float32
+  - qwen_pool:   (N, 2048)   float16
+"""
+
+import logging
+import os
+
+import joblib
 import numpy as np
 import torch
-import h5py
-from pathlib import Path
+from sklearn.decomposition import PCA
 from torch.utils.data import Dataset
-from typing import Dict, Optional
+
+logger = logging.getLogger("nsd_dataset")
 
 
 class NSDDataset(Dataset):
-    """
-    Dataset for Natural Scenes Dataset (NSD).
-    Loads preprocessed fMRI .npy files from the MindEye data layout.
+    """NSD dataset for discrete image→fMRI mapping.
 
-    Expected directory structure:
-        {data_root}/processed/{subject}_{split}_avg.npy      (averaged trials)
-        {data_root}/processed/{subject}_{split}_single.npy   (single trials)
-        {data_root}/embeddings/{embedding_file}               (optional image embeddings)
-
-    Args:
-        data_root:       Root directory (e.g. 'NSD/data/mindeye_nsd')
-        split:           'train' or 'test'
-        mode:            'averaged' or 'single_trial'
-        subject:         Subject id, e.g. 'subj01'
-        embedding_file:  Filename inside {data_root}/embeddings/ (optional)
-        normalize_fmri:  Whether to z-score normalize fMRI data
-        roi_file:        ROI atlas name (currently unused, reserved for future)
+    Each sample returns:
+        context:     dict of features
+        fmri:        (n_voxels,)     raw fMRI (averaged reps)
+        subject_idx: int             subject index (0 for single-subject)
     """
 
     def __init__(
         self,
-        data_root: str,
-        split: str = "train",
-        mode: str = "averaged",
-        subject: str = "subj01",
-        embedding_file: Optional[str] = None,
-        normalize_fmri: bool = False,
-        roi_file: Optional[str] = None,
-        images_path: Optional[str] = None,
-        indices_path: Optional[str] = None,
-        transform = None,
-        features_path: Optional[str] = None,
-        latents_path: Optional[str] = None,
+        data_dir: str,
+        subject: int,
+        mode: str = "train",         # "train" or "test"
     ):
         super().__init__()
-        self.data_root = Path(data_root)
-        self.split = split
         self.mode = mode
         self.subject = subject
-        self.images_path = images_path
-        self.indices_path = indices_path
-        self.transform = transform
 
-        # --- Load fMRI data ---
-        suffix = "avg" if mode == "averaged" else "single"
-        fmri_path = self.data_root / "processed" / f"{subject}_{split}_{suffix}.npy"
-        if not fmri_path.exists():
-            raise FileNotFoundError(f"fMRI file not found: {fmri_path}")
+        subj_dir = os.path.join(data_dir, f"subj0{subject}")
+        logger.info("Loading NSD data from %s (mode=%s)", subj_dir, mode)
 
-        self.fmri = np.load(str(fmri_path), mmap_mode='r')  # [N, V] (Memory mapped)
-        print(f"NSDDataset: loaded {fmri_path.name} (mmap) shape={self.fmri.shape}")
+        # --- Load fMRI: (N, 3, 15724) → average reps → (N, 15724) ---
+        fmri_path = os.path.join(subj_dir, f"nsd_{mode}_fmri_scale_sub{subject}.npy")
+        fmri_raw = np.load(fmri_path)  # (N, 3, V)
+        logger.info("  fMRI raw: %s %s", fmri_raw.shape, fmri_raw.dtype)
 
-        if normalize_fmri:
-            mean = self.fmri.mean(axis=0, keepdims=True)
-            std = self.fmri.std(axis=0, keepdims=True) + 1e-8
-            self.fmri = (self.fmri - mean) / std
-            print(f"  fMRI z-score normalized")
+        # Average across repetitions
+        self.fmri = torch.from_numpy(fmri_raw.mean(axis=1).astype(np.float32))  # (N, V)
+        del fmri_raw
+        logger.info("  fMRI averaged: %s", self.fmri.shape)
 
-        # --- Optionally load embeddings ---
-        self.embeddings = None
-        if embedding_file is not None:
-            emb_path = self.data_root / "embeddings" / embedding_file
-            if emb_path.exists():
-                self.embeddings = np.load(str(emb_path))
-                print(f"  Embeddings loaded: {emb_path.name}  shape={self.embeddings.shape}")
+        def load_feature(mod_name, default_prefix):
+            multi_path = os.path.join(subj_dir, f"nsd_{default_prefix}_multi_{mode}_sub{subject}.npy")
+            pool_path = os.path.join(subj_dir, f"nsd_{default_prefix}_pool_{mode}_sub{subject}.npy")
+            
+            if os.path.exists(multi_path):
+                arr = np.load(multi_path)
+            elif os.path.exists(pool_path):
+                arr = np.load(pool_path)
+                # Ensure sequence dimension exists: (N, D) -> (N, 1, D)
+                if arr.ndim == 2:
+                    arr = np.expand_dims(arr, axis=1)
             else:
-                print(f"  Warning: embedding file not found at {emb_path}, skipping.")
+                raise FileNotFoundError(f"Missing {mod_name} feature file for {mode} split")
+            
+            return torch.from_numpy(arr.astype(np.float32))
 
-        # --- Optionally load DINOv2 patch features from HDF5 ---
-        self.features_path = features_path
-        self.trial_to_feature_idx = None
-        if features_path is not None:
-            fp = Path(features_path)
-            if fp.exists():
-                with h5py.File(str(fp), 'r') as f:
-                    self.trial_to_feature_idx = f['trial_to_feature_idx'][:]
-                    feat_shape = f['features'].shape
-                print(f"  DINOv2 features: {fp.name}  shape={feat_shape}")
-                print(f"  trial_to_feature_idx loaded: {self.trial_to_feature_idx.shape}")
-            else:
-                print(f"  Warning: features file not found at {fp}, skipping.")
-                self.features_path = None
+        self.feat_dinov2 = load_feature("dinov2", "dinov2_vitl14")
+        self.feat_clip = load_feature("clip", "sdxl_clip")
+        self.feat_qwen = load_feature("qwen", "qwen3vl")
 
-        # Store roi_file for potential future use
-        self.roi_file = roi_file
+        logger.info("  DINOv2: %s, CLIP: %s, Qwen: %s", self.feat_dinov2.shape, self.feat_clip.shape, self.feat_qwen.shape)
 
-        # --- Optionally load pre-extracted VAE latents (mu) ---
-        self.vae_latents = None
-        if latents_path is not None:
-            lp = Path(latents_path)
-            if lp.exists():
-                # Load fully into RAM for fast access (cast float16→float32)
-                raw = np.load(str(lp))
-                self.vae_latents = raw.astype(np.float32) if raw.dtype == np.float16 else raw
-                print(f"  VAE latents loaded into RAM: {lp.name}  shape={self.vae_latents.shape}  "
-                      f"dtype={self.vae_latents.dtype}  ({self.vae_latents.nbytes / 1024**3:.1f} GB)")
-                assert len(self.vae_latents) == len(self.fmri), (
-                    f"Latents/fMRI length mismatch: {len(self.vae_latents)} vs {len(self.fmri)}"
-                )
-            else:
-                print(f"  Warning: latents file not found at {lp}, will encode on-the-fly")
 
-    def __len__(self) -> int:
-        return self.fmri.shape[0]
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        fmri = torch.from_numpy(self.fmri[idx].copy()).float()
+        self.n_samples = self.fmri.shape[0]
+        assert self.feat_dinov2.shape[0] == self.n_samples
+        assert self.feat_clip.shape[0] == self.n_samples
+        assert self.feat_qwen.shape[0] == self.n_samples
 
-        out = {
-            "fmri": fmri,
-            "trial_idx": torch.tensor(idx).long(),
+        logger.info("  Dataset ready: %d samples", self.n_samples)
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        fmri = self.fmri[idx]  # (V=15724,)
+
+        return {
+            "context": {
+                "dino": self.feat_dinov2[idx], # (L1, 1024)
+                "clip": self.feat_clip[idx],   # (L2, 1280)
+                "qwen": self.feat_qwen[idx],   # (L3, 2048)
+            },
+            "fmri": fmri,             # (15724,)
+            "subject_idx": 0,          # single-subject
         }
-
-        # Pre-extracted VAE latents
-        if self.vae_latents is not None:
-            out["vae_mu"] = torch.from_numpy(self.vae_latents[idx].copy()).float()
-
-        # Load image if paths are provided
-        if self.images_path and self.indices_path:
-            try:
-                # Map trial index -> image index
-                with h5py.File(self.indices_path, 'r') as f_idx:
-                    image_idx = int(f_idx[self.subject][idx])
-                
-                out["image_idx"] = torch.tensor(image_idx).long()
-
-                # Load image
-                with h5py.File(self.images_path, 'r') as f_img:
-                    if 'images' in f_img:
-                        dset = f_img['images']
-                    else:
-                        key = list(f_img.keys())[0]
-                        dset = f_img[key]
-                    
-                    image_data = dset[image_idx] # [H, W, C]
-                    image = torch.from_numpy(image_data).float()
-                    
-                    if image.shape[-1] == 3:
-                        image = image.permute(2, 0, 1) # [3, 224, 224]
-                    
-                    # Normalize to [-1, 1] if needed (assuming [0, 1] float16 input)
-                    if image.max() > 1.0:
-                        image = image / 255.0
-                    image = (image - 0.5) / 0.5
-
-                if self.transform:
-                    image = self.transform(image)
-                
-                out["image"] = image
-            except Exception as e:
-                print(f"Error loading image for index {idx}: {e}")
-
-        if self.embeddings is not None:
-            # For averaged mode the mapping may differ; use idx directly
-            emb_idx = idx if idx < len(self.embeddings) else idx % len(self.embeddings)
-            out["embedding"] = torch.from_numpy(self.embeddings[emb_idx]).float()
-
-        # Load DINOv2 patch features (lazy from HDF5)
-        if self.features_path is not None and self.trial_to_feature_idx is not None:
-            feat_idx = int(self.trial_to_feature_idx[idx])
-            with h5py.File(self.features_path, 'r') as f:
-                features = f['features'][feat_idx]  # [3, 256, 1024] float16
-            out["dino_features"] = torch.from_numpy(features.astype(np.float32))
-
-        return out
