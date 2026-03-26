@@ -271,15 +271,15 @@ class BrainFlowNSD(nn.Module):
         dit_net_params: dict = None,
         source_encoder_params: dict = None,
         transport_params: dict = None,
-        kld_weight: float = 1e-3,
-        align_weight: float = 0.1,
-        detach_ut: bool = True,
+        var_reg_weight: float = 0.01,
+        align_weight: float = 0.5,
+        detach_ut: bool = False,
         vae: nn.Module = None,
         **kwargs,
     ):
         super().__init__()
         self.output_dim = output_dim
-        self.kld_weight = kld_weight
+        self.var_reg_weight = var_reg_weight
         self.align_weight = align_weight
         self.detach_ut = detach_ut
 
@@ -350,18 +350,15 @@ class BrainFlowNSD(nn.Module):
         log_var = torch.clamp(log_var, min=-4.0, max=2.0)  # min σ ≈ 0.14
         x0 = self.source_encoder.reparameterize(mu, log_var)  # x₀ = source
 
-        # 2. KLD loss: regularize source toward N(0,1)
-        kld_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
+        # 2. Variance-only regularization: keep σ near 1 (no μ penalty)
+        # This avoids fighting with align_loss over μ
+        var_reg = 0.5 * torch.mean(log_var.exp() - log_var - 1)
 
         # 3. Alignment loss: encourage μ → target
         align_loss = F.mse_loss(mu, target_latent)
 
-        # 4. CSFM Flow Matching (using CSFM's transport)
-        # Time sampling (CSFM-style, with optional logit-normal + shift)
+        # 4. CSFM Flow Matching
         t = self.transport.sample_timestep(x1)
-
-        # Path interpolation: xt = (1-t)·x₁ + t·x₀, ut = -x₁ + x₀
-        # x₀ maintains gradient → SourceEncoder gets gradient through xt
         t, xt, ut = self.transport.path_sampler.plan(t, x0, x1)
 
         # DiT context encoding (separate from source encoder)
@@ -373,16 +370,16 @@ class BrainFlowNSD(nn.Module):
         # Velocity prediction
         v_pred = self.dit_net(x=xt, t=t, pre_encoded_context=flow_ctx)
 
-        # Flow loss with detach_ut (like CSFM)
+        # Flow loss
         ut_target = ut.detach() if self.detach_ut else ut
         flow_loss = F.mse_loss(v_pred, ut_target)
 
-        total_loss = flow_loss + self.kld_weight * kld_loss + self.align_weight * align_loss
+        total_loss = flow_loss + self.var_reg_weight * var_reg + self.align_weight * align_loss
 
         return {
             "total_loss": total_loss,
             "flow_loss": flow_loss,
-            "kld_loss": kld_loss,
+            "var_reg": var_reg,
             "align_loss": align_loss,
             "mu_norm": mu.detach().norm(dim=-1).mean(),
             "std_mean": torch.exp(0.5 * log_var).detach().mean(),

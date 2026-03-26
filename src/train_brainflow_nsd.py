@@ -208,9 +208,9 @@ def train(args):
             **nf_cfg.get("source_encoder", {}),
         },
         transport_params=cfg.get("transport", {}),
-        kld_weight=nf_cfg.get("kld_weight", 1e-3),
-        align_weight=nf_cfg.get("align_weight", 0.1),
-        detach_ut=nf_cfg.get("detach_ut", True),
+        var_reg_weight=nf_cfg.get("var_reg_weight", 0.01),
+        align_weight=nf_cfg.get("align_weight", 0.5),
+        detach_ut=nf_cfg.get("detach_ut", False),
         vae=vae_model,
     ).to(device)
 
@@ -271,7 +271,7 @@ def train(args):
     history_file = out_dir / "history.csv"
     if start_epoch == 1:
         with open(history_file, "w") as f:
-            f.write("epoch,total_loss,flow_loss,kld_loss,align_loss,mu_norm,std_mean,flow_pcc,src_pcc,lr\n")
+            f.write("epoch,total_loss,flow_loss,var_reg,align_loss,mu_norm,std_mean,flow_pcc,src_pcc,lr\n")
 
     # Solver config
     solver_cfg = cfg.get("solver_args", {})
@@ -286,7 +286,7 @@ def train(args):
 
     for epoch in range(start_epoch, tr_cfg["n_epochs"] + 1):
         model.train()
-        epoch_losses = {"total": [], "flow": [], "kld": [], "align": [], "mu_norm": [], "std_mean": []}
+        epoch_losses = {"total": [], "flow": [], "var_reg": [], "align": [], "mu_norm": [], "std_mean": []}
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{tr_cfg['n_epochs']}")
         for batch_idx, batch in enumerate(pbar):
@@ -326,7 +326,7 @@ def train(args):
 
             epoch_losses["total"].append(loss.item())
             epoch_losses["flow"].append(losses["flow_loss"].item())
-            epoch_losses["kld"].append(losses["kld_loss"].item())
+            epoch_losses["var_reg"].append(losses["var_reg"].item())
             epoch_losses["align"].append(losses["align_loss"].item())
             epoch_losses["mu_norm"].append(losses["mu_norm"].item())
             epoch_losses["std_mean"].append(losses["std_mean"].item())
@@ -398,13 +398,13 @@ def train(args):
             # Log
             mean_total = float(np.mean(epoch_losses["total"]))
             mean_flow = float(np.mean(epoch_losses["flow"]))
-            mean_kld = float(np.mean(epoch_losses["kld"]))
+            mean_var_reg = float(np.mean(epoch_losses["var_reg"]))
             mean_align = float(np.mean(epoch_losses["align"]))
             mean_mu_norm = float(np.mean(epoch_losses["mu_norm"]))
             mean_std = float(np.mean(epoch_losses["std_mean"]))
             lr = scheduler.get_last_lr()[0]
             with open(history_file, "a") as f:
-                f.write(f"{epoch},{mean_total:.6f},{mean_flow:.6f},{mean_kld:.6f},{mean_align:.6f},{mean_mu_norm:.4f},{mean_std:.4f},{mean_pcc:.6f},{mean_pcc_reg:.6f},{lr:.2e}\n")
+                f.write(f"{epoch},{mean_total:.6f},{mean_flow:.6f},{mean_var_reg:.6f},{mean_align:.6f},{mean_mu_norm:.4f},{mean_std:.4f},{mean_pcc:.6f},{mean_pcc_reg:.6f},{lr:.2e}\n")
 
             ema.restore(model)
 

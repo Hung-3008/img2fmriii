@@ -1,9 +1,11 @@
 # =====================================================================
-# BrainFlow NSD — CSFM-Style Conditional Source Flow Matching
+# BrainFlow NSD — CSFM v2 (Optimized Architecture)
 # =====================================================================
-# Source: SourceEncoder (Perceiver) → (μ, log_var) → reparameterize
-# Target: target_latent (no shift)
-# Uses CSFM transport for correct gradient flow
+# Fixes applied:
+#   - Variance-only regularization (no μ penalty, avoids KLD-align fight)
+#   - Smaller DiT: 3 blocks × 512 hidden (was 6 × 768)
+#   - Smaller SourceEncoder: 2 queries × 256 hidden × 1 layer
+#   - detach_ut=false for full gradient flow
 # =====================================================================
 
 data_dir: NSD/data/nsd
@@ -40,26 +42,26 @@ fmri:
 # =====================================================================
 brainflow:
   output_dim: 256
-  kld_weight: 3.0e-2                 # KLD loss weight (↑ prevent variance collapse)
-  align_weight: 0.5                  # Alignment loss weight (↑ push μ → target)
+  var_reg_weight: 0.01                # Variance regularization (σ near 1)
+  align_weight: 0.5                   # Alignment (μ → target)
   detach_ut: false                    # Flow loss gradient → SourceEncoder
 
-  # Source Encoder (CSFM-style Perceiver)
+  # Source Encoder (lightweight Perceiver)
   source_encoder:
-    hidden_dim: 512
+    hidden_dim: 256
     output_dim: 256
-    n_queries: 8
-    n_layers: 2
+    n_queries: 2
+    n_layers: 1
     n_heads: 8
     dropout: 0.1
-    init_logvar: 0.0                 # Start with σ ≈ 1
+    init_logvar: 0.0
 
-  # Velocity Network (DiT)
+  # Velocity Network (compact DiT)
   dit_net:
     output_dim: 256
-    hidden_dim: 768
-    n_blocks: 6
-    n_heads: 12
+    hidden_dim: 512
+    n_blocks: 3
+    n_heads: 8
     dropout: 0.25
 
 # =====================================================================
