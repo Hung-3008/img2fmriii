@@ -117,11 +117,14 @@ def train(args):
 
     from src.data.nsd_dataset import NSDDataset
 
+    fmri_mode = cfg.get("fmri_mode", "scale")
+
     logger.info("Loading training data...")
     train_set = NSDDataset(
         data_dir=data_dir,
         subject=subject,
         mode="train",
+        fmri_mode=fmri_mode,
     )
 
     logger.info("Loading test data...")
@@ -129,6 +132,7 @@ def train(args):
         data_dir=data_dir,
         subject=subject,
         mode="test",
+        fmri_mode=fmri_mode,
     )
 
     tr_cfg = cfg["training"]
@@ -152,11 +156,38 @@ def train(args):
         drop_last=False,
     )
 
+    # Load frozen VAE
+    vae_model = None
+    vae_cfg = cfg.get("vae", {})
+    vae_ckpt_path = vae_cfg.get("checkpoint", None)
+    if vae_ckpt_path:
+        vae_ckpt_path = str(PROJECT_ROOT / vae_ckpt_path)
+        logger.info("Loading frozen VAE from %s", vae_ckpt_path)
+        vae_ckpt = torch.load(vae_ckpt_path, map_location=device, weights_only=False)
+        vae_train_cfg = vae_ckpt["config"]["vae"]
+
+        from src.models.fmri_vae import fMRI_VAE_NSD
+        vae_model = fMRI_VAE_NSD(
+            n_voxels=cfg["n_voxels"],
+            latent_dim=vae_train_cfg.get("latent_dim", 256),
+            hidden_dim=vae_train_cfg.get("hidden_dim", 2048),
+            num_res_blocks=vae_train_cfg.get("num_res_blocks", 4),
+            dropout=vae_train_cfg.get("dropout", 0.1),
+        ).to(device)
+        vae_model.load_state_dict(vae_ckpt["ema_model"])
+        vae_model.eval()
+        vae_n_params = sum(p.numel() for p in vae_model.parameters())
+        logger.info("VAE loaded (epoch %d, pearson=%.4f, %s params, frozen)",
+                    vae_ckpt["epoch"], vae_ckpt.get("best_pearson", -1), f"{vae_n_params:,}")
+        del vae_ckpt
+    else:
+        logger.warning("No VAE checkpoint specified — operating on raw fMRI space")
+
     # Model
     from src.models.brain_flow_nsd import BrainFlowNSD
 
     nf_cfg = cfg["brainflow"]
-    output_dim = nf_cfg.get("output_dim", 15724)
+    output_dim = nf_cfg.get("output_dim", 256)
 
     dn_params = dict(nf_cfg.get("dit_net", {}))
     dn_params["modality_dims"] = [
@@ -168,10 +199,19 @@ def train(args):
     model = BrainFlowNSD(
         output_dim=output_dim,
         dit_net_params=dn_params,
-        n_subjects=nf_cfg.get("n_subjects", 1),
-        reg_weight=nf_cfg.get("reg_weight", 1.0),
-        contrastive_weight=nf_cfg.get("contrastive_weight", 0.1),
-        contrastive_temp=nf_cfg.get("contrastive_temp", 0.1),
+        source_encoder_params={
+            "modality_dims": [
+                train_set.feat_dinov2.shape[-1],
+                train_set.feat_clip.shape[-1],
+                train_set.feat_qwen.shape[-1],
+            ],
+            **nf_cfg.get("source_encoder", {}),
+        },
+        transport_params=cfg.get("transport", {}),
+        kld_weight=nf_cfg.get("kld_weight", 1e-3),
+        align_weight=nf_cfg.get("align_weight", 0.1),
+        detach_ut=nf_cfg.get("detach_ut", True),
+        vae=vae_model,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -231,7 +271,7 @@ def train(args):
     history_file = out_dir / "history.csv"
     if start_epoch == 1:
         with open(history_file, "w") as f:
-            f.write("epoch,total_loss,flow_loss,reg_loss,cont_loss,val_pcc,lr\n")
+            f.write("epoch,total_loss,flow_loss,kld_loss,align_loss,mu_norm,std_mean,flow_pcc,src_pcc,lr\n")
 
     # Solver config
     solver_cfg = cfg.get("solver_args", {})
@@ -246,7 +286,7 @@ def train(args):
 
     for epoch in range(start_epoch, tr_cfg["n_epochs"] + 1):
         model.train()
-        epoch_losses = {"total": [], "flow": [], "reg": [], "cont": []}
+        epoch_losses = {"total": [], "flow": [], "kld": [], "align": [], "mu_norm": [], "std_mean": []}
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{tr_cfg['n_epochs']}")
         for batch_idx, batch in enumerate(pbar):
@@ -255,15 +295,27 @@ def train(args):
 
             context = {k: v.to(device) for k, v in batch["context"].items()}
             target = batch["fmri"].to(device)            # (B, 15724)
-            subject_ids = batch["subject_idx"].to(device)
 
-            # CFG: 10% context dropout
+            # Feature augmentation: add Gaussian noise to input features
+            feat_noise_std = tr_cfg.get("feat_noise_std", 0.0)
+            if feat_noise_std > 0 and model.training:
+                context = {k: v + feat_noise_std * torch.randn_like(v) for k, v in context.items()}
+
+            # Mixup augmentation: interpolate between pairs of samples
+            mixup_alpha = tr_cfg.get("mixup_alpha", 0.0)
+            if mixup_alpha > 0 and model.training:
+                lam = np.random.beta(mixup_alpha, mixup_alpha)
+                perm = torch.randperm(target.size(0), device=device)
+                context = {k: lam * v + (1 - lam) * v[perm] for k, v in context.items()}
+                target = lam * target + (1 - lam) * target[perm]
+
+            # CFG: 10% context dropout (flow branch only)
+            context_dropped = None
             if random.random() < 0.1:
-                # If context is a dict, apply dropout to each tensor value
-                context = {k: torch.zeros_like(v) for k, v in context.items()}
+                context_dropped = {k: torch.zeros_like(v) for k, v in context.items()}
 
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
-                losses = model(context, target, subject_ids=subject_ids)
+                losses = model(context, target_fmri=target, context_dropped=context_dropped)
                 loss = losses["total_loss"]
 
             optimizer.zero_grad(set_to_none=True)
@@ -274,8 +326,10 @@ def train(args):
 
             epoch_losses["total"].append(loss.item())
             epoch_losses["flow"].append(losses["flow_loss"].item())
-            epoch_losses["reg"].append(losses["reg_loss"].item())
-            epoch_losses["cont"].append(losses["cont_loss"].item())
+            epoch_losses["kld"].append(losses["kld_loss"].item())
+            epoch_losses["align"].append(losses["align_loss"].item())
+            epoch_losses["mu_norm"].append(losses["mu_norm"].item())
+            epoch_losses["std_mean"].append(losses["std_mean"].item())
             global_step += 1
             ema.update(model)
 
@@ -289,11 +343,14 @@ def train(args):
         # Validation
         # =====================================================================
         mean_pcc = 0.0
+        median_pcc = 0.0
+        mean_pcc_reg = 0.0
         if epoch % tr_cfg["val_every_n_epochs"] == 0 or args.fast_dev_run:
             ema.apply_shadow(model)
             model.eval()
 
-            all_fmri_pred = []
+            all_flow_pred = []
+            all_reg_pred = []
             all_fmri_target = []
 
             with torch.no_grad():
@@ -303,49 +360,65 @@ def train(args):
                     context = {k: v.to(device) for k, v in batch["context"].items()}
                     fmri_target = batch["fmri"]  # (B, 15724) — raw fMRI
 
-                    # Directly predict Regression for PCC calculation
-                    fmri_pred = model.predict_regression(context)  # (B, 15724)
+                    # Flow model prediction via ODE solver (20 steps)
+                    flow_pred = model.synthesise(
+                        context,
+                        n_timesteps=val_n_timesteps,
+                        solver_method=val_solver_method,
+                        cfg_scale=val_cfg_scale,
+                    )  # (B, 15724)
 
-                    all_fmri_pred.append(fmri_pred.cpu())
+                    # μ₀ shift prediction (coarse estimate, for comparison)
+                    reg_pred = model.predict_regression(context)  # (B, 15724)
+
+                    all_flow_pred.append(flow_pred.cpu())
+                    all_reg_pred.append(reg_pred.cpu())
                     all_fmri_target.append(fmri_target)
 
-            if all_fmri_pred:
-                all_fmri_pred = torch.cat(all_fmri_pred, dim=0).float()
+            if all_flow_pred:
+                all_flow_pred = torch.cat(all_flow_pred, dim=0).float()
+                all_reg_pred = torch.cat(all_reg_pred, dim=0).float()
                 all_fmri_target = torch.cat(all_fmri_target, dim=0).float()
 
-                pcc = pearson_corr_per_dim(all_fmri_pred, all_fmri_target)
-                mean_pcc = float(pcc.mean().item())
-                median_pcc = float(pcc.median().item())
+                pcc_flow = pearson_corr_per_dim(all_flow_pred, all_fmri_target)
+                mean_pcc = float(pcc_flow.mean().item())
+                median_pcc = float(pcc_flow.median().item())
 
-            logger.info("Epoch %d | Val PCC: mean=%.4f, median=%.4f (PCA→fMRI)",
-                        epoch, mean_pcc, median_pcc)
+                pcc_reg = pearson_corr_per_dim(all_reg_pred, all_fmri_target)
+                mean_pcc_reg = float(pcc_reg.mean().item())
+
+            logger.info("Epoch %d | Flow PCC: mean=%.4f, median=%.4f | Src PCC: mean=%.4f",
+                        epoch, mean_pcc, median_pcc, mean_pcc_reg)
 
             if mean_pcc > best_val_corr:
                 best_val_corr = mean_pcc
                 torch.save(model.state_dict(), out_dir / "best.pt")
-                logger.info("✅ New best model (PCC=%.4f)", best_val_corr)
+                logger.info("✅ New best model (Flow PCC=%.4f)", best_val_corr)
 
             # Log
             mean_total = float(np.mean(epoch_losses["total"]))
             mean_flow = float(np.mean(epoch_losses["flow"]))
-            mean_reg = float(np.mean(epoch_losses["reg"]))
-            mean_cont = float(np.mean(epoch_losses["cont"]))
+            mean_kld = float(np.mean(epoch_losses["kld"]))
+            mean_align = float(np.mean(epoch_losses["align"]))
+            mean_mu_norm = float(np.mean(epoch_losses["mu_norm"]))
+            mean_std = float(np.mean(epoch_losses["std_mean"]))
             lr = scheduler.get_last_lr()[0]
             with open(history_file, "a") as f:
-                f.write(f"{epoch},{mean_total:.6f},{mean_flow:.6f},{mean_reg:.6f},{mean_cont:.6f},{mean_pcc:.6f},{lr:.2e}\n")
+                f.write(f"{epoch},{mean_total:.6f},{mean_flow:.6f},{mean_kld:.6f},{mean_align:.6f},{mean_mu_norm:.4f},{mean_std:.4f},{mean_pcc:.6f},{mean_pcc_reg:.6f},{lr:.2e}\n")
 
             ema.restore(model)
 
-        # Save checkpoint
-        torch.save({
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "ema": ema.state_dict(),
-            "global_step": global_step,
-            "best_val_corr": best_val_corr,
-        }, out_dir / "last.pt")
+        # Save checkpoint (only on val epochs to avoid ~2.4GB disk I/O every epoch)
+        if epoch % tr_cfg["val_every_n_epochs"] == 0 or args.fast_dev_run:
+            torch.save({
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "ema": ema.state_dict(),
+                "global_step": global_step,
+                "best_val_corr": best_val_corr,
+            }, out_dir / "last.pt")
 
     logger.info("Training complete. Best val PCC: %.4f", best_val_corr)
 

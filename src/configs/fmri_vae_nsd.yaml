@@ -1,0 +1,54 @@
+# =====================================================================
+# fMRI VAE for NSD — Train static MLP-based VAE
+# =====================================================================
+# Compresses 15724 voxels → 256-D latent for Stage-2 Flow Matching
+# Uses existing NSDDataset (only fmri field)
+#
+# Usage:
+#     python src/train_fmri_vae_nsd.py --config src/configs/fmri_vae_nsd.yaml --fast_dev_run
+#     python src/train_fmri_vae_nsd.py --config src/configs/fmri_vae_nsd.yaml
+#     python src/train_fmri_vae_nsd.py --config src/configs/fmri_vae_nsd.yaml --resume
+# =====================================================================
+
+data_dir: NSD/data/nsd
+subject: 1
+n_voxels: 15724
+fmri_mode: zscore
+
+# =====================================================================
+# VAE config
+# =====================================================================
+vae:
+  latent_dim: 256
+  hidden_dim: 2048
+  num_res_blocks: 4
+  dropout: 0.15
+
+  # Loss
+  lambda_pcc: 1.0
+  pcc_warmstart_epochs: 10         # First 10 epochs: PCC only
+  free_bits: 0.5
+  beta_max: 0.05
+  beta_warmup_epochs: 30           # Linear β annealing: 0→0.05 over 30 epochs
+
+  # Augmentation
+  noise_std: 0.05                  # Gaussian noise injection during training
+
+# =====================================================================
+# Training
+# =====================================================================
+training:
+  n_epochs: 200
+  lr: 3.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  grad_clip: 1.0
+  use_amp: true
+  ema_decay: 0.999
+  log_every_n_steps: 10
+  val_every_n_epochs: 5
+  batch_size: 64
+  val_batch_size: 512
+
+# --- Output ---
+output_dir: outputs/fmri_vae_nsd

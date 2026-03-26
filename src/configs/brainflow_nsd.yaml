@@ -1,63 +1,81 @@
 # =====================================================================
-# BrainFlow NSD — Flow Matching for NSD Discrete Image→fMRI
+# BrainFlow NSD — CSFM-Style Conditional Source Flow Matching
 # =====================================================================
-# 3 modalities (pooled features): DINOv2, SDXL-CLIP, Qwen3-VL
-# PCA: 15724 voxels → 1000 dimensions
-# No temporal context (T=1, discrete image-fMRI pairs)
+# Source: SourceEncoder (Perceiver) → (μ, log_var) → reparameterize
+# Target: target_latent (no shift)
+# Uses CSFM transport for correct gradient flow
 # =====================================================================
 
 data_dir: NSD/data/nsd
 subject: 1
 n_voxels: 15724
+fmri_mode: zscore
 
-# --- Feature files (pooled embeddings) ---
-# Files are at: {data_dir}/subj0{subject}/nsd_{feat}_{mode}_sub{subject}.npy
+# --- VAE (frozen, Stage 1) ---
+vae:
+  checkpoint: outputs/fmri_vae_nsd/best.pt
+  latent_dim: 256
+
+# --- Feature files ---
 features:
   dinov2:
     pool: nsd_dinov2_vitl14_pool_{mode}_sub{sub}.npy
     dim: 1024
   clip:
     pool: nsd_sdxl_clip_pool_{mode}_sub{sub}.npy
-    dim: 1280
+    dim: 1664
   qwen:
     pool: nsd_qwen3vl_pool_{mode}_sub{sub}.npy
     dim: 2048
 
-modality_dims: [1024, 1280, 2048]   # dinov2, clip, qwen = 4352 total
+modality_dims: [1024, 1664, 2048]
 
-# --- fMRI ---
 fmri:
-  train: nsd_train_fmri_scale_sub{sub}.npy    # (9000, 3, 15724)
-  test: nsd_test_fmri_scale_sub{sub}.npy      # (1000, 3, 15724)
-  n_reps: 3                                    # average 3 repetitions
-
-# --- PCA ---
-# Removed PCA logic for direct fMRI prediction
+  train: nsd_train_fmri_zscore_sub{sub}.npy
+  test: nsd_test_fmri_zscore_sub{sub}.npy
+  n_reps: 3
 
 # =====================================================================
 # Model config
 # =====================================================================
 brainflow:
-  output_dim: 15724                # Full fMRI space
-  reg_weight: 1.0                  # Explicit weight for regression loss
-  contrastive_weight: 0.1          # InfoNCE contrastive loss weight
-  contrastive_temp: 0.1            # InfoNCE contrastive temp
-  n_subjects: 1
+  output_dim: 256
+  kld_weight: 3.0e-2                 # KLD loss weight (↑ prevent variance collapse)
+  align_weight: 0.5                  # Alignment loss weight (↑ push μ → target)
+  detach_ut: false                    # Flow loss gradient → SourceEncoder
 
-  dit_net:                         # BrainDiT configuration inspired by mm-DiT
-    output_dim: 15724
+  # Source Encoder (CSFM-style Perceiver)
+  source_encoder:
+    hidden_dim: 512
+    output_dim: 256
+    n_queries: 8
+    n_layers: 2
+    n_heads: 8
+    dropout: 0.1
+    init_logvar: 0.0                 # Start with σ ≈ 1
+
+  # Velocity Network (DiT)
+  dit_net:
+    output_dim: 256
     hidden_dim: 768
-    proj_dim: 256
     n_blocks: 6
     n_heads: 12
-    dropout: 0.1
-    modality_dropout: 0.1
+    dropout: 0.25
 
 # =====================================================================
-# Solver (validation inference)
+# CSFM Transport config
+# =====================================================================
+transport:
+  path_type: Linear
+  prediction: velocity
+  time_dist_type: uniform
+  time_dist_shift: 1.0
+
+# =====================================================================
+# Solver (validation ODE inference)
 # =====================================================================
 solver_args:
-  method: midpoint
+  method: dopri5
   time_points: 50
   cfg_scale: 0.0
 
@@ -65,19 +83,20 @@ solver_args:
 # Training
 # =====================================================================
 training:
-  n_epochs: 200
-  lr: 5.0e-4
-  weight_decay: 0.01
+  n_epochs: 300
+  lr: 2.0e-4
+  weight_decay: 0.05
   warmup_ratio: 0.1
   min_lr: 1.0e-5
   grad_clip: 1.0
   use_amp: true
   log_every_n_steps: 10
-  val_every_n_epochs: 5
+  val_every_n_epochs: 10
   ema_decay: 0.999
   batch_size: 64
   val_batch_size: 128
   num_workers: 4
+  feat_noise_std: 0.1
+  mixup_alpha: 0.4
 
-# --- Output ---
 output_dir: outputs/brainflow_nsd

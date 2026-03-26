@@ -15,10 +15,8 @@ Data shapes (subj01):
 import logging
 import os
 
-import joblib
 import numpy as np
 import torch
-from sklearn.decomposition import PCA
 from torch.utils.data import Dataset
 
 logger = logging.getLogger("nsd_dataset")
@@ -38,16 +36,17 @@ class NSDDataset(Dataset):
         data_dir: str,
         subject: int,
         mode: str = "train",         # "train" or "test"
+        fmri_mode: str = "scale",    # "scale" or "zscore"
     ):
         super().__init__()
         self.mode = mode
         self.subject = subject
 
         subj_dir = os.path.join(data_dir, f"subj0{subject}")
-        logger.info("Loading NSD data from %s (mode=%s)", subj_dir, mode)
+        logger.info("Loading NSD data from %s (mode=%s, fmri_mode=%s)", subj_dir, mode, fmri_mode)
 
         # --- Load fMRI: (N, 3, 15724) → average reps → (N, 15724) ---
-        fmri_path = os.path.join(subj_dir, f"nsd_{mode}_fmri_scale_sub{subject}.npy")
+        fmri_path = os.path.join(subj_dir, f"nsd_{mode}_fmri_{fmri_mode}_sub{subject}.npy")
         fmri_raw = np.load(fmri_path)  # (N, 3, V)
         logger.info("  fMRI raw: %s %s", fmri_raw.shape, fmri_raw.dtype)
 
