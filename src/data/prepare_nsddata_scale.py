@@ -135,11 +135,12 @@ print("Stimuli dataset is opened: ", stim.shape)
 
 num_train, num_test = len(train_im_idx), len(test_im_idx)
 vox_dim, im_dim, im_c = num_voxel, 425, 3
-fmri_array = np.zeros((num_train,3,vox_dim))
+fmri_array = np.zeros((num_train,3,vox_dim), dtype=np.float32)
 stim_array = np.zeros((num_train,im_dim,im_dim,im_c), dtype=np.uint8) # Pre-allocate with uint8 to save RAM
 for i,idx in enumerate(train_im_idx):
     stim_array[i] = stim[idx] # Read only this specific image from disk to RAM
-    fmri_array[i] = fmri[sorted(sig_train[idx])]  #[3, voxels]
+    trials = sorted(sig_train[idx])
+    fmri_array[i, :len(trials)] = fmri[trials]  #[3, voxels]
     # fmri_array[i] = fmri[sorted(sig_train[idx])].mean(0)
     print(i)
 
@@ -149,11 +150,12 @@ np.save('nsd/subj{:02d}/nsd_train_stim_sub{}.npy'.format(sub,sub),stim_array)
 
 print("Training data is saved.")
 
-fmri_array = np.zeros((num_test,3,vox_dim))
+fmri_array = np.zeros((num_test,3,vox_dim), dtype=np.float32)
 stim_array = np.zeros((num_test,im_dim,im_dim,im_c), dtype=np.uint8) # Pre-allocate with uint8 to save RAM
 for i,idx in enumerate(test_im_idx):
     stim_array[i] = stim[idx] # Read only this specific image from disk to RAM
-    fmri_array[i] = fmri[sorted(sig_test[idx])]
+    trials = sorted(sig_test[idx])
+    fmri_array[i, :len(trials)] = fmri[trials]
     # fmri_array[i] = fmri[sorted(sig_test[idx])].mean(0)
     print(i)
 

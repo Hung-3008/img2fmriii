@@ -127,3 +127,4 @@ SynBrain/
 docs/
 .vscode/
 outputs/
+pyrightconfig.json

@@ -37,10 +37,12 @@ class NSDDataset(Dataset):
         subject: int,
         mode: str = "train",         # "train" or "test"
         fmri_mode: str = "scale",    # "scale" or "zscore"
+        fmri_only: bool = False,     # True for VAE training (skip features)
     ):
         super().__init__()
         self.mode = mode
         self.subject = subject
+        self.fmri_only = fmri_only
 
         subj_dir = os.path.join(data_dir, f"subj0{subject}")
         logger.info("Loading NSD data from %s (mode=%s, fmri_mode=%s)", subj_dir, mode, fmri_mode)
@@ -71,18 +73,23 @@ class NSDDataset(Dataset):
             
             return torch.from_numpy(arr.astype(np.float32))
 
-        self.feat_dinov2 = load_feature("dinov2", "dinov2_vitl14")
-        self.feat_clip = load_feature("clip", "sdxl_clip")
-        self.feat_qwen = load_feature("qwen", "qwen3vl")
+        if not fmri_only:
+            self.feat_dinov2 = load_feature("dinov2", "dinov2_vitl14")
+            self.feat_clip = load_feature("clip", "sdxl_clip")
+            self.feat_qwen = load_feature("qwen", "qwen3vl")
 
-        logger.info("  DINOv2: %s, CLIP: %s, Qwen: %s", self.feat_dinov2.shape, self.feat_clip.shape, self.feat_qwen.shape)
+            logger.info("  DINOv2: %s, CLIP: %s, Qwen: %s", self.feat_dinov2.shape, self.feat_clip.shape, self.feat_qwen.shape)
 
-
-
-        self.n_samples = self.fmri.shape[0]
-        assert self.feat_dinov2.shape[0] == self.n_samples
-        assert self.feat_clip.shape[0] == self.n_samples
-        assert self.feat_qwen.shape[0] == self.n_samples
+            self.n_samples = self.fmri.shape[0]
+            assert self.feat_dinov2.shape[0] == self.n_samples
+            assert self.feat_clip.shape[0] == self.n_samples
+            assert self.feat_qwen.shape[0] == self.n_samples
+        else:
+            self.feat_dinov2 = None
+            self.feat_clip = None
+            self.feat_qwen = None
+            self.n_samples = self.fmri.shape[0]
+            logger.info("  fMRI-only mode (skipping feature loading)")
 
         logger.info("  Dataset ready: %d samples", self.n_samples)
 
@@ -90,14 +97,20 @@ class NSDDataset(Dataset):
         return self.n_samples
 
     def __getitem__(self, idx):
-        fmri = self.fmri[idx]  # (V=15724,)
+        fmri = self.fmri[idx]
+
+        if self.fmri_only:
+            return {
+                "fmri": fmri,
+                "subject_idx": 0,
+            }
 
         return {
             "context": {
-                "dino": self.feat_dinov2[idx], # (L1, 1024)
-                "clip": self.feat_clip[idx],   # (L2, 1280)
-                "qwen": self.feat_qwen[idx],   # (L3, 2048)
+                "dino": self.feat_dinov2[idx],
+                "clip": self.feat_clip[idx],
+                "qwen": self.feat_qwen[idx],
             },
-            "fmri": fmri,             # (15724,)
-            "subject_idx": 0,          # single-subject
+            "fmri": fmri,
+            "subject_idx": 0,
         }
