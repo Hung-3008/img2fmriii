@@ -20,6 +20,7 @@ parts/
 sdist/
 var/
 wheels/
+pip-wheel-metadata/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
@@ -37,24 +38,19 @@ pip-delete-this-directory.txt
 # Unit test / coverage reports
 htmlcov/
 .tox/
-.nox/
-.coverage
-.coverage.*
+.nosetests
+.pytest_cache/
 .cache
 nosetests.xml
 coverage.xml
 *.cover
-*.py,cover
 .hypothesis/
-.pytest_cache/
-cover/
 
 # Translations
 *.mo
 *.pot
 
 # Django stuff:
-*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -70,7 +66,6 @@ instance/
 docs/_build/
 
 # PyBuilder
-.pybuilder/
 target/
 
 # Jupyter Notebook
@@ -89,25 +84,9 @@ ipython_config.py
 # Pipfile.lock
 
 # poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   poetry.lock
-
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm.lock
-#   pdm build/
-.pdm-python
-.pdm-build/
-
-# PEP 582; used by e.g. github.com/pdm-project/pdm
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
+#   Poetry uses pyproject.toml and poetry.lock. It is recommended to include poetry.lock.
+#   If you must ignore it, uncomment the next line:
+# poetry.lock
 
 # Environments
 .env
@@ -118,15 +97,15 @@ ENV/
 env.bak/
 venv.bak/
 
-# Spyder project settings
+# Spyder project files
 .spyderproject
 .spyproject
 
-# Rope project settings
+# Rope project files
 .ropeproject
 
 # mkdocs documentation
-/site
+site/
 
 # mypy
 .mypy_cache/
@@ -136,16 +115,16 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# PyCharm
-.idea/
-BrainSyn/
+results/
+.gemini/
 NSD/
-wandb/
 notes/
-scripts/
+commands.ipynb
+Data/
+SynBrain/
+src/utils/MindeEyeV2/
+SynBrain/
+docs/
+.vscode/
+outputs/
+pyrightconfig.json
