@@ -410,21 +410,21 @@ class FactFlowTrainer:
         return {"mse": val_mse, "profile_r": val_corr, "n": n}
 
     @torch.no_grad()
-    def _validate(self, epoch: int) -> Dict[str, float]:
-        """Full validation over the entire test set (EMA + RAW)."""
+    def _validate(self, epoch: int) -> Dict[str, Dict[str, float]]:
+        """Full validation over the test set, returning both EMA and RAW metrics."""
         eval_bs = min(8, len(self.test_ds))
         loader = DataLoader(self.test_ds, batch_size=eval_bs, shuffle=False, num_workers=0)
 
-        # EMA — primary metric used for best-ckpt selection
-        val = self._run_val_pass(self.ema, loader, "EMA", epoch)
+        # EMA — smoothed weights
+        val_ema = self._run_val_pass(self.ema, loader, "EMA", epoch)
 
-        # RAW — secondary, useful to diagnose EMA lag especially early in training
+        # RAW — instantaneous weights; tracks true model capability, esp. early on
         self.wrapper.eval()
         loader2 = DataLoader(self.test_ds, batch_size=eval_bs, shuffle=False, num_workers=0)
-        self._run_val_pass(self.wrapper, loader2, "RAW", epoch)
+        val_raw = self._run_val_pass(self.wrapper, loader2, "RAW", epoch)
         self.wrapper.train()
 
-        return val
+        return {"ema": val_ema, "raw": val_raw}
 
     # ──────────────────────────────────────────────────────────────────
     # Main training loop
@@ -439,9 +439,11 @@ class FactFlowTrainer:
         history_writer = csv.writer(history_file)
         if not history_exists:
             history_writer.writerow([
-                "step", "epoch",
+                "epoch", "step",
                 "train_loss", "train_diff_loss", "train_kld_loss", "train_align_loss",
-                "val_mse", "val_profile_r", "lr",
+                "val_mse", "val_profile_r",
+                "val_mse_raw", "val_profile_r_raw", "val_profile_r_best",
+                "lr",
             ])
             history_file.flush()
 
@@ -575,18 +577,25 @@ class FactFlowTrainer:
             if not hit_max and is_val_epoch:
                 self.logger.info("End of epoch %d, running validation...", epoch + 1)
                 val = self._validate(epoch)
+                ema_m, raw_m = val["ema"], val["raw"]
+                best_pcc = max(ema_m["profile_r"], raw_m["profile_r"])
+                best_src = "EMA" if ema_m["profile_r"] >= raw_m["profile_r"] else "RAW"
+                best_mse = (ema_m if best_src == "EMA" else raw_m)["mse"]
 
-                # Write CSV
+                # Write CSV (EMA cols kept for back-compat; raw + best appended)
                 lr = self.scheduler.get_last_lr()[0]
                 ep_n = max(1, epoch_steps)
                 history_writer.writerow([
-                    self.train_steps, epoch,
+                    epoch + 1, self.train_steps,
                     f"{epoch_acc['loss'] / ep_n:.6f}",
                     f"{epoch_acc['diff'] / ep_n:.6f}",
                     f"{epoch_acc['kld'] / ep_n:.6f}",
                     f"{epoch_acc['align'] / ep_n:.6f}",
-                    f"{val['mse']:.6f}",
-                    f"{val['profile_r']:.6f}",
+                    f"{ema_m['mse']:.6f}",
+                    f"{ema_m['profile_r']:.6f}",
+                    f"{raw_m['mse']:.6f}",
+                    f"{raw_m['profile_r']:.6f}",
+                    f"{best_pcc:.6f}",
                     f"{lr:.2e}",
                 ])
                 history_file.flush()
@@ -595,17 +604,19 @@ class FactFlowTrainer:
                 epoch_acc = {k: 0. for k in epoch_acc}
                 epoch_steps = 0
 
-                # Save best checkpoint
-                if val["profile_r"] > self.best_val_pcc:
-                    self.best_val_pcc = val["profile_r"]
+                # Save best checkpoint by max(EMA, RAW) PCC
+                if best_pcc > self.best_val_pcc:
+                    self.best_val_pcc = best_pcc
                     save_checkpoint(
                         os.path.join(self.ckpt_dir, "best.pt"),
                         self.wrapper, self.ema, self.optimizer, self.scheduler,
                         self.train_steps, epoch, self.best_val_pcc,
-                        val_mse=val["mse"],
+                        val_mse=best_mse,
                     )
                     self.logger.info(
-                        "New best PCC: %.4f!", self.best_val_pcc,
+                        "New best PCC: %.4f (%s; EMA=%.4f RAW=%.4f)!",
+                        self.best_val_pcc, best_src,
+                        ema_m["profile_r"], raw_m["profile_r"],
                     )
 
             if hit_max:
