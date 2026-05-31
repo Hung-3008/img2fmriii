@@ -382,6 +382,11 @@ def main():
     epoch_kld = 0.0
     epoch_align = 0.0
     epoch_steps = 0
+    # Per-step accumulators (reset after each optimizer step)
+    step_loss = 0.0
+    step_diff = 0.0
+    step_kld = 0.0
+    step_align = 0.0
     log_steps = 0
     accum_counter = 0
     start_time = time()
@@ -453,10 +458,18 @@ def main():
             pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{sched.get_last_lr()[0]:.2e}")
 
             # Accumulate loss stats per micro-batch
-            running_loss += loss.detach().item() / grad_accum
-            running_diff += diff_loss.detach().item() / grad_accum
-            running_kld += kld_loss_val.detach().item() / grad_accum
-            running_align += align_loss_val.detach().item() / grad_accum
+            _loss_val = loss.detach().item() / grad_accum
+            _diff_val = diff_loss.detach().item() / grad_accum
+            _kld_val = kld_loss_val.detach().item() / grad_accum
+            _align_val = align_loss_val.detach().item() / grad_accum
+            running_loss += _loss_val
+            running_diff += _diff_val
+            running_kld += _kld_val
+            running_align += _align_val
+            step_loss += _loss_val
+            step_diff += _diff_val
+            step_kld += _kld_val
+            step_align += _align_val
 
             # Only step optimizer after grad_accum micro-batches
             if accum_counter < grad_accum:
@@ -473,12 +486,13 @@ def main():
             log_steps += 1
             train_steps += 1
 
-            # Epoch-level accumulators
-            epoch_loss += running_loss
-            epoch_diff += running_diff
-            epoch_kld += running_kld
-            epoch_align += running_align
+            # Epoch-level accumulators (use per-step values, not running sums)
+            epoch_loss += step_loss
+            epoch_diff += step_diff
+            epoch_kld += step_kld
+            epoch_align += step_align
             epoch_steps += 1
+            step_loss = step_diff = step_kld = step_align = 0.0
 
             # --- Logging ---
             if train_steps % log_every == 0:
