@@ -16,21 +16,25 @@ def expand_t_like_x(t, x):
 #################### Coupling Plans ####################
 
 class ICPlan:
-    """Linear Coupling Plan"""
+    """Linear Coupling Plan (standard: t=0 noise, t=1 data)
+
+    x_t = alpha(t) * x1 + sigma(t) * x0 = t * x1 + (1-t) * x0
+    u_t = x1 - x0 (velocity: noise → data)
+    """
     def __init__(self, sigma=0.0):
         self.sigma = sigma
 
     def compute_alpha_t(self, t):
-        """Compute the data coefficient along the path"""
-        return 1 - t, -1
-    
-    def compute_sigma_t(self, t):
-        """Compute the noise coefficient along the path"""
+        """Compute the data coefficient: alpha(t) = t"""
         return t, 1
     
+    def compute_sigma_t(self, t):
+        """Compute the noise coefficient: sigma(t) = 1-t"""
+        return 1 - t, -1
+    
     def compute_d_alpha_alpha_ratio_t(self, t):
-        """Compute the ratio between d_alpha and alpha"""
-        return -1 / (1 - t)
+        """Compute the ratio between d_alpha and alpha: 1/t"""
+        return 1 / t
 
     def compute_drift(self, x, t):
         """We always output sde according to score parametrization; """

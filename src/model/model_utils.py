@@ -206,6 +206,44 @@ class VisionRotaryEmbeddingFast(nn.Module):
         # return t * freqs_cos + rotate_half(t) * freqs_sin
 
 
+class RotaryEmbedding1D(nn.Module):
+    """1D Rotary Position Embedding for sequential tokens.
+
+    Unlike VisionRotaryEmbeddingFast (2D grid), this uses a single
+    spatial dimension — suitable for 1D signals like fMRI voxels.
+
+    The full head_dim is used for rotation (vs 2D which splits
+    head_dim in half for h and w).
+    """
+
+    def __init__(self, dim, seq_len, theta=10000):
+        """
+        Args:
+            dim:     head_dim = hidden_size // num_heads
+            seq_len: number of tokens (patches)
+        """
+        super().__init__()
+        freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+        t = torch.arange(seq_len).float()
+        freqs = torch.einsum('i, j -> ij', t, freqs)   # (seq_len, dim//2)
+        freqs = repeat(freqs, '... n -> ... (n r)', r=2)  # (seq_len, dim)
+
+        self.register_buffer("freqs_cos", freqs.cos())
+        self.register_buffer("freqs_sin", freqs.sin())
+
+    def forward(self, t):
+        """
+        Args:
+            t: (B, num_heads, L, head_dim)
+        Returns:
+            Rotated tensor of same shape.
+        """
+        _, _, L, _ = t.shape
+        freqs_cos = self.freqs_cos[:L]
+        freqs_sin = self.freqs_sin[:L]
+        return t * freqs_cos + rotate_half(t) * freqs_sin
+
+
 class RelativePositionBias2D(nn.Module):
     """
     2D relative positional bias for full self-attention.

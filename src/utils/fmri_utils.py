@@ -26,13 +26,22 @@ def create_pad_mask(
     return mask
 
 
-def get_latent_size(data_cfg: Union[DictConfig, Dict]) -> Tuple[int, int, int]:
-    """Return ``(C, H, W)`` for the pseudo-2D fMRI representation.
+def get_latent_size(data_cfg: Union[DictConfig, Dict]) -> Tuple[int, ...]:
+    """Return latent tensor shape for fMRI representation.
 
-    Reads ``fmri_channels`` and ``fmri_spatial`` from *data_cfg*.
+    - 1D mode (default): ``(1, pad_to)``
+    - 2D mode (legacy):  ``(C, H, W)``
+
+    Reads ``fmri_channels``, ``fmri_spatial``, and ``pad_to`` from *data_cfg*.
     """
     if isinstance(data_cfg, DictConfig):
         data_cfg = OmegaConf.to_container(data_cfg, resolve=True)
-    c = int(data_cfg["fmri_channels"])
-    s = int(data_cfg["fmri_spatial"])
-    return (c, s, s)
+    s = data_cfg.get("fmri_spatial", None)
+    if s is not None and int(s) > 0:
+        # 2D legacy mode
+        c = int(data_cfg["fmri_channels"])
+        s = int(s)
+        return (c, s, s)
+    else:
+        # 1D native mode
+        return (1, int(data_cfg["pad_to"]))

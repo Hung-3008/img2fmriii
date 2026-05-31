@@ -3,6 +3,9 @@
 # CLIP image features → Flow Matching → fMRI voxels
 # =============================================================================
 
+# --- Source encoder toggle (false = pure noise x₀, standard flow matching) ---
+use_source_encoder: false
+
 # --- Data ---
 data:
   data_dir: NSD/data/nsd
@@ -10,17 +13,16 @@ data:
   fmri_mode: scale          # "scale" or "zscore"
   clip_feature: sdxl_clip   # feature prefix
   n_voxels: 15724           # raw voxel count for subj01
-  pad_to: 16384             # reshaped as (4, 64, 64)
-  fmri_channels: 4          # reshape: 16384 / (64*64) = 4
-  fmri_spatial: 64          # spatial dim: 64×64
+  pad_to: 16384             # padded length (must be divisible by patch_size)
+  # 1D mode — no fmri_channels / fmri_spatial needed
 
-# --- Stage 2: Velocity model (LightningDiT) ---
+# --- Stage 2: Velocity model (DiT1D — native 1D) ---
 stage_2:
-  target: model.lightning_dit.LightningDiT
+  target: model.dit_1d.DiT1D
   params:
-    input_size: 64           # spatial size after reshape
-    patch_size: 2            # 2×2 patches → 32×32 = 1024 tokens
-    in_channels: 4           # fMRI reshaped to 4 channels
+    seq_len: 16384           # = pad_to
+    patch_size: 32           # 16384/32 = 512 tokens
+    in_channels: 1           # fMRI as single-channel 1D signal
     hidden_size: 512
     depth: 12
     num_heads: 8
@@ -68,19 +70,19 @@ sampler:
   mode: ODE
   params:
     sampling_method: euler
-    num_steps: 50
+    num_steps: 30
     atol: 1.0e-06
     rtol: 0.001
     reverse: false
 
 # --- Losses ---
 losses:
-  use_kld_loss: true
+  use_kld_loss: false
   kld_loss_type: var_kld
   kld_loss_weight: 5.0
   kld_target_std: 1.0
   kld_reduction: mean
-  use_align_loss: true
+  use_align_loss: false
   align_loss_weight: 1.0
   align_loss_type: normalized_l2
   detach_ut: false
@@ -89,7 +91,7 @@ losses:
 training:
   global_seed: 42
   epochs: 200
-  batch_size: 32
+  batch_size: 64
   grad_accum_steps: 8       # effective batch = 8 × 8 = 64
   ema_decay: 0.9999
   num_workers: 4

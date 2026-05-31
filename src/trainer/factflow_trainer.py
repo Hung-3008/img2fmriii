@@ -159,6 +159,11 @@ class FactFlowTrainer:
         self.start_epoch = 0
         self.best_val_pcc = -1.0
 
+        # Sync EMA = exact copy of wrapper BEFORE loading checkpoint, so that
+        # on fresh starts EMA begins as a copy of the initialized model, and on
+        # resumes the checkpoint loader correctly overwrites both wrapper and EMA.
+        update_ema(self.ema, self.wrapper, decay=0)
+
         self._maybe_resume()
 
         # ── Training hyper-params ─────────────────────────────────────
@@ -187,9 +192,8 @@ class FactFlowTrainer:
         self.detach_ut = self.loss_cfg.get("detach_ut", False)
         self.clip_logvar_min = float(self.loss_cfg.get("clip_logvar_min", -10.0))
         self.clip_logvar_max = float(self.loss_cfg.get("clip_logvar_max", 10.0))
+        self.use_source = bool(self.cfg.get("use_source_encoder", True))
 
-        # ── Initialise EMA ────────────────────────────────────────────
-        update_ema(self.ema, self.wrapper, decay=0)  # exact copy
         self.wrapper.train()
         self.ema.eval()
 
@@ -206,8 +210,8 @@ class FactFlowTrainer:
             clip_feature=dc["clip_feature"],
             n_voxels=dc["n_voxels"],
             pad_to=dc["pad_to"],
-            fmri_channels=dc["fmri_channels"],
-            fmri_spatial=dc["fmri_spatial"],
+            fmri_channels=dc.get("fmri_channels", 1),
+            fmri_spatial=dc.get("fmri_spatial", None),
         )
         self.train_ds = FactFlowfMRIDataset(mode="train", **ds_kwargs)
         self.test_ds = FactFlowfMRIDataset(mode="test", **ds_kwargs)
@@ -270,15 +274,19 @@ class FactFlowTrainer:
         """
         B = x1.shape[0]
 
-        # 1) Source x₀ from PerceiverVE
-        x0_tok, mu, log_var = self.wrapper.encode_source(clip_tokens)
-        if log_var is not None:
-            log_var = torch.clamp(
-                log_var, min=self.clip_logvar_min, max=self.clip_logvar_max,
-            )
-
-        # Reshape: (B, Q, D) → (B, C, H, W)
-        x0 = x0_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
+        # 1) Source x₀
+        if self.use_source:
+            x0_tok, mu, log_var = self.wrapper.encode_source(clip_tokens)
+            if log_var is not None:
+                log_var = torch.clamp(
+                    log_var, min=self.clip_logvar_min, max=self.clip_logvar_max,
+                )
+            # Reshape: (B, Q, D) → (B, C, H, W)
+            x0 = x0_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
+        else:
+            # Pure Gaussian noise source (standard flow matching)
+            x0 = torch.randn_like(x1)
+            mu, log_var = None, None
 
         # 2) Sample timestep & interpolate along the flow path
         t = self.transport.sample_timestep(x1)
@@ -304,7 +312,7 @@ class FactFlowTrainer:
 
         # 6) Alignment loss (source mean ↔ target)
         align_val = torch.tensor(0.0, device=self.device)
-        if self.use_align:
+        if self.use_align and mu is not None:
             mu_reshaped = mu.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
             if self.align_type == "normalized_l2":
                 mu_norm = F.normalize(mu_reshaped.flatten(1), p=2, dim=-1)
@@ -338,8 +346,11 @@ class FactFlowTrainer:
         clip_pool = batch["clip_pool"].to(self.device)
 
         # Source from EMA encoder
-        x0_tok, _, _ = self.ema.encode_source(clip_tok)
-        x0 = x0_tok.permute(0, 2, 1).contiguous().view(n_eval, *self.latent_size)
+        if self.use_source:
+            x0_tok, _, _ = self.ema.encode_source(clip_tok)
+            x0 = x0_tok.permute(0, 2, 1).contiguous().view(n_eval, *self.latent_size)
+        else:
+            x0 = torch.randn(n_eval, *self.latent_size, device=self.device)
 
         # ODE sampling
         with autocast(**self.autocast_kwargs):
@@ -357,31 +368,35 @@ class FactFlowTrainer:
     # Full validation (end of epoch)
     # ──────────────────────────────────────────────────────────────────
 
-    @torch.no_grad()
-    def _validate(self, epoch: int) -> Dict[str, float]:
-        """Full validation over the entire test set."""
-        self.ema.eval()
-        eval_bs = min(8, len(self.test_ds))
-        loader = DataLoader(self.test_ds, batch_size=eval_bs, shuffle=False, num_workers=0)
-
+    def _run_val_pass(
+        self,
+        model: torch.nn.Module,
+        loader,
+        label: str,
+        epoch: int,
+    ) -> Dict[str, float]:
+        """Single validation pass over *loader* using *model*."""
+        model.eval()
         mse_sum, corr_sum, n = 0.0, 0.0, 0
 
-        for batch in tqdm(loader, desc="Validating", leave=False, dynamic_ncols=True):
+        for batch in loader:
             fmri_gt = batch["fmri"].to(self.device)
             clip_tok = batch["clip_tokens"].to(self.device)
             clip_pool = batch["clip_pool"].to(self.device)
             B = fmri_gt.shape[0]
 
-            x0_tok, _, _ = self.ema.encode_source(clip_tok)
-            x0 = x0_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
+            if self.use_source:
+                x0_tok, _, _ = model.encode_source(clip_tok)
+                x0 = x0_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
+            else:
+                x0 = torch.randn(B, *self.latent_size, device=self.device)
 
             with autocast(**self.autocast_kwargs):
-                traj = self.sample_fn(x0, self.ema.dit.forward, y=clip_pool)
+                traj = self.sample_fn(x0, model.dit.forward, y=clip_pool)
             pred = traj[-1]
 
             corr = pearson_corr_per_sample(pred, fmri_gt, self.pad_mask)
             mse_val = masked_mse(pred, fmri_gt, self.pad_mask).item()
-
             mse_sum += mse_val * B
             corr_sum += corr.sum().item()
             n += B
@@ -389,10 +404,27 @@ class FactFlowTrainer:
         val_mse = mse_sum / n
         val_corr = corr_sum / n
         self.logger.info(
-            "  [Val epoch=%d] profile_r=%.4f  mse=%.5f  n=%d",
-            epoch + 1, val_corr, val_mse, n,
+            "  [Val epoch=%d %s] profile_r=%.4f  mse=%.5f  n=%d",
+            epoch + 1, label, val_corr, val_mse, n,
         )
         return {"mse": val_mse, "profile_r": val_corr, "n": n}
+
+    @torch.no_grad()
+    def _validate(self, epoch: int) -> Dict[str, float]:
+        """Full validation over the entire test set (EMA + RAW)."""
+        eval_bs = min(8, len(self.test_ds))
+        loader = DataLoader(self.test_ds, batch_size=eval_bs, shuffle=False, num_workers=0)
+
+        # EMA — primary metric used for best-ckpt selection
+        val = self._run_val_pass(self.ema, loader, "EMA", epoch)
+
+        # RAW — secondary, useful to diagnose EMA lag especially early in training
+        self.wrapper.eval()
+        loader2 = DataLoader(self.test_ds, batch_size=eval_bs, shuffle=False, num_workers=0)
+        self._run_val_pass(self.wrapper, loader2, "RAW", epoch)
+        self.wrapper.train()
+
+        return val
 
     # ──────────────────────────────────────────────────────────────────
     # Main training loop
@@ -474,7 +506,13 @@ class FactFlowTrainer:
                     )
                 self.optimizer.step()
                 self.scheduler.step()
-                update_ema(self.ema, self.wrapper, decay=self.ema_decay)
+                # Adaptive EMA warmup: ramps from ~0 → ema_decay over first ~10k steps,
+                # preventing the frozen-init problem when decay=0.9999 and steps are few.
+                adaptive_decay = min(
+                    self.ema_decay,
+                    (1 + self.train_steps) / (10 + self.train_steps),
+                )
+                update_ema(self.ema, self.wrapper, decay=adaptive_decay)
                 self.optimizer.zero_grad(set_to_none=True)
 
                 log_steps += 1

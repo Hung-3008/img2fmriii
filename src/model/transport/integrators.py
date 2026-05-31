@@ -21,7 +21,7 @@ class sde:
         assert t0 < t1, "SDE sampler has to be in forward time"
 
         self.num_timesteps = num_steps
-        self.t = 1 - th.linspace(t0, t1, num_steps)
+        self.t = th.linspace(t0, t1, num_steps)
         self.t = time_dist_shift * self.t / (1 + (time_dist_shift - 1) * self.t)
         self.drift = drift
         self.diffusion = diffusion
@@ -31,26 +31,28 @@ class sde:
     def __Euler_Maruyama_step(self, x, mean_x, t_curr, t_next, model, **model_kwargs):
         w_cur = th.randn(x.size()).to(x)
         t = th.ones(x.size(0)).to(x) * t_curr
-        dw = w_cur * th.sqrt(t_curr - t_next)
+        dt = t_next - t_curr
+        dw = w_cur * th.sqrt(dt.abs())
         drift = self.drift(x, t, model, **model_kwargs)
         diffusion = self.diffusion(x, t)
-        mean_x = x - drift * (t_curr - t_next)
+        mean_x = x + drift * dt
         x = mean_x + th.sqrt(2 * diffusion) * dw
         return x, mean_x
     
     def __Heun_step(self, x, _, t_curr, t_next, model, **model_kwargs):
         w_cur = th.randn(x.size()).to(x)
-        dw = w_cur * th.sqrt(t_curr - t_next)
+        dt = t_next - t_curr
+        dw = w_cur * th.sqrt(dt.abs())
         diffusion = self.diffusion(x, th.ones(x.size(0)).to(x) * t_curr)
         xhat = x + th.sqrt(2 * diffusion) * dw
         K1 = self.drift(
             xhat, th.ones(x.size(0)).to(x) * t_curr, model, **model_kwargs
         )
-        xp = xhat - (t_curr - t_next) * K1
+        xp = xhat + dt * K1
         K2 = self.drift(
             xp, th.ones(x.size(0)).to(x) * t_next, model, **model_kwargs
         )
-        return xhat - 0.5 * (t_curr - t_next) * (K1 + K2), xhat # at last time point we do not perform the heun step
+        return xhat + 0.5 * dt * (K1 + K2), xhat
 
     def __forward_fn(self):
         """TODO: generalize here by adding all private functions ending with steps to it"""
@@ -96,8 +98,7 @@ class ode:
         assert t0 < t1, "ODE sampler has to be in forward time"
 
         self.drift = drift
-        # self.t = th.linspace(t0, t1, num_steps)
-        self.t = 1 - th.linspace(t0, t1, num_steps)
+        self.t = th.linspace(t0, t1, num_steps)
         self.t = time_dist_shift * self.t / (1 + (time_dist_shift - 1) * self.t)
         self.atol = atol
         self.rtol = rtol
@@ -141,8 +142,7 @@ class ode_x:
         assert t0 < t1, "ODE sampler has to be in forward time"
 
         self.drift = drift
-        # self.t = th.linspace(t0, t1, num_steps)
-        self.t = 1 - th.linspace(t0, t1, num_steps)
+        self.t = th.linspace(t0, t1, num_steps)
         self.t = time_dist_shift * self.t / (1 + (time_dist_shift - 1) * self.t)
         self.atol = atol
         self.rtol = rtol
@@ -186,8 +186,7 @@ class ode_npe:
         assert t0 < t1, "ODE sampler has to be in forward time"
 
         self.drift = drift
-        # self.t = th.linspace(t0, t1, num_steps)
-        self.t = 1 - th.linspace(t0, t1, num_steps)
+        self.t = th.linspace(t0, t1, num_steps)
         self.t = time_dist_shift * self.t / (1 + (time_dist_shift - 1) * self.t)
         self.atol = atol
         self.rtol = rtol
