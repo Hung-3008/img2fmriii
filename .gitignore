@@ -128,3 +128,4 @@ docs/
 .vscode/
 outputs/
 pyrightconfig.json
+exps/

@@ -466,12 +466,12 @@ def main():
                 dummy_pooled, dummy_multi = extract_qwen_batch(model, processor_or_transform, dummy_paths, layers, device)
                 
                 out_pool_path = os.path.join(save_path, f'nsd_{file_prefix}_pool_{mode}_sub{subj}.npy')
-                pool_mmap = np.lib.format.open_memmap(out_pool_path, mode='w+', dtype=np.float16, shape=(num_images, dummy_pooled.shape[1]))
+                pool_mmap = np.lib.format.open_memmap(out_pool_path, mode='w+', dtype=np.float16, shape=tuple(int(x) for x in (num_images, dummy_pooled.shape[1])))
                 
                 multi_mmap = None
                 if dummy_multi is not None:
                     out_multi_path = os.path.join(save_path, f'nsd_{file_prefix}{config["multi_suffix"]}{mode}_sub{subj}.npy')
-                    multi_mmap = np.lib.format.open_memmap(out_multi_path, mode='w+', dtype=np.float16, shape=(num_images, dummy_multi.shape[1], dummy_multi.shape[2]))
+                    multi_mmap = np.lib.format.open_memmap(out_multi_path, mode='w+', dtype=np.float16, shape=tuple(int(x) for x in (num_images, dummy_multi.shape[1], dummy_multi.shape[2])))
                 
                 for start_idx in tqdm(range(0, num_images, batch_size), desc=f"  Extracting {mode}"):
                     end_idx = min(start_idx + batch_size, num_images)
@@ -581,17 +581,17 @@ def main():
             
             # Create memmap files based on dummy shapes
             out_pool_path = os.path.join(save_path, f'nsd_{file_prefix}_pool_{mode}_sub{subj}.npy')
-            pool_mmap = np.lib.format.open_memmap(out_pool_path, mode='w+', dtype=np.float16, shape=(num_images, cls_token.shape[1]))
+            pool_mmap = np.lib.format.open_memmap(out_pool_path, mode='w+', dtype=np.float16, shape=tuple(int(x) for x in (num_images, cls_token.shape[1])))
             
             token_mmap = None
             if config['has_tokens'] and full_features is not None:
                 out_tokens_path = os.path.join(save_path, f'nsd_{file_prefix}_{mode}_sub{subj}.npy')
-                token_mmap = np.lib.format.open_memmap(out_tokens_path, mode='w+', dtype=np.float16, shape=(num_images, full_features.shape[1], full_features.shape[2]))
+                token_mmap = np.lib.format.open_memmap(out_tokens_path, mode='w+', dtype=np.float16, shape=tuple(int(x) for x in (num_images, full_features.shape[1], full_features.shape[2])))
                 
             multi_mmap = None
             if multi_features is not None:
                 out_multi_path = os.path.join(save_path, f'nsd_{file_prefix}{config["multi_suffix"]}{mode}_sub{subj}.npy')
-                multi_shape_tuple = (num_images,) + multi_features.shape[1:]
+                multi_shape_tuple = tuple(int(x) for x in (num_images,) + multi_features.shape[1:])
                 multi_mmap = np.lib.format.open_memmap(out_multi_path, mode='w+', dtype=np.float16, shape=multi_shape_tuple)
             
             for batch_i, batch_data in enumerate(dataloader):

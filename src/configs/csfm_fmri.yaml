@@ -1,0 +1,109 @@
+# =============================================================================
+# CSFM for fMRI Synthesis — Subject 1
+# CLIP image features → Flow Matching → fMRI voxels
+# =============================================================================
+
+# --- Data ---
+data:
+  data_dir: NSD/data/nsd
+  subject: 1
+  fmri_mode: scale          # "scale" or "zscore"
+  clip_feature: sdxl_clip   # feature prefix
+  n_voxels: 15724           # raw voxel count for subj01
+  pad_to: 16384             # reshaped as (4, 64, 64)
+  fmri_channels: 4          # reshape: 16384 / (64*64) = 4
+  fmri_spatial: 64          # spatial dim: 64×64
+
+# --- Stage 2: Velocity model (LightningDiT) ---
+stage_2:
+  target: stage2.models.lightningDiT.LightningDiT
+  params:
+    input_size: 64           # spatial size after reshape
+    patch_size: 2            # 2×2 patches → 32×32 = 1024 tokens
+    in_channels: 4           # fMRI reshaped to 4 channels
+    hidden_size: 512
+    depth: 12
+    num_heads: 8
+    mlp_ratio: 4.0
+    y_in_channels: 1280     # SDXL CLIP pool dim
+    learn_sigma: false
+    use_qknorm: true
+    use_swiglu: true
+    use_rmsnorm: true
+    use_rope: true
+    wo_shift: false
+
+# --- Source encoder (PerceiverVE): CLIP tokens → learned x₀ ---
+# Output: (B, 256, 64) → permute+reshape → (B, 4, 64, 64) = 16384 values
+source_encoder:
+  target: stage2.text_encoders.perceiver.PerceiverVE
+  params:
+    in_channels: 1664       # SDXL CLIP token dim
+    out_channels: 64        # 256 queries × 64 = 16384 = pad_to
+    hidden_size: 384
+    depth: 4
+    num_heads: 8
+    mlp_ratio: 4.0
+    dropout_prob: 0.0
+    num_queries: 256         # 16×16 grid; 256 × 64 = 16384
+    max_input_len: 256       # CLIP token count
+    pos_emb_type: learned
+    use_qknorm: false
+    use_swiglu: true
+    use_rmsnorm: true
+    use_variational: true
+    init_logvar: 0.0
+    fixed_std: 1.0
+
+# --- Transport (Flow Matching) ---
+transport:
+  params:
+    path_type: Linear
+    prediction: velocity
+    loss_weight: null
+    time_dist_type: uniform
+
+# --- ODE sampler ---
+sampler:
+  mode: ODE
+  params:
+    sampling_method: euler
+    num_steps: 50
+    atol: 1.0e-06
+    rtol: 0.001
+    reverse: false
+
+# --- Losses ---
+losses:
+  use_kld_loss: true
+  kld_loss_type: var_kld
+  kld_loss_weight: 5.0
+  kld_target_std: 1.0
+  kld_reduction: mean
+  use_align_loss: true
+  align_loss_weight: 1.0
+  align_loss_type: normalized_l2
+  detach_ut: false
+
+# --- Training ---
+training:
+  global_seed: 42
+  epochs: 200
+  batch_size: 32
+  grad_accum_steps: 8       # effective batch = 8 × 8 = 64
+  ema_decay: 0.9999
+  num_workers: 4
+  log_every: 50
+  ckpt_every: 5000
+  sample_every: 2000
+  val_every: 5
+  optimizer:
+    lr: 2.0e-04
+    betas: [0.9, 0.95]
+    weight_decay: 0.01
+  base_lr: 2.0e-04
+  final_lr: 2.0e-05
+  schedule_type: cosine
+  warmup_steps: 500
+  clip_grad: 1.0
+  precision: bf16
