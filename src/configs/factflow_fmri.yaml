@@ -1,5 +1,5 @@
 # =============================================================================
-# CSFM for fMRI Synthesis — Subject 1
+# FactFlow for fMRI Synthesis — Subject 1
 # CLIP image features → Flow Matching → fMRI voxels
 # =============================================================================
 
@@ -16,7 +16,7 @@ data:
 
 # --- Stage 2: Velocity model (LightningDiT) ---
 stage_2:
-  target: stage2.models.lightningDiT.LightningDiT
+  target: model.lightning_dit.LightningDiT
   params:
     input_size: 64           # spatial size after reshape
     patch_size: 2            # 2×2 patches → 32×32 = 1024 tokens
@@ -36,7 +36,7 @@ stage_2:
 # --- Source encoder (PerceiverVE): CLIP tokens → learned x₀ ---
 # Output: (B, 256, 64) → permute+reshape → (B, 4, 64, 64) = 16384 values
 source_encoder:
-  target: stage2.text_encoders.perceiver.PerceiverVE
+  target: model.perceiver.PerceiverVE
   params:
     in_channels: 1664       # SDXL CLIP token dim
     out_channels: 64        # 256 queries × 64 = 16384 = pad_to

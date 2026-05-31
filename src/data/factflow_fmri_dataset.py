@@ -1,7 +1,7 @@
 """
-csfm_fmri_dataset.py
-====================
-Dataset for CSFM-based fMRI synthesis.
+factflow_fmri_dataset.py
+========================
+Dataset for FactFlow-based fMRI synthesis.
 
 Loads pre-extracted SDXL CLIP features and NSD fMRI betas,
 returning them in a format ready for flow matching training.
@@ -20,7 +20,7 @@ from torch.utils.data import Dataset
 logger = logging.getLogger(__name__)
 
 
-class CSFMfMRIDataset(Dataset):
+class FactFlowfMRIDataset(Dataset):
     """Dataset pairing CLIP visual features with fMRI betas.
 
     Each sample returns:
@@ -86,7 +86,7 @@ class CSFMfMRIDataset(Dataset):
         self.pad_mask[:n_voxels] = True
 
         logger.info(
-            "CSFMfMRIDataset: subj=%d, mode=%s, images=%d, reps=%d, "
+            "FactFlowfMRIDataset: subj=%d, mode=%s, images=%d, reps=%d, "
             "samples=%d, voxels=%d→%d, reshape=(%d,%d,%d), "
             "clip_tokens=%s, clip_pool=%s",
             subject, mode, self.n_images, self.n_reps,
