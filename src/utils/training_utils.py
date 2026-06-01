@@ -1,40 +1,18 @@
 """
 training_utils.py
 =================
-Training helpers: EMA update, optimizer / scheduler construction.
-
-The optimizer and scheduler logic is adapted for the FactFlow codebase
-and rewritten to be self-contained.
+Training helpers: optimizer / scheduler construction.
 """
 
 from __future__ import annotations
 
 import math
-from collections import OrderedDict
 from typing import Any, Dict, Iterable, Tuple
 
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# EMA
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@torch.no_grad()
-def update_ema(
-    ema_model: nn.Module,
-    model: nn.Module,
-    decay: float = 0.9999,
-) -> None:
-    """Exponential moving average update: θ_ema ← decay·θ_ema + (1−decay)·θ."""
-    ema_params = OrderedDict(ema_model.named_parameters())
-    model_params = OrderedDict(model.named_parameters())
-    for name, param in model_params.items():
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

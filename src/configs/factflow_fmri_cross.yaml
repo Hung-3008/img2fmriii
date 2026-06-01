@@ -1,55 +1,62 @@
 # =============================================================================
-# FactFlow for fMRI Synthesis — Subject 1
-# CLIP image features → Flow Matching → fMRI voxels
+# FactFlow for fMRI Synthesis — Subject 1  [EXP ①+③]
+#   ① Token cross-attention: 256 CLIP tokens condition the DiT at every t
+#      (not just x0), via cross-attn in each block. Fixes the ~0.16 ceiling
+#      caused by image info being present only at the source.
+#   ③ SNR-weighted loss: weight the velocity MSE by per-voxel noise-ceiling
+#      reliability so capacity goes to learnable voxels instead of dead ones.
+# Keeps the source encoder ON (anchor x0) — cross-attn and anchor are
+# complementary: anchor sets a good x0, cross-attn keeps image info along the
+# whole trajectory.
 # =============================================================================
 
-# --- Source encoder toggle (false = pure noise x₀, standard flow matching) ---
-use_source_encoder: false
+# --- Source encoder toggle (true = learned x0 from CLIP tokens) ---
+use_source_encoder: true
 
 # --- Data ---
 data:
   data_dir: NSD/data/nsd
   subject: 1
-  fmri_mode: zscore          # "scale" or "zscore"
-  clip_feature: sdxl_clip   # feature prefix
-  n_voxels: 15724           # raw voxel count for subj01
-  pad_to: 16384             # padded length (must be divisible by patch_size)
-  avg_reps: true            # average 3 reps per image -> 9000 train samples (reduces session label-noise)
-  # 1D mode — no fmri_channels / fmri_spatial needed
+  fmri_mode: zscore
+  clip_feature: sdxl_clip
+  n_voxels: 15724
+  pad_to: 16384
+  avg_reps: true
 
 # --- Stage 2: Velocity model (DiT1D — native 1D) ---
 stage_2:
   target: model.dit_1d.DiT1D
   params:
-    seq_len: 16384           # = pad_to
-    patch_size: 32           # 16384/32 = 512 tokens
-    in_channels: 1           # fMRI as single-channel 1D signal
+    seq_len: 16384
+    patch_size: 32
+    in_channels: 1
     hidden_size: 512
     depth: 12
     num_heads: 8
     mlp_ratio: 4.0
-    y_in_channels: 1280     # SDXL CLIP pool dim
+    y_in_channels: 1280     # SDXL CLIP pool dim (AdaLN global conditioning)
     learn_sigma: false
     use_qknorm: true
     use_swiglu: true
     use_rmsnorm: true
     use_rope: true
     wo_shift: false
+    use_cross_attn: true    # ① cross-attend to CLIP tokens in every block
+    y_token_channels: 1664  # SDXL CLIP token dim
 
 # --- Source encoder (PerceiverVE): CLIP tokens → learned x₀ ---
-# Output: (B, 256, 64) → permute+reshape → (B, 4, 64, 64) = 16384 values
 source_encoder:
   target: model.perceiver.PerceiverVE
   params:
-    in_channels: 1664       # SDXL CLIP token dim
-    out_channels: 64        # 256 queries × 64 = 16384 = pad_to
+    in_channels: 1664
+    out_channels: 64
     hidden_size: 384
     depth: 4
     num_heads: 8
     mlp_ratio: 4.0
     dropout_prob: 0.0
-    num_queries: 256         # 16×16 grid; 256 × 64 = 16384
-    max_input_len: 256       # CLIP token count
+    num_queries: 256
+    max_input_len: 256
     pos_emb_type: learned
     use_qknorm: false
     use_swiglu: true
@@ -59,19 +66,15 @@ source_encoder:
     fixed_std: 1.0
 
 # --- Transport (Flow Matching) ---
-# Strategy 2: logit-normal(-1.0, 1.0) focuses 56% of training at t<0.3
-# vs current uniform+shift=2.0 which only spends 17% at t<0.3.
-# This fixes the early-trajectory weakness: r(v_pred,x1)=0.07 at t=0.
 transport:
   params:
     path_type: Linear
     prediction: velocity
     loss_weight: null
-    time_dist_type: "logit-normal_-1.0_1.0"   # focus on t~0.1-0.4 (weak zone)
-    time_dist_shift: 16384   # = dim → shift=sqrt(16384/16384)=1.0 (no extra warp)
+    time_dist_type: "logit-normal_-1.0_1.0"
+    time_dist_shift: 16384
 
 # --- ODE sampler ---
-# num_steps=50: more steps to integrate the sharpened logit-normal trajectory
 sampler:
   mode: ODE
   params:
@@ -88,17 +91,18 @@ losses:
   kld_loss_weight: 5.0
   kld_target_std: 1.0
   kld_reduction: mean
-  use_align_loss: false
+  use_align_loss: true
   align_loss_weight: 1.0
   align_loss_type: normalized_l2
   detach_ut: false
+  use_snr_weight: true      # ③ weight velocity MSE by per-voxel noise ceiling
 
 # --- Training ---
 training:
   global_seed: 42
   epochs: 200
-  batch_size: 64
-  grad_accum_steps: 8       # effective batch = 8 × 8 = 64
+  batch_size: 32
+  grad_accum_steps: 8
   num_workers: 4
   log_every: 50
   ckpt_every: 5000

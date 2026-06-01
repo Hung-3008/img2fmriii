@@ -42,6 +42,8 @@ class FactFlowfMRIDataset(Dataset):
         pad_to: int = 16384,
         fmri_channels: int = 1,
         fmri_spatial: int = None,
+        avg_reps: bool = False,
+        dino_feature: str = None,
     ):
         super().__init__()
         self.mode = mode
@@ -50,6 +52,8 @@ class FactFlowfMRIDataset(Dataset):
         self.pad_to = pad_to
         self.fmri_channels = fmri_channels
         self.fmri_spatial = fmri_spatial
+        self.avg_reps = avg_reps
+        self.dino_feature = dino_feature
 
         # Determine reshape mode
         if fmri_spatial is not None and fmri_spatial > 0:
@@ -70,7 +74,8 @@ class FactFlowfMRIDataset(Dataset):
         self.fmri_data = np.load(fmri_path, mmap_mode="r")  # (N_img, 3, V)
         self.n_images = self.fmri_data.shape[0]
         self.n_reps = self.fmri_data.shape[1]
-        self.n_samples = self.n_images * self.n_reps
+        # avg_reps: treat each image as a single sample (mean across reps)
+        self.n_samples = self.n_images if avg_reps else self.n_images * self.n_reps
 
         # --- CLIP tokens: (N_images, T, D) ---
         clip_tok_path = os.path.join(
@@ -83,6 +88,16 @@ class FactFlowfMRIDataset(Dataset):
             subj_dir, f"nsd_{clip_feature}_pool_{mode}_sub{subject}.npy"
         )
         self.clip_pool = np.load(clip_pool_path, mmap_mode="r")
+
+        # --- Optional DINOv2 tokens: (N_images, T2, D2) ---
+        # Second visual-feature stream for cross-attention (early-visual cortex).
+        self.dino_tokens = None
+        if dino_feature is not None:
+            dino_path = os.path.join(
+                subj_dir, f"nsd_{dino_feature}_{mode}_sub{subject}.npy"
+            )
+            self.dino_tokens = np.load(dino_path, mmap_mode="r")
+            assert self.dino_tokens.shape[0] == self.n_images
 
         assert self.clip_tokens.shape[0] == self.n_images
         assert self.clip_pool.shape[0] == self.n_images
@@ -108,11 +123,15 @@ class FactFlowfMRIDataset(Dataset):
         return self.n_samples
 
     def __getitem__(self, idx):
-        image_idx = idx // self.n_reps
-        rep_idx = idx % self.n_reps
-
-        # --- fMRI: load, pad, reshape ---
-        raw_fmri = self.fmri_data[image_idx, rep_idx].astype(np.float32)  # (V,)
+        if self.avg_reps:
+            # One sample per image: average all reps to reduce session-level noise
+            image_idx = idx
+            raw_fmri = self.fmri_data[image_idx].astype(np.float32)  # (3, V)
+            raw_fmri = raw_fmri.mean(axis=0)  # (V,)
+        else:
+            image_idx = idx // self.n_reps
+            rep_idx = idx % self.n_reps
+            raw_fmri = self.fmri_data[image_idx, rep_idx].astype(np.float32)  # (V,)
         padded = np.zeros(self.pad_to, dtype=np.float32)
         padded[: self.n_voxels] = raw_fmri
         if self.reshape_2d:
@@ -124,12 +143,16 @@ class FactFlowfMRIDataset(Dataset):
         clip_tok = self.clip_tokens[image_idx].astype(np.float32)
         clip_p = self.clip_pool[image_idx].astype(np.float32)
 
-        return {
+        sample = {
             "fmri": torch.from_numpy(fmri_out),
             "clip_tokens": torch.from_numpy(clip_tok), # (T, D)
             "clip_pool": torch.from_numpy(clip_p),     # (D_pool,)
             "pad_mask": torch.from_numpy(self.pad_mask.copy()),  # (V_pad,)
         }
+        if self.dino_tokens is not None:
+            dino_tok = self.dino_tokens[image_idx].astype(np.float32)
+            sample["dino_tokens"] = torch.from_numpy(dino_tok)  # (T2, D2)
+        return sample
 
     @property
     def voxel_count(self) -> int:

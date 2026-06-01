@@ -98,6 +98,9 @@ class DiT1D(nn.Module):
         use_rmsnorm: bool = True,
         use_rope: bool = True,
         wo_shift: bool = False,
+        use_cross_attn: bool = False,
+        y_token_channels: int = 1664,
+        y_token_channels_2: int = None,
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -109,6 +112,7 @@ class DiT1D(nn.Module):
         self.use_rope = use_rope
         self.learn_sigma = learn_sigma
         self.depth = depth
+        self.use_cross_attn = use_cross_attn
 
         num_patches = seq_len // patch_size
 
@@ -116,6 +120,23 @@ class DiT1D(nn.Module):
         self.x_embedder = PatchEmbed1D(seq_len, patch_size, in_channels, hidden_size)
         self.t_embedder = GaussianFourierEmbedding(hidden_size)
         self.y_embedder = VectorEmbedder(y_in_channels, hidden_size)
+
+        # ── Context stem(s): feature tokens → hidden for cross-attention ─
+        # Each stream (CLIP, optionally DINOv2) is projected once and the
+        # results are concatenated along the token axis to form one context
+        # sequence, shared across all blocks.
+        self.context_embedder = None
+        self.context_embedder_2 = None
+        if use_cross_attn:
+            self.context_embedder = nn.Sequential(
+                nn.Linear(y_token_channels, hidden_size),
+                RMSNorm(hidden_size),
+            )
+            if y_token_channels_2 is not None:
+                self.context_embedder_2 = nn.Sequential(
+                    nn.Linear(y_token_channels_2, hidden_size),
+                    RMSNorm(hidden_size),
+                )
 
         # 1D positional embedding (fixed sin-cos)
         self.pos_embed = nn.Parameter(
@@ -138,6 +159,7 @@ class DiT1D(nn.Module):
                 use_swiglu=use_swiglu,
                 use_rmsnorm=use_rmsnorm,
                 wo_shift=wo_shift,
+                use_cross_attn=use_cross_attn,
             ) for _ in range(depth)
         ])
 
@@ -185,6 +207,13 @@ class DiT1D(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
+        # Zero-out cross-attention output proj → block starts as pooled-only
+        # DiT, then learns to use the CLIP-token context.
+        for block in self.blocks:
+            if getattr(block, "use_cross_attn", False):
+                nn.init.constant_(block.cross_attn.proj.weight, 0)
+                nn.init.constant_(block.cross_attn.proj.bias, 0)
+
     def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (B, N, patch_size * out_channels) → (B, out_channels, seq_len)
@@ -197,7 +226,7 @@ class DiT1D(nn.Module):
         x = x.reshape(B, c, N * p)    # (B, C, N*P) = (B, C, seq_len)
         return x
 
-    def forward(self, x, t=None, y=None):
+    def forward(self, x, t=None, y=None, context=None, context2=None):
         """
         Forward pass of DiT1D.
 
@@ -205,6 +234,10 @@ class DiT1D(nn.Module):
             x: (B, C, L) — 1D fMRI signal (C=1 typically)
             t: (B,) — diffusion timestep
             y: (B, D_pool) — CLIP pooled conditioning
+            context: (B, M, D_tok) — CLIP spatial tokens for cross-attention
+                     (only used when ``use_cross_attn=True``)
+            context2: (B, M2, D_tok2) — optional second token stream
+                     (e.g. DINOv2); concatenated with ``context``.
 
         Returns:
             (B, C, L) — predicted velocity
@@ -214,8 +247,15 @@ class DiT1D(nn.Module):
         y = self.y_embedder(y)                      # (B, D)
         c = t + y                                    # (B, D)
 
+        ctx = None
+        if self.use_cross_attn and context is not None:
+            ctx = self.context_embedder(context)    # (B, M, D)
+            if self.context_embedder_2 is not None and context2 is not None:
+                ctx2 = self.context_embedder_2(context2)        # (B, M2, D)
+                ctx = torch.cat([ctx, ctx2], dim=1)             # (B, M+M2, D)
+
         for block in self.blocks:
-            x = block(x, c, feat_rope=self.feat_rope)
+            x = block(x, c, feat_rope=self.feat_rope, context=ctx)
 
         x = self.final_layer(x, c)   # (B, N, P*C)
         x = self.unpatchify(x)       # (B, C, L)

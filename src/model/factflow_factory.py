@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import logging
 import math
-from copy import deepcopy
 from typing import Any, Callable, Dict, Tuple
 
 import torch
@@ -68,6 +67,8 @@ class FactFlowWrapper(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         y: torch.Tensor,
+        context: torch.Tensor = None,
+        context2: torch.Tensor = None,
     ) -> torch.Tensor:
         """Run the velocity network (DiT).
 
@@ -75,11 +76,14 @@ class FactFlowWrapper(nn.Module):
             x: ``(B, C, H, W)`` noisy latent.
             t: ``(B,)`` timestep.
             y: ``(B, D_pool)`` conditioning (CLIP pooled).
+            context: ``(B, M, D_tok)`` CLIP tokens for cross-attention
+                     (ignored unless the DiT was built with ``use_cross_attn``).
+            context2: ``(B, M2, D_tok2)`` optional second token stream (DINOv2).
 
         Returns:
             ``(B, C, H, W)`` predicted velocity.
         """
-        return self.dit(x=x, t=t, y=y)
+        return self.dit(x=x, t=t, y=y, context=context, context2=context2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -90,10 +94,10 @@ class FactFlowWrapper(nn.Module):
 def build_models(
     cfg: DictConfig,
     device: str = "cpu",
-) -> Tuple[FactFlowWrapper, FactFlowWrapper]:
-    """Instantiate DiT + SourceEncoder, wrap, and create an EMA copy.
+) -> FactFlowWrapper:
+    """Instantiate DiT + SourceEncoder and wrap them.
 
-    Returns ``(wrapper, ema)`` — both on *device*.
+    Returns the *wrapper* on *device*.
     """
     dit = instantiate_from_config(cfg.stage_2)
     source_encoder = instantiate_from_config(cfg.source_encoder)
@@ -104,9 +108,7 @@ def build_models(
     logger.info("SourceEncoder params: %.2fM", se_params / 1e6)
     logger.info("Total trainable: %.2fM", (dit_params + se_params) / 1e6)
 
-    wrapper = FactFlowWrapper(dit=dit, source_encoder=source_encoder).to(device)
-    ema = deepcopy(wrapper).to(device)
-    return wrapper, ema
+    return FactFlowWrapper(dit=dit, source_encoder=source_encoder).to(device)
 
 
 def build_transport(

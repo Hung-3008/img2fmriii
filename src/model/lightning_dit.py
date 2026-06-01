@@ -1,10 +1,47 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from timm.models.vision_transformer import PatchEmbed, Mlp
 import torch
 from torch import nn
 
 from .model_utils import VisionRotaryEmbeddingFast, SwiGLUFFN, RMSNorm, NormAttention, LabelEmbedder, get_2d_sincos_pos_embed, GaussianFourierEmbedding, modulate
+
+
+class CrossAttention(nn.Module):
+    """Multi-head cross-attention: voxel tokens (query) attend to a context
+    sequence (e.g. 256 CLIP image tokens). No positional encoding on the
+    context — it is an unordered set of visual tokens.
+    """
+
+    def __init__(self, dim, num_heads, qk_norm=False):
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q_proj = nn.Linear(dim, dim, bias=True)
+        self.kv_proj = nn.Linear(dim, dim * 2, bias=True)
+        self.proj = nn.Linear(dim, dim, bias=True)
+        if qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
+
+    def forward(self, x, context):
+        B, N, C = x.shape
+        M = context.shape[1]
+        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim)
+        kv = self.kv_proj(context).reshape(B, M, 2, self.num_heads, self.head_dim)
+        k, v = kv[:, :, 0], kv[:, :, 1]
+        q = self.q_norm(q).transpose(1, 2)   # (B, H, N, hd)
+        k = self.k_norm(k).transpose(1, 2)   # (B, H, M, hd)
+        v = v.transpose(1, 2)                 # (B, H, M, hd)
+        out = F.scaled_dot_product_attention(q, k, v)   # (B, H, N, hd)
+        out = out.transpose(1, 2).reshape(B, N, C)
+        return self.proj(out)
+
 
 class VectorEmbedder(nn.Module):
     """Embeds a flat vector of dimension input_dim"""
@@ -36,13 +73,14 @@ class LightningDiTBlock(nn.Module):
         num_heads,
         mlp_ratio=4.0,
         use_qknorm=False,
-        use_swiglu=True, 
+        use_swiglu=True,
         use_rmsnorm=True,
         wo_shift=False,
+        use_cross_attn=False,
         **block_kwargs
     ):
         super().__init__()
-        
+
         # Initialize normalization layers
         if not use_rmsnorm:
             self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -50,7 +88,19 @@ class LightningDiTBlock(nn.Module):
         else:
             self.norm1 = RMSNorm(hidden_size)
             self.norm2 = RMSNorm(hidden_size)
-            
+
+        # Optional cross-attention to a context sequence (e.g. CLIP tokens).
+        # The output projection is zero-initialised (in the parent model's
+        # initialize_weights) so the block starts identical to a pooled-only
+        # DiT and learns to attend to the context.
+        self.use_cross_attn = use_cross_attn
+        if use_cross_attn:
+            if not use_rmsnorm:
+                self.norm_cross = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            else:
+                self.norm_cross = RMSNorm(hidden_size)
+            self.cross_attn = CrossAttention(hidden_size, num_heads, qk_norm=use_qknorm)
+
         # Initialize attention layer
         self.attn = NormAttention(
             hidden_size,
@@ -88,7 +138,7 @@ class LightningDiTBlock(nn.Module):
             )
         self.wo_shift = wo_shift
 
-    def forward(self, x, c, feat_rope=None):
+    def forward(self, x, c, feat_rope=None, context=None):
         if self.wo_shift:
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(4, dim=1)
             shift_msa = None
@@ -96,6 +146,8 @@ class LightningDiTBlock(nn.Module):
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
+        if self.use_cross_attn and context is not None:
+            x = x + self.cross_attn(self.norm_cross(x), context)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 class LightningFinalLayer(nn.Module):

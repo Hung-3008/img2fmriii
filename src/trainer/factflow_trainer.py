@@ -41,8 +41,8 @@ from utils.checkpoint import (
 )
 from utils.fmri_utils import create_pad_mask, get_latent_size
 from utils.logging_utils import create_logger
-from utils.metrics import masked_mse, pearson_corr_per_sample
-from utils.training_utils import update_ema, build_optimizer_and_scheduler
+from utils.metrics import masked_mse, voxel_pearson, compute_voxel_reliability
+from utils.training_utils import build_optimizer_and_scheduler
 
 # ── KLD losses (self-contained) ──────────────────────
 
@@ -133,7 +133,7 @@ class FactFlowTrainer:
         )
 
         # ── Models ────────────────────────────────────────────────────
-        self.wrapper, self.ema = build_models(self.cfg, self.device)
+        self.wrapper = build_models(self.cfg, self.device)
         self.transport = build_transport(self.cfg, self.latent_size)
         self.sample_fn = build_sampler(self.transport, self.cfg.sampler)
 
@@ -157,12 +157,7 @@ class FactFlowTrainer:
         # ── State ─────────────────────────────────────────────────────
         self.train_steps = 0
         self.start_epoch = 0
-        self.best_val_pcc = -1.0
-
-        # Sync EMA = exact copy of wrapper BEFORE loading checkpoint, so that
-        # on fresh starts EMA begins as a copy of the initialized model, and on
-        # resumes the checkpoint loader correctly overwrites both wrapper and EMA.
-        update_ema(self.ema, self.wrapper, decay=0)
+        self.best_voxel_r = -1.0
 
         self._maybe_resume()
 
@@ -174,7 +169,6 @@ class FactFlowTrainer:
             enabled=use_bf16,
         )
         self.clip_grad = float(self.train_cfg.get("clip_grad", 1.0))
-        self.ema_decay = float(self.train_cfg.get("ema_decay", 0.9999))
         self.log_every = int(self.train_cfg.get("log_every", 50))
         self.ckpt_every = int(self.train_cfg.get("ckpt_every", 5000))
         self.sample_every = int(self.train_cfg.get("sample_every", 2000))
@@ -194,8 +188,38 @@ class FactFlowTrainer:
         self.clip_logvar_max = float(self.loss_cfg.get("clip_logvar_max", 10.0))
         self.use_source = bool(self.cfg.get("use_source_encoder", True))
 
+        # ── Cross-attention conditioning (CLIP / DINOv2 tokens → DiT) ──
+        self.use_cross_attn = bool(
+            self.cfg.stage_2.get("params", {}).get("use_cross_attn", False)
+        )
+        self.use_dino = self.use_cross_attn and self.data_cfg.get("dino_feature") is not None
+
+        # ── SNR-weighted voxel loss ───────────────────────────────────
+        self.voxel_weight = self._build_voxel_weight()
+
         self.wrapper.train()
-        self.ema.eval()
+
+    def _build_voxel_weight(self) -> Optional[torch.Tensor]:
+        """Per-voxel noise-ceiling weight over ``pad_to`` (None if disabled)."""
+        if not self.loss_cfg.get("use_snr_weight", False):
+            return None
+        nc = compute_voxel_reliability(
+            self.train_ds.fmri_data, self.train_ds.n_reps,
+        )  # (V,)
+        w = np.zeros(self.data_cfg["pad_to"], dtype=np.float64)
+        w[: self.data_cfg["n_voxels"]] = nc
+        # Normalise so the mean weight over real voxels is 1 (keeps loss scale).
+        real = w[: self.data_cfg["n_voxels"]]
+        mean_w = real.mean()
+        if mean_w > 0:
+            w = w / mean_w
+        self.logger.info(
+            "SNR-weighted loss ON: noise-ceiling mean=%.3f median=%.3f, "
+            "voxels with nc>0.1: %d/%d",
+            float(nc.mean()), float(np.median(nc)),
+            int((nc > 0.1).sum()), nc.shape[0],
+        )
+        return torch.tensor(w, dtype=torch.float32, device=self.device)
 
     # ──────────────────────────────────────────────────────────────────
     # Dataset construction
@@ -212,9 +236,19 @@ class FactFlowTrainer:
             pad_to=dc["pad_to"],
             fmri_channels=dc.get("fmri_channels", 1),
             fmri_spatial=dc.get("fmri_spatial", None),
+            avg_reps=dc.get("avg_reps", False),
+            dino_feature=dc.get("dino_feature", None),
         )
         self.train_ds = FactFlowfMRIDataset(mode="train", **ds_kwargs)
-        self.test_ds = FactFlowfMRIDataset(mode="test", **ds_kwargs)
+        self.test_ds  = FactFlowfMRIDataset(mode="test",  **ds_kwargs)
+
+        # ── Rep-averaged validation dataset ───────────────────────────
+        # Always validate against rep-averaged GT (mean of 3 reps) so that:
+        #   - ceiling R ≈ 0.620  (vs single-trial ceiling R ≈ 0.148)
+        #   - metric is meaningful and comparable to published benchmarks
+        # This is independent of whether training uses avg_reps or not.
+        val_kwargs = {**ds_kwargs, "avg_reps": True}
+        self.val_ds = FactFlowfMRIDataset(mode="test", **val_kwargs)
 
         batch_size = int(self.train_cfg.get("batch_size", 64))
         num_workers = int(self.train_cfg.get("num_workers", 4))
@@ -228,7 +262,8 @@ class FactFlowTrainer:
             persistent_workers=num_workers > 0,
         )
         self.logger.info(
-            "Train: %d samples, Test: %d samples", len(self.train_ds), len(self.test_ds),
+            "Train: %d samples, Test: %d samples (val_avg: %d images)",
+            len(self.train_ds), len(self.test_ds), len(self.val_ds),
         )
         self.logger.info(
             "Batch size: %d, Steps/epoch: %d", batch_size, len(self.train_loader),
@@ -251,12 +286,12 @@ class FactFlowTrainer:
 
         if ckpt_path is not None:
             info = load_checkpoint(
-                ckpt_path, self.wrapper, self.ema,
+                ckpt_path, self.wrapper,
                 self.optimizer, self.scheduler, self.device,
             )
             self.train_steps = info["train_steps"]
             self.start_epoch = info["epoch"]
-            self.best_val_pcc = info["best_val_pcc"]
+            self.best_voxel_r = info["best_val_pcc"]
 
     # ──────────────────────────────────────────────────────────────────
     # Forward + loss
@@ -267,6 +302,7 @@ class FactFlowTrainer:
         x1: torch.Tensor,
         clip_tokens: torch.Tensor,
         clip_pool: torch.Tensor,
+        dino_tokens: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         """One forward pass: source encoding → interpolation → velocity prediction → losses.
 
@@ -292,12 +328,16 @@ class FactFlowTrainer:
         t = self.transport.sample_timestep(x1)
         t, xt, ut = self.transport.path_sampler.plan(t, x0, x1)
 
-        # 3) Predict velocity
-        v_pred = self.wrapper.predict_velocity(x=xt, t=t, y=clip_pool)
+        # 3) Predict velocity (cross-attend to CLIP/DINOv2 tokens if enabled)
+        context = clip_tokens if self.use_cross_attn else None
+        context2 = dino_tokens if self.use_dino else None
+        v_pred = self.wrapper.predict_velocity(
+            x=xt, t=t, y=clip_pool, context=context, context2=context2,
+        )
 
-        # 4) Diffusion loss (masked MSE on real voxels)
+        # 4) Diffusion loss (masked, optionally SNR-weighted, MSE on real voxels)
         ut_target = ut.detach() if self.detach_ut else ut
-        diff_loss = masked_mse(v_pred, ut_target, self.pad_mask)
+        diff_loss = masked_mse(v_pred, ut_target, self.pad_mask, weight=self.voxel_weight)
         total = diff_loss
 
         # 5) KLD regularisation on the variational source encoder
@@ -336,7 +376,7 @@ class FactFlowTrainer:
     @torch.no_grad()
     def _inline_eval(self) -> None:
         """Quick ODE-based eval on a small test subset."""
-        self.ema.eval()
+        self.wrapper.eval()
         n_eval = min(64, len(self.test_ds))
         loader = DataLoader(self.test_ds, batch_size=n_eval, shuffle=False, num_workers=0)
         batch = next(iter(loader))
@@ -344,25 +384,34 @@ class FactFlowTrainer:
         fmri_gt = batch["fmri"].to(self.device)
         clip_tok = batch["clip_tokens"].to(self.device)
         clip_pool = batch["clip_pool"].to(self.device)
+        dino_tok = batch["dino_tokens"].to(self.device) if self.use_dino else None
 
-        # Source from EMA encoder
+        # Source from raw model encoder
         if self.use_source:
-            x0_tok, _, _ = self.ema.encode_source(clip_tok)
+            x0_tok, _, _ = self.wrapper.encode_source(clip_tok)
             x0 = x0_tok.permute(0, 2, 1).contiguous().view(n_eval, *self.latent_size)
         else:
             x0 = torch.randn(n_eval, *self.latent_size, device=self.device)
 
         # ODE sampling
+        context = clip_tok if self.use_cross_attn else None
+        context2 = dino_tok if self.use_dino else None
         with autocast(**self.autocast_kwargs):
-            traj = self.sample_fn(x0, self.ema.dit.forward, y=clip_pool)
-        pred = traj[-1]
+            traj = self.sample_fn(
+                x0, self.wrapper.dit.forward, y=clip_pool,
+                context=context, context2=context2,
+            )
+        pred = traj[-1].float()
 
-        corr = pearson_corr_per_sample(pred, fmri_gt, self.pad_mask)
-        mouse_val = masked_mse(pred, fmri_gt, self.pad_mask).item()
+        preds_flat = pred.reshape(n_eval, -1)[:, self.pad_mask]
+        gts_flat = fmri_gt.reshape(n_eval, -1)[:, self.pad_mask]
+        voxel_r = voxel_pearson(preds_flat, gts_flat).mean().item()
+        mse_val = masked_mse(pred, fmri_gt, self.pad_mask).item()
         self.logger.info(
-            "  [Eval step=%d] profile_r=%.4f  mse=%.5f",
-            self.train_steps, corr.mean().item(), mouse_val,
+            "  [Eval step=%d] voxel_r=%.4f  mse=%.5f",
+            self.train_steps, voxel_r, mse_val,
         )
+        self.wrapper.train()
 
     # ──────────────────────────────────────────────────────────────────
     # Full validation (end of epoch)
@@ -375,14 +424,20 @@ class FactFlowTrainer:
         label: str,
         epoch: int,
     ) -> Dict[str, float]:
-        """Single validation pass over *loader* using *model*."""
+        """Single validation pass over *loader* using *model*.
+
+        Accumulates all predictions/targets, then computes voxel-wise
+        (encoding) Pearson r across the sample axis — the honest NSD metric.
+        """
         model.eval()
-        mse_sum, corr_sum, n = 0.0, 0.0, 0
+        preds_all, gts_all = [], []
+        mse_sum, n = 0.0, 0
 
         for batch in loader:
             fmri_gt = batch["fmri"].to(self.device)
             clip_tok = batch["clip_tokens"].to(self.device)
             clip_pool = batch["clip_pool"].to(self.device)
+            dino_tok = batch["dino_tokens"].to(self.device) if self.use_dino else None
             B = fmri_gt.shape[0]
 
             if self.use_source:
@@ -391,40 +446,51 @@ class FactFlowTrainer:
             else:
                 x0 = torch.randn(B, *self.latent_size, device=self.device)
 
+            context = clip_tok if self.use_cross_attn else None
+            context2 = dino_tok if self.use_dino else None
             with autocast(**self.autocast_kwargs):
-                traj = self.sample_fn(x0, model.dit.forward, y=clip_pool)
-            pred = traj[-1]
+                traj = self.sample_fn(
+                    x0, model.dit.forward, y=clip_pool,
+                    context=context, context2=context2,
+                )
+            pred = traj[-1].float()
 
-            corr = pearson_corr_per_sample(pred, fmri_gt, self.pad_mask)
-            mse_val = masked_mse(pred, fmri_gt, self.pad_mask).item()
-            mse_sum += mse_val * B
-            corr_sum += corr.sum().item()
+            mse_sum += masked_mse(pred, fmri_gt, self.pad_mask).item() * B
             n += B
+            preds_all.append(pred.reshape(B, -1)[:, self.pad_mask].cpu())
+            gts_all.append(fmri_gt.reshape(B, -1)[:, self.pad_mask].cpu())
 
+        preds_all = torch.cat(preds_all, dim=0)
+        gts_all = torch.cat(gts_all, dim=0)
+        val_voxel_r = voxel_pearson(preds_all, gts_all).mean().item()
         val_mse = mse_sum / n
-        val_corr = corr_sum / n
         self.logger.info(
-            "  [Val epoch=%d %s] profile_r=%.4f  mse=%.5f  n=%d",
-            epoch + 1, label, val_corr, val_mse, n,
+            "  [Val epoch=%d %s] voxel_r=%.4f  mse=%.5f  n=%d",
+            epoch + 1, label, val_voxel_r, val_mse, n,
         )
-        return {"mse": val_mse, "profile_r": val_corr, "n": n}
+        return {"mse": val_mse, "voxel_r": val_voxel_r, "n": n}
 
     @torch.no_grad()
-    def _validate(self, epoch: int) -> Dict[str, Dict[str, float]]:
-        """Full validation over the test set, returning both EMA and RAW metrics."""
-        eval_bs = min(8, len(self.test_ds))
-        loader = DataLoader(self.test_ds, batch_size=eval_bs, shuffle=False, num_workers=0)
+    def _validate(self, epoch: int) -> Dict[str, float]:
+        """Full validation over the rep-averaged test set (val_ds, avg_reps=True).
 
-        # EMA — smoothed weights
-        val_ema = self._run_val_pass(self.ema, loader, "EMA", epoch)
+        Reports voxel-wise (encoding) Pearson r: per-voxel correlation across
+        images. Rep-averaging the GT removes measurement noise so the metric
+        reflects true signal rather than the single-trial noise floor.
+        """
+        val_bs = 32
+        loader = DataLoader(
+            self.val_ds,
+            batch_size=val_bs,
+            shuffle=False,
+            num_workers=0,
+            drop_last=False,
+        )
 
-        # RAW — instantaneous weights; tracks true model capability, esp. early on
         self.wrapper.eval()
-        loader2 = DataLoader(self.test_ds, batch_size=eval_bs, shuffle=False, num_workers=0)
-        val_raw = self._run_val_pass(self.wrapper, loader2, "RAW", epoch)
+        metrics = self._run_val_pass(self.wrapper, loader, "avg_reps", epoch)
         self.wrapper.train()
-
-        return {"ema": val_ema, "raw": val_raw}
+        return metrics
 
     # ──────────────────────────────────────────────────────────────────
     # Main training loop
@@ -439,18 +505,14 @@ class FactFlowTrainer:
         history_writer = csv.writer(history_file)
         if not history_exists:
             history_writer.writerow([
-                "epoch", "step",
-                "train_loss", "train_diff_loss", "train_kld_loss", "train_align_loss",
-                "val_mse", "val_profile_r",
-                "val_mse_raw", "val_profile_r_raw", "val_profile_r_best",
-                "lr",
+                "epoch", "step", "train_loss", "val_mse", "val_voxel_r", "lr",
             ])
             history_file.flush()
 
         # ── Accumulators ──
-        running = {"loss": 0., "diff": 0., "kld": 0., "align": 0.}
-        epoch_acc = {"loss": 0., "diff": 0., "kld": 0., "align": 0.}
-        step_acc = {"loss": 0., "diff": 0., "kld": 0., "align": 0.}
+        running_loss = 0.0   # since last log_every
+        epoch_loss = 0.0     # since last validation
+        step_loss = 0.0      # current optimizer step (across micro-batches)
         epoch_steps = 0
         log_steps = 0
         accum_counter = 0
@@ -473,9 +535,14 @@ class FactFlowTrainer:
                 x1 = batch["fmri"].to(self.device)
                 clip_tokens = batch["clip_tokens"].to(self.device)
                 clip_pool = batch["clip_pool"].to(self.device)
+                dino_tokens = (
+                    batch["dino_tokens"].to(self.device) if self.use_dino else None
+                )
 
                 with autocast(**self.autocast_kwargs):
-                    losses = self._compute_loss(x1, clip_tokens, clip_pool)
+                    losses = self._compute_loss(
+                        x1, clip_tokens, clip_pool, dino_tokens,
+                    )
 
                 # Backward (scale by grad_accum)
                 (losses["total"] / self.grad_accum).backward()
@@ -486,16 +553,10 @@ class FactFlowTrainer:
                     lr=f"{self.scheduler.get_last_lr()[0]:.2e}",
                 )
 
-                # Accumulate micro-batch stats
-                scale = 1.0 / self.grad_accum
-                for k in running:
-                    val = losses.get(k, losses.get("total")).item() * scale
-                    if k == "loss":
-                        val = losses["total"].item() * scale
-                    else:
-                        val = losses[k].item() * scale
-                    running[k] += val
-                    step_acc[k] += val
+                # Accumulate micro-batch loss (rescaled to full-step units)
+                micro_loss = losses["total"].item() / self.grad_accum
+                running_loss += micro_loss
+                step_loss += micro_loss
 
                 if accum_counter < self.grad_accum:
                     continue
@@ -508,22 +569,14 @@ class FactFlowTrainer:
                     )
                 self.optimizer.step()
                 self.scheduler.step()
-                # Adaptive EMA warmup: ramps from ~0 → ema_decay over first ~10k steps,
-                # preventing the frozen-init problem when decay=0.9999 and steps are few.
-                adaptive_decay = min(
-                    self.ema_decay,
-                    (1 + self.train_steps) / (10 + self.train_steps),
-                )
-                update_ema(self.ema, self.wrapper, decay=adaptive_decay)
                 self.optimizer.zero_grad(set_to_none=True)
 
                 log_steps += 1
                 self.train_steps += 1
 
-                for k in epoch_acc:
-                    epoch_acc[k] += step_acc[k]
+                epoch_loss += step_loss
                 epoch_steps += 1
-                step_acc = {k: 0. for k in step_acc}
+                step_loss = 0.0
 
                 # ── Periodic logging ──
                 if self.train_steps % self.log_every == 0:
@@ -531,16 +584,11 @@ class FactFlowTrainer:
                     sps = log_steps / elapsed if elapsed > 0 else 0
                     lr = self.scheduler.get_last_lr()[0]
                     self.logger.info(
-                        "[step=%07d ep=%d] loss=%.5f diff=%.5f kld=%.5f "
-                        "align=%.5f lr=%.2e steps/s=%.1f",
+                        "[step=%07d ep=%d] loss=%.5f lr=%.2e steps/s=%.1f",
                         self.train_steps, epoch,
-                        running["loss"] / log_steps,
-                        running["diff"] / log_steps,
-                        running["kld"] / log_steps,
-                        running["align"] / log_steps,
-                        lr, sps,
+                        running_loss / log_steps, lr, sps,
                     )
-                    running = {k: 0. for k in running}
+                    running_loss = 0.0
                     log_steps = 0
                     wall_start = time()
 
@@ -548,16 +596,16 @@ class FactFlowTrainer:
                 if self.train_steps % self.ckpt_every == 0 and self.train_steps > 0:
                     save_checkpoint(
                         os.path.join(self.ckpt_dir, f"{self.train_steps:07d}.pt"),
-                        self.wrapper, self.ema, self.optimizer, self.scheduler,
-                        self.train_steps, epoch, self.best_val_pcc,
+                        self.wrapper, self.optimizer, self.scheduler,
+                        self.train_steps, epoch, self.best_voxel_r,
                     )
 
                 # ── Rolling last checkpoint ──
                 if self.train_steps % 1000 == 0 and self.train_steps > 0:
                     save_rolling_last(
-                        self.ckpt_dir, self.wrapper, self.ema,
+                        self.ckpt_dir, self.wrapper,
                         self.optimizer, self.scheduler,
-                        self.train_steps, epoch, self.best_val_pcc,
+                        self.train_steps, epoch, self.best_voxel_r,
                     )
 
                 # ── Inline sample eval ──
@@ -577,46 +625,33 @@ class FactFlowTrainer:
             if not hit_max and is_val_epoch:
                 self.logger.info("End of epoch %d, running validation...", epoch + 1)
                 val = self._validate(epoch)
-                ema_m, raw_m = val["ema"], val["raw"]
-                best_pcc = max(ema_m["profile_r"], raw_m["profile_r"])
-                best_src = "EMA" if ema_m["profile_r"] >= raw_m["profile_r"] else "RAW"
-                best_mse = (ema_m if best_src == "EMA" else raw_m)["mse"]
 
-                # Write CSV (EMA cols kept for back-compat; raw + best appended)
                 lr = self.scheduler.get_last_lr()[0]
                 ep_n = max(1, epoch_steps)
                 history_writer.writerow([
                     epoch + 1, self.train_steps,
-                    f"{epoch_acc['loss'] / ep_n:.6f}",
-                    f"{epoch_acc['diff'] / ep_n:.6f}",
-                    f"{epoch_acc['kld'] / ep_n:.6f}",
-                    f"{epoch_acc['align'] / ep_n:.6f}",
-                    f"{ema_m['mse']:.6f}",
-                    f"{ema_m['profile_r']:.6f}",
-                    f"{raw_m['mse']:.6f}",
-                    f"{raw_m['profile_r']:.6f}",
-                    f"{best_pcc:.6f}",
+                    f"{epoch_loss / ep_n:.6f}",
+                    f"{val['mse']:.6f}",
+                    f"{val['voxel_r']:.6f}",
                     f"{lr:.2e}",
                 ])
                 history_file.flush()
 
                 # Reset epoch accumulators
-                epoch_acc = {k: 0. for k in epoch_acc}
+                epoch_loss = 0.0
                 epoch_steps = 0
 
-                # Save best checkpoint by max(EMA, RAW) PCC
-                if best_pcc > self.best_val_pcc:
-                    self.best_val_pcc = best_pcc
+                # Save best checkpoint by voxel-wise Pearson r
+                if val["voxel_r"] > self.best_voxel_r:
+                    self.best_voxel_r = val["voxel_r"]
                     save_checkpoint(
                         os.path.join(self.ckpt_dir, "best.pt"),
-                        self.wrapper, self.ema, self.optimizer, self.scheduler,
-                        self.train_steps, epoch, self.best_val_pcc,
-                        val_mse=best_mse,
+                        self.wrapper, self.optimizer, self.scheduler,
+                        self.train_steps, epoch, self.best_voxel_r,
+                        val_mse=val["mse"],
                     )
                     self.logger.info(
-                        "New best PCC: %.4f (%s; EMA=%.4f RAW=%.4f)!",
-                        self.best_val_pcc, best_src,
-                        ema_m["profile_r"], raw_m["profile_r"],
+                        "New best voxel_r: %.4f", self.best_voxel_r,
                     )
 
             if hit_max:
@@ -625,8 +660,8 @@ class FactFlowTrainer:
         # ── Final checkpoint ──
         save_checkpoint(
             os.path.join(self.ckpt_dir, f"final-{self.train_steps}.pt"),
-            self.wrapper, self.ema, self.optimizer, self.scheduler,
-            self.train_steps, self.epochs, self.best_val_pcc,
+            self.wrapper, self.optimizer, self.scheduler,
+            self.train_steps, self.epochs, self.best_voxel_r,
         )
         history_file.close()
         self.logger.info("Training complete. History: %s", history_path)

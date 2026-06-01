@@ -7,7 +7,6 @@ Checkpoint dict layout::
 
     {
         "model":       wrapper.state_dict(),
-        "ema":         ema.state_dict(),
         "opt":         optimizer.state_dict(),
         "scheduler":   scheduler.state_dict(),
         "train_steps": int,
@@ -35,7 +34,6 @@ logger = logging.getLogger(__name__)
 def save_checkpoint(
     path: str,
     wrapper: nn.Module,
-    ema: nn.Module,
     optimizer: Optimizer,
     scheduler: LRScheduler,
     train_steps: int,
@@ -47,7 +45,6 @@ def save_checkpoint(
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     payload: Dict[str, Any] = {
         "model": wrapper.state_dict(),
-        "ema": ema.state_dict(),
         "opt": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "train_steps": train_steps,
@@ -62,7 +59,6 @@ def save_checkpoint(
 def load_checkpoint(
     path: str,
     wrapper: nn.Module,
-    ema: nn.Module,
     optimizer: Optional[Optimizer] = None,
     scheduler: Optional[LRScheduler] = None,
     device: str = "cpu",
@@ -70,10 +66,11 @@ def load_checkpoint(
     """Load a checkpoint and restore model / optimizer / scheduler state.
 
     Returns a dict with ``train_steps``, ``epoch``, ``best_val_pcc``.
+    Legacy checkpoints that still contain an ``"ema"`` key are accepted —
+    the EMA weights are simply ignored.
     """
     ckpt = torch.load(path, map_location=device)
     wrapper.load_state_dict(ckpt["model"])
-    ema.load_state_dict(ckpt["ema"])
     if optimizer is not None and "opt" in ckpt:
         optimizer.load_state_dict(ckpt["opt"])
     if scheduler is not None and "scheduler" in ckpt:
@@ -97,7 +94,6 @@ def load_checkpoint(
 def save_rolling_last(
     ckpt_dir: str,
     wrapper: nn.Module,
-    ema: nn.Module,
     optimizer: Optimizer,
     scheduler: LRScheduler,
     train_steps: int,
@@ -112,7 +108,7 @@ def save_rolling_last(
         os.remove(old)
     path = os.path.join(ckpt_dir, f"last-{train_steps}.pt")
     save_checkpoint(
-        path, wrapper, ema, optimizer, scheduler,
+        path, wrapper, optimizer, scheduler,
         train_steps, epoch, best_val_pcc,
     )
     return path

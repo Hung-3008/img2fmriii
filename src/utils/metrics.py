@@ -32,12 +32,17 @@ def masked_mse(
     pred: torch.Tensor,
     target: torch.Tensor,
     pad_mask: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """MSE computed only on real (non-padded) voxels.
 
     Args:
         pred, target: ``(B, C, H, W)`` — predicted and ground-truth fMRI.
         pad_mask: ``(V_pad,)`` boolean — ``True`` for real voxels.
+        weight: optional ``(V_pad,)`` per-voxel weight (e.g. noise-ceiling
+            reliability). When given, the loss becomes a weighted average —
+            voxels with low reliability contribute less, focusing capacity on
+            learnable voxels. Should be ~0 on padded positions.
 
     Returns:
         Scalar MSE tensor.
@@ -46,8 +51,39 @@ def masked_mse(
     pred_flat = pred.reshape(B, -1)
     target_flat = target.reshape(B, -1)
     mask = pad_mask.to(pred.device).float()
+    if weight is not None:
+        mask = mask * weight.to(pred.device).float()
     diff_sq = (pred_flat - target_flat) ** 2
-    return (diff_sq * mask.unsqueeze(0)).sum() / (mask.sum() * B)
+    return (diff_sq * mask.unsqueeze(0)).sum() / (mask.sum() * B + 1e-8)
+
+
+def compute_voxel_reliability(
+    fmri_data: np.ndarray,
+    n_reps: int,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """Per-voxel noise-ceiling reliability from repeated presentations.
+
+    Estimates, for each voxel, the fraction of variance in the
+    ``n_reps``-averaged response that is explainable signal (NSD-style noise
+    ceiling). Voxels dominated by trial noise get a weight ≈ 0; reliable
+    voxels get a weight ≈ 1.
+
+    Args:
+        fmri_data: ``(N_images, n_reps, V)`` raw (un-averaged) betas.
+        n_reps:    repetitions per image.
+        eps:       numerical floor.
+
+    Returns:
+        ``(V,)`` reliability in ``[0, 1]`` (noise ceiling for the rep-mean).
+    """
+    x = np.asarray(fmri_data, dtype=np.float32)        # (N, K, V)
+    rep_mean = x.mean(axis=1)                          # (N, V)
+    noise_var = x.var(axis=1, ddof=1).mean(axis=0)     # (V,) within-image noise
+    signal_var = rep_mean.var(axis=0) - noise_var / n_reps
+    signal_var = np.clip(signal_var, 0.0, None)
+    nc = signal_var / (signal_var + noise_var / n_reps + eps)
+    return nc.astype(np.float64)
 
 
 @torch.no_grad()
@@ -72,6 +108,31 @@ def pearson_corr_per_sample(
     t = target_flat - target_flat.mean(dim=1, keepdim=True)
     num = (p * t).sum(dim=1)
     den = torch.sqrt((p ** 2).sum(dim=1) * (t ** 2).sum(dim=1))
+    return num / (den + 1e-8)
+
+
+@torch.no_grad()
+def voxel_pearson(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """Per-voxel (encoding) Pearson *r* across the sample axis.
+
+    The standard NSD encoding-model metric: for each voxel, the correlation
+    between predicted and measured responses across all images. Unlike the
+    per-sample profile r, it is **not** inflated by anatomical mean structure
+    — a constant predictor (per-voxel mean) scores r ≈ 0.
+
+    Args:
+        preds, targets: ``(N, V)`` — unpadded voxels for all N samples.
+
+    Returns:
+        ``(V,)`` tensor of per-voxel Pearson *r*.
+    """
+    p = preds - preds.mean(dim=0, keepdim=True)
+    t = targets - targets.mean(dim=0, keepdim=True)
+    num = (p * t).sum(dim=0)
+    den = torch.sqrt((p ** 2).sum(dim=0) * (t ** 2).sum(dim=0))
     return num / (den + 1e-8)
 
 

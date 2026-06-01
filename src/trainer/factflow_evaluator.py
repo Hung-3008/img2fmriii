@@ -68,8 +68,9 @@ class FactFlowEvaluator:
             clip_feature=dc["clip_feature"],
             n_voxels=dc["n_voxels"],
             pad_to=dc["pad_to"],
-            fmri_channels=dc["fmri_channels"],
-            fmri_spatial=dc["fmri_spatial"],
+            fmri_channels=dc.get("fmri_channels", 1),
+            fmri_spatial=dc.get("fmri_spatial", None),
+            dino_feature=dc.get("dino_feature", None),
         )
         self.test_loader = DataLoader(
             self.test_ds,
@@ -81,17 +82,20 @@ class FactFlowEvaluator:
 
         # ── Geometry ──────────────────────────────────────────────────
         self.latent_size = get_latent_size(self.data_cfg)
+        self.use_cross_attn = bool(
+            self.cfg.stage_2.get("params", {}).get("use_cross_attn", False)
+        )
+        self.use_dino = self.use_cross_attn and self.data_cfg.get("dino_feature") is not None
 
         # ── Model ─────────────────────────────────────────────────────
-        self.wrapper, self.ema = build_models(self.cfg, self.device)
+        self.wrapper = build_models(self.cfg, self.device)
         self.transport = build_transport(self.cfg, self.latent_size)
         self.sample_fn = build_sampler(self.transport, self.cfg.sampler)
 
-        # Load checkpoint — prefer EMA weights
+        # Load checkpoint (raw model weights)
         ckpt = torch.load(args.ckpt, map_location="cpu")
-        state_key = "ema" if "ema" in ckpt else "model"
-        self.wrapper.load_state_dict(ckpt[state_key], strict=False)
-        self.logger.info("Loaded %s weights from %s", state_key, args.ckpt)
+        self.wrapper.load_state_dict(ckpt["model"], strict=False)
+        self.logger.info("Loaded model weights from %s", args.ckpt)
         del ckpt
         if str(self.device).startswith("cuda"):
             torch.cuda.empty_cache()
@@ -115,6 +119,7 @@ class FactFlowEvaluator:
             clip_tokens = batch["clip_tokens"].to(self.device)
             clip_pool = batch["clip_pool"].to(self.device)
             fmri_gt = batch["fmri"].to(self.device)
+            dino_tokens = batch["dino_tokens"].to(self.device) if self.use_dino else None
             B = clip_tokens.shape[0]
 
             # Source from PerceiverVE
@@ -122,9 +127,12 @@ class FactFlowEvaluator:
             x0 = x0_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
 
             # ODE sampling
+            context = clip_tokens if self.use_cross_attn else None
+            context2 = dino_tokens if self.use_dino else None
             with autocast(**self.autocast_kwargs):
                 traj = self.sample_fn(
                     x0, self.wrapper.dit.forward, y=clip_pool,
+                    context=context, context2=context2,
                 )
             pred = traj[-1].float()
 

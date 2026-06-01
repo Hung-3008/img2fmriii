@@ -12,7 +12,7 @@ from .checkpoint import (
     save_rolling_last,
     find_last_checkpoint,
 )
-from .training_utils import update_ema, build_optimizer_and_scheduler
+from .training_utils import build_optimizer_and_scheduler
 
 __all__ = [
     "get_obj_from_str",
@@ -27,6 +27,5 @@ __all__ = [
     "load_checkpoint",
     "save_rolling_last",
     "find_last_checkpoint",
-    "update_ema",
     "build_optimizer_and_scheduler",
 ]
