@@ -3,8 +3,7 @@ factflow_trainer.py
 ===================
 Training orchestrator for FactFlow-based fMRI synthesis.
 
-Pipeline:  CLIP image features → PerceiverVE (learned source x₀)
-           → Flow Matching (velocity matching) → fMRI voxels
+Pipeline:  CLIP image features → Flow Matching (velocity matching) → fMRI voxels
 
 Adapted from the CSFM paper's training logic with:
   - No RAE / stage-1 encoder — operates directly on fMRI voxels
@@ -43,48 +42,6 @@ from utils.fmri_utils import create_pad_mask, get_latent_size
 from utils.logging_utils import create_logger
 from utils.metrics import masked_mse, voxel_pearson, compute_voxel_reliability
 from utils.training_utils import build_optimizer_and_scheduler
-
-# ── KLD losses (self-contained) ──────────────────────
-
-
-def _kld_loss(
-    mu: torch.Tensor,
-    log_var: torch.Tensor,
-    loss_type: str,
-    reduction: str = "mean",
-    target_std: float = 1.0,
-) -> torch.Tensor:
-    """KL-divergence regularisation on the variational source encoder.
-
-    Supports:
-      - ``"kld"``:     standard KLD: 𝔼[-½(1 + logσ² - μ² - σ²)]
-      - ``"naive_kld"``: stability variant: replaces μ² with (0.3μ)⁶
-      - ``"var_kld"``:  variance-only KLD (ignores μ term)
-    """
-    var = log_var.exp()
-    if target_std != 1.0:
-        sigma2_star = target_std ** 2
-        var = var / sigma2_star
-        log_var = log_var - math.log(sigma2_star)
-
-    if loss_type == "kld":
-        raw = -0.5 * (1 + log_var - mu ** 2 - var)
-    elif loss_type == "naive_kld":
-        raw = -0.5 * (1 + log_var - (0.3 * mu) ** 6 - var)
-    elif loss_type == "var_kld":
-        raw = -0.5 * (1 + log_var - var)
-    else:
-        raise ValueError(f"Unknown KLD type: {loss_type}")
-
-    if reduction == "mean":
-        return raw.mean()
-    elif reduction == "sum":
-        return raw.flatten(1).sum(1).mean()
-    else:
-        raise ValueError(f"Unknown reduction: {reduction}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 
 
 class FactFlowTrainer:
@@ -133,7 +90,7 @@ class FactFlowTrainer:
         )
 
         # ── Models ────────────────────────────────────────────────────
-        self.wrapper = build_models(self.cfg, self.device)
+        self.model = build_models(self.cfg, self.device)
         self.transport = build_transport(self.cfg, self.latent_size)
         self.sample_fn = build_sampler(self.transport, self.cfg.sampler)
 
@@ -145,7 +102,7 @@ class FactFlowTrainer:
 
         self.optimizer, self.scheduler, opt_msg, sched_msg = (
             build_optimizer_and_scheduler(
-                self.wrapper.parameters(),
+                self.model.parameters(),
                 self.train_cfg,
                 self.steps_per_epoch,
                 self.epochs,
@@ -175,18 +132,7 @@ class FactFlowTrainer:
         self.val_every = int(self.train_cfg.get("val_every", 1))
 
         # Loss config shortcuts
-        self.use_kld = self.loss_cfg.get("use_kld_loss", True)
-        self.kld_weight = float(self.loss_cfg.get("kld_loss_weight", 5.0))
-        self.kld_type = self.loss_cfg.get("kld_loss_type", "var_kld")
-        self.kld_reduction = self.loss_cfg.get("kld_reduction", "mean")
-        self.kld_target_std = float(self.loss_cfg.get("kld_target_std", 1.0))
-        self.use_align = self.loss_cfg.get("use_align_loss", True)
-        self.align_weight = float(self.loss_cfg.get("align_loss_weight", 1.0))
-        self.align_type = self.loss_cfg.get("align_loss_type", "normalized_l2")
         self.detach_ut = self.loss_cfg.get("detach_ut", False)
-        self.clip_logvar_min = float(self.loss_cfg.get("clip_logvar_min", -10.0))
-        self.clip_logvar_max = float(self.loss_cfg.get("clip_logvar_max", 10.0))
-        self.use_source = bool(self.cfg.get("use_source_encoder", True))
 
         # ── Cross-attention conditioning (CLIP / DINOv2 tokens → DiT) ──
         self.use_cross_attn = bool(
@@ -197,7 +143,7 @@ class FactFlowTrainer:
         # ── SNR-weighted voxel loss ───────────────────────────────────
         self.voxel_weight = self._build_voxel_weight()
 
-        self.wrapper.train()
+        self.model.train()
 
     def _build_voxel_weight(self) -> Optional[torch.Tensor]:
         """Per-voxel noise-ceiling weight over ``pad_to`` (None if disabled)."""
@@ -286,7 +232,7 @@ class FactFlowTrainer:
 
         if ckpt_path is not None:
             info = load_checkpoint(
-                ckpt_path, self.wrapper,
+                ckpt_path, self.model,
                 self.optimizer, self.scheduler, self.device,
             )
             self.train_steps = info["train_steps"]
@@ -304,25 +250,14 @@ class FactFlowTrainer:
         clip_pool: torch.Tensor,
         dino_tokens: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
-        """One forward pass: source encoding → interpolation → velocity prediction → losses.
+        """One forward pass: interpolation → velocity prediction → losses.
 
-        Returns a dict with keys: ``total``, ``diff``, ``kld``, ``align``.
+        Returns a dict with keys: ``total``, ``diff``.
         """
         B = x1.shape[0]
 
-        # 1) Source x₀
-        if self.use_source:
-            x0_tok, mu, log_var = self.wrapper.encode_source(clip_tokens)
-            if log_var is not None:
-                log_var = torch.clamp(
-                    log_var, min=self.clip_logvar_min, max=self.clip_logvar_max,
-                )
-            # Reshape: (B, Q, D) → (B, C, H, W)
-            x0 = x0_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
-        else:
-            # Pure Gaussian noise source (standard flow matching)
-            x0 = torch.randn_like(x1)
-            mu, log_var = None, None
+        # 1) Source x₀ (Pure Gaussian noise source)
+        x0 = torch.randn_like(x1)
 
         # 2) Sample timestep & interpolate along the flow path
         t = self.transport.sample_timestep(x1)
@@ -331,7 +266,7 @@ class FactFlowTrainer:
         # 3) Predict velocity (cross-attend to CLIP/DINOv2 tokens if enabled)
         context = clip_tokens if self.use_cross_attn else None
         context2 = dino_tokens if self.use_dino else None
-        v_pred = self.wrapper.predict_velocity(
+        v_pred = self.model(
             x=xt, t=t, y=clip_pool, context=context, context2=context2,
         )
 
@@ -340,33 +275,9 @@ class FactFlowTrainer:
         diff_loss = masked_mse(v_pred, ut_target, self.pad_mask, weight=self.voxel_weight)
         total = diff_loss
 
-        # 5) KLD regularisation on the variational source encoder
-        kld_val = torch.tensor(0.0, device=self.device)
-        if self.use_kld and log_var is not None:
-            kld_val = _kld_loss(
-                mu, log_var, self.kld_type,
-                reduction=self.kld_reduction,
-                target_std=self.kld_target_std,
-            )
-            total = total + self.kld_weight * kld_val
-
-        # 6) Alignment loss (source mean ↔ target)
-        align_val = torch.tensor(0.0, device=self.device)
-        if self.use_align and mu is not None:
-            mu_reshaped = mu.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
-            if self.align_type == "normalized_l2":
-                mu_norm = F.normalize(mu_reshaped.flatten(1), p=2, dim=-1)
-                x1_norm = F.normalize(x1.flatten(1), p=2, dim=-1)
-                align_val = F.mse_loss(mu_norm, x1_norm)
-            elif self.align_type == "l2":
-                align_val = F.mse_loss(mu_reshaped, x1)
-            total = total + self.align_weight * align_val
-
         return {
             "total": total,
             "diff": diff_loss.detach(),
-            "kld": kld_val.detach(),
-            "align": align_val.detach(),
         }
 
     # ──────────────────────────────────────────────────────────────────
@@ -376,7 +287,7 @@ class FactFlowTrainer:
     @torch.no_grad()
     def _inline_eval(self) -> None:
         """Quick ODE-based eval on a small test subset."""
-        self.wrapper.eval()
+        self.model.eval()
         n_eval = min(64, len(self.test_ds))
         loader = DataLoader(self.test_ds, batch_size=n_eval, shuffle=False, num_workers=0)
         batch = next(iter(loader))
@@ -386,19 +297,15 @@ class FactFlowTrainer:
         clip_pool = batch["clip_pool"].to(self.device)
         dino_tok = batch["dino_tokens"].to(self.device) if self.use_dino else None
 
-        # Source from raw model encoder
-        if self.use_source:
-            x0_tok, _, _ = self.wrapper.encode_source(clip_tok)
-            x0 = x0_tok.permute(0, 2, 1).contiguous().view(n_eval, *self.latent_size)
-        else:
-            x0 = torch.randn(n_eval, *self.latent_size, device=self.device)
+        # Source x0 (pure noise)
+        x0 = torch.randn(n_eval, *self.latent_size, device=self.device)
 
         # ODE sampling
         context = clip_tok if self.use_cross_attn else None
         context2 = dino_tok if self.use_dino else None
         with autocast(**self.autocast_kwargs):
             traj = self.sample_fn(
-                x0, self.wrapper.dit.forward, y=clip_pool,
+                x0, self.model, y=clip_pool,
                 context=context, context2=context2,
             )
         pred = traj[-1].float()
@@ -411,7 +318,7 @@ class FactFlowTrainer:
             "  [Eval step=%d] voxel_r=%.4f  mse=%.5f",
             self.train_steps, voxel_r, mse_val,
         )
-        self.wrapper.train()
+        self.model.train()
 
     # ──────────────────────────────────────────────────────────────────
     # Full validation (end of epoch)
@@ -440,17 +347,14 @@ class FactFlowTrainer:
             dino_tok = batch["dino_tokens"].to(self.device) if self.use_dino else None
             B = fmri_gt.shape[0]
 
-            if self.use_source:
-                x0_tok, _, _ = model.encode_source(clip_tok)
-                x0 = x0_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
-            else:
-                x0 = torch.randn(B, *self.latent_size, device=self.device)
+            # Source x0 (pure noise)
+            x0 = torch.randn(B, *self.latent_size, device=self.device)
 
             context = clip_tok if self.use_cross_attn else None
             context2 = dino_tok if self.use_dino else None
             with autocast(**self.autocast_kwargs):
                 traj = self.sample_fn(
-                    x0, model.dit.forward, y=clip_pool,
+                    x0, model, y=clip_pool,
                     context=context, context2=context2,
                 )
             pred = traj[-1].float()
@@ -487,9 +391,9 @@ class FactFlowTrainer:
             drop_last=False,
         )
 
-        self.wrapper.eval()
-        metrics = self._run_val_pass(self.wrapper, loader, "avg_reps", epoch)
-        self.wrapper.train()
+        self.model.eval()
+        metrics = self._run_val_pass(self.model, loader, "avg_reps", epoch)
+        self.model.train()
         return metrics
 
     # ──────────────────────────────────────────────────────────────────
@@ -524,7 +428,7 @@ class FactFlowTrainer:
         )
 
         for epoch in range(self.start_epoch, self.epochs):
-            self.wrapper.train()
+            self.model.train()
             pbar = tqdm(
                 self.train_loader,
                 desc=f"Epoch {epoch + 1}/{self.epochs}",
@@ -565,7 +469,7 @@ class FactFlowTrainer:
                 accum_counter = 0
                 if self.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(
-                        self.wrapper.parameters(), self.clip_grad,
+                        self.model.parameters(), self.clip_grad,
                     )
                 self.optimizer.step()
                 self.scheduler.step()
@@ -596,14 +500,14 @@ class FactFlowTrainer:
                 if self.train_steps % self.ckpt_every == 0 and self.train_steps > 0:
                     save_checkpoint(
                         os.path.join(self.ckpt_dir, f"{self.train_steps:07d}.pt"),
-                        self.wrapper, self.optimizer, self.scheduler,
+                        self.model, self.optimizer, self.scheduler,
                         self.train_steps, epoch, self.best_voxel_r,
                     )
 
                 # ── Rolling last checkpoint ──
                 if self.train_steps % 1000 == 0 and self.train_steps > 0:
                     save_rolling_last(
-                        self.ckpt_dir, self.wrapper,
+                        self.ckpt_dir, self.model,
                         self.optimizer, self.scheduler,
                         self.train_steps, epoch, self.best_voxel_r,
                     )
@@ -646,7 +550,7 @@ class FactFlowTrainer:
                     self.best_voxel_r = val["voxel_r"]
                     save_checkpoint(
                         os.path.join(self.ckpt_dir, "best.pt"),
-                        self.wrapper, self.optimizer, self.scheduler,
+                        self.model, self.optimizer, self.scheduler,
                         self.train_steps, epoch, self.best_voxel_r,
                         val_mse=val["mse"],
                     )
@@ -660,7 +564,7 @@ class FactFlowTrainer:
         # ── Final checkpoint ──
         save_checkpoint(
             os.path.join(self.ckpt_dir, f"final-{self.train_steps}.pt"),
-            self.wrapper, self.optimizer, self.scheduler,
+            self.model, self.optimizer, self.scheduler,
             self.train_steps, self.epochs, self.best_voxel_r,
         )
         history_file.close()

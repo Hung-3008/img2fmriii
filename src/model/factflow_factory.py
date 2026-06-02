@@ -3,16 +3,10 @@ factflow_factory.py
 ===================
 Factory functions for building the FactFlow model stack:
 
-1. **Models**: LightningDiT (velocity network) + PerceiverVE (source encoder),
-   wrapped in a unified ``nn.Module`` for joint state-dict management.
+1. **Models**: LightningDiT (velocity network), returned directly.
 2. **Transport**: Flow-matching transport with configurable path type
    and time distribution shift.
 3. **Sampler**: ODE sampler for inference.
-
-Architecture notes
-------------------
-We import the model classes (``LightningDiT``, ``PerceiverVE``) from
-the local modules. The *wiring* and *factory logic* is fully owned here.
 """
 
 from __future__ import annotations
@@ -32,61 +26,6 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Unified wrapper — replaces original generic ``Wrapper``
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class FactFlowWrapper(nn.Module):
-    """Unified container for the velocity DiT and the source encoder.
-
-    Advantages over the generic ``Wrapper``:
-    * Typed attributes (``self.dit``, ``self.source_encoder``) for IDE
-      auto-completion and static analysis.
-    * Direct method calls instead of string-based dispatch.
-    """
-
-    def __init__(self, dit: nn.Module, source_encoder: nn.Module) -> None:
-        super().__init__()
-        self.dit = dit
-        self.source_encoder = source_encoder
-
-    def encode_source(self, clip_tokens: torch.Tensor):
-        """Run the source encoder (PerceiverVE).
-
-        Args:
-            clip_tokens: ``(B, T, D)`` CLIP spatial tokens.
-
-        Returns:
-            ``(x0_tok, mu, log_var)`` where ``x0_tok`` is
-            ``(B, num_queries, out_channels)``.
-        """
-        return self.source_encoder(text_tokens=clip_tokens)
-
-    def predict_velocity(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        y: torch.Tensor,
-        context: torch.Tensor = None,
-        context2: torch.Tensor = None,
-    ) -> torch.Tensor:
-        """Run the velocity network (DiT).
-
-        Args:
-            x: ``(B, C, H, W)`` noisy latent.
-            t: ``(B,)`` timestep.
-            y: ``(B, D_pool)`` conditioning (CLIP pooled).
-            context: ``(B, M, D_tok)`` CLIP tokens for cross-attention
-                     (ignored unless the DiT was built with ``use_cross_attn``).
-            context2: ``(B, M2, D_tok2)`` optional second token stream (DINOv2).
-
-        Returns:
-            ``(B, C, H, W)`` predicted velocity.
-        """
-        return self.dit(x=x, t=t, y=y, context=context, context2=context2)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # Factory functions
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -94,21 +33,17 @@ class FactFlowWrapper(nn.Module):
 def build_models(
     cfg: DictConfig,
     device: str = "cpu",
-) -> FactFlowWrapper:
-    """Instantiate DiT + SourceEncoder and wrap them.
+) -> nn.Module:
+    """Instantiate DiT.
 
-    Returns the *wrapper* on *device*.
+    Returns the DiT model on *device*.
     """
     dit = instantiate_from_config(cfg.stage_2)
-    source_encoder = instantiate_from_config(cfg.source_encoder)
 
     dit_params = sum(p.numel() for p in dit.parameters())
-    se_params = sum(p.numel() for p in source_encoder.parameters())
     logger.info("DiT params: %.2fM", dit_params / 1e6)
-    logger.info("SourceEncoder params: %.2fM", se_params / 1e6)
-    logger.info("Total trainable: %.2fM", (dit_params + se_params) / 1e6)
 
-    return FactFlowWrapper(dit=dit, source_encoder=source_encoder).to(device)
+    return dit.to(device)
 
 
 def build_transport(

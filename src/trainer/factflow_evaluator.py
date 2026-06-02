@@ -88,19 +88,19 @@ class FactFlowEvaluator:
         self.use_dino = self.use_cross_attn and self.data_cfg.get("dino_feature") is not None
 
         # ── Model ─────────────────────────────────────────────────────
-        self.wrapper = build_models(self.cfg, self.device)
+        self.model = build_models(self.cfg, self.device)
         self.transport = build_transport(self.cfg, self.latent_size)
         self.sample_fn = build_sampler(self.transport, self.cfg.sampler)
 
         # Load checkpoint (raw model weights)
         ckpt = torch.load(args.ckpt, map_location="cpu")
-        self.wrapper.load_state_dict(ckpt["model"], strict=False)
+        self.model.load_state_dict(ckpt["model"], strict=False)
         self.logger.info("Loaded model weights from %s", args.ckpt)
         del ckpt
         if str(self.device).startswith("cuda"):
             torch.cuda.empty_cache()
 
-        self.wrapper.eval()
+        self.model.eval()
 
     # ──────────────────────────────────────────────────────────────────
     # Inference + metrics
@@ -122,16 +122,15 @@ class FactFlowEvaluator:
             dino_tokens = batch["dino_tokens"].to(self.device) if self.use_dino else None
             B = clip_tokens.shape[0]
 
-            # Source from PerceiverVE
-            x0_tok, _, _ = self.wrapper.encode_source(clip_tokens)
-            x0 = x0_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
+            # Source x0 (pure noise)
+            x0 = torch.randn(B, *self.latent_size, device=self.device)
 
             # ODE sampling
             context = clip_tokens if self.use_cross_attn else None
             context2 = dino_tokens if self.use_dino else None
             with autocast(**self.autocast_kwargs):
                 traj = self.sample_fn(
-                    x0, self.wrapper.dit.forward, y=clip_pool,
+                    x0, self.model, y=clip_pool,
                     context=context, context2=context2,
                 )
             pred = traj[-1].float()

@@ -3,9 +3,6 @@
 # CLIP image features → Flow Matching → fMRI voxels
 # =============================================================================
 
-# --- Source encoder toggle (false = pure noise x₀, standard flow matching) ---
-use_source_encoder: false
-
 # --- Data ---
 data:
   data_dir: NSD/data/nsd
@@ -36,28 +33,6 @@ stage_2:
     use_rope: true
     wo_shift: false
 
-# --- Source encoder (PerceiverVE): CLIP tokens → learned x₀ ---
-# Output: (B, 256, 64) → permute+reshape → (B, 4, 64, 64) = 16384 values
-source_encoder:
-  target: model.perceiver.PerceiverVE
-  params:
-    in_channels: 1664       # SDXL CLIP token dim
-    out_channels: 64        # 256 queries × 64 = 16384 = pad_to
-    hidden_size: 384
-    depth: 4
-    num_heads: 8
-    mlp_ratio: 4.0
-    dropout_prob: 0.0
-    num_queries: 256         # 16×16 grid; 256 × 64 = 16384
-    max_input_len: 256       # CLIP token count
-    pos_emb_type: learned
-    use_qknorm: false
-    use_swiglu: true
-    use_rmsnorm: true
-    use_variational: true
-    init_logvar: 0.0
-    fixed_std: 1.0
-
 # --- Transport (Flow Matching) ---
 # Strategy 2: logit-normal(-1.0, 1.0) focuses 56% of training at t<0.3
 # vs current uniform+shift=2.0 which only spends 17% at t<0.3.
@@ -83,14 +58,6 @@ sampler:
 
 # --- Losses ---
 losses:
-  use_kld_loss: false
-  kld_loss_type: var_kld
-  kld_loss_weight: 5.0
-  kld_target_std: 1.0
-  kld_reduction: mean
-  use_align_loss: false
-  align_loss_weight: 1.0
-  align_loss_type: normalized_l2
   detach_ut: false
 
 # --- Training ---

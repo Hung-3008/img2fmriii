@@ -8,8 +8,6 @@
 # 513-token context. Everything else matches the `cross` run for a clean A/B.
 # =============================================================================
 
-use_source_encoder: true
-
 # --- Data ---
 data:
   data_dir: NSD/data/nsd
@@ -43,27 +41,6 @@ stage_2:
     y_token_channels: 1664       # CLIP token dim
     y_token_channels_2: 1024     # DINOv2 token dim (second context stream)
 
-# --- Source encoder (PerceiverVE): CLIP tokens → learned x₀ ---
-source_encoder:
-  target: model.perceiver.PerceiverVE
-  params:
-    in_channels: 1664
-    out_channels: 64
-    hidden_size: 384
-    depth: 4
-    num_heads: 8
-    mlp_ratio: 4.0
-    dropout_prob: 0.0
-    num_queries: 256
-    max_input_len: 256
-    pos_emb_type: learned
-    use_qknorm: false
-    use_swiglu: true
-    use_rmsnorm: true
-    use_variational: true
-    init_logvar: 0.0
-    fixed_std: 1.0
-
 # --- Transport (Flow Matching) ---
 transport:
   params:
@@ -85,14 +62,6 @@ sampler:
 
 # --- Losses ---
 losses:
-  use_kld_loss: false
-  kld_loss_type: var_kld
-  kld_loss_weight: 5.0
-  kld_target_std: 1.0
-  kld_reduction: mean
-  use_align_loss: true
-  align_loss_weight: 1.0
-  align_loss_type: normalized_l2
   detach_ut: false
   use_snr_weight: true
 

@@ -71,6 +71,10 @@ class FactFlowfMRIDataset(Dataset):
         fmri_path = os.path.join(
             subj_dir, f"nsd_{mode}_fmri_{fmri_mode}_sub{subject}.npy"
         )
+        if not os.path.exists(fmri_path):
+            fmri_path = os.path.join(
+                subj_dir, "fmri", f"nsd_{mode}_fmri_{fmri_mode}_sub{subject}.npy"
+            )
         self.fmri_data = np.load(fmri_path, mmap_mode="r")  # (N_img, 3, V)
         self.n_images = self.fmri_data.shape[0]
         self.n_reps = self.fmri_data.shape[1]
@@ -81,12 +85,20 @@ class FactFlowfMRIDataset(Dataset):
         clip_tok_path = os.path.join(
             subj_dir, f"nsd_{clip_feature}_{mode}_sub{subject}.npy"
         )
+        if not os.path.exists(clip_tok_path):
+            clip_tok_path = os.path.join(
+                subj_dir, "clip", f"nsd_{clip_feature}_{mode}_sub{subject}.npy"
+            )
         self.clip_tokens = np.load(clip_tok_path, mmap_mode="r")
 
         # --- CLIP pooled: (N_images, D_pool) ---
         clip_pool_path = os.path.join(
             subj_dir, f"nsd_{clip_feature}_pool_{mode}_sub{subject}.npy"
         )
+        if not os.path.exists(clip_pool_path):
+            clip_pool_path = os.path.join(
+                subj_dir, "clip", f"nsd_{clip_feature}_pool_{mode}_sub{subject}.npy"
+            )
         self.clip_pool = np.load(clip_pool_path, mmap_mode="r")
 
         # --- Optional DINOv2 tokens: (N_images, T2, D2) ---
@@ -96,6 +108,10 @@ class FactFlowfMRIDataset(Dataset):
             dino_path = os.path.join(
                 subj_dir, f"nsd_{dino_feature}_{mode}_sub{subject}.npy"
             )
+            if not os.path.exists(dino_path):
+                dino_path = os.path.join(
+                    subj_dir, "dino", f"nsd_{dino_feature}_{mode}_sub{subject}.npy"
+                )
             self.dino_tokens = np.load(dino_path, mmap_mode="r")
             assert self.dino_tokens.shape[0] == self.n_images
 
