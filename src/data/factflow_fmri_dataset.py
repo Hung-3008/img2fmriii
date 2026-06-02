@@ -92,12 +92,13 @@ class FactFlowfMRIDataset(Dataset):
         self.clip_tokens = np.load(clip_tok_path, mmap_mode="r")
 
         # --- CLIP pooled: (N_images, D_pool) ---
+        clip_pool_feat = clip_feature.replace("_multi", "")
         clip_pool_path = os.path.join(
-            subj_dir, f"nsd_{clip_feature}_pool_{mode}_sub{subject}.npy"
+            subj_dir, f"nsd_{clip_pool_feat}_pool_{mode}_sub{subject}.npy"
         )
         if not os.path.exists(clip_pool_path):
             clip_pool_path = os.path.join(
-                subj_dir, "clip", f"nsd_{clip_feature}_pool_{mode}_sub{subject}.npy"
+                subj_dir, "clip", f"nsd_{clip_pool_feat}_pool_{mode}_sub{subject}.npy"
             )
         self.clip_pool = np.load(clip_pool_path, mmap_mode="r")
 

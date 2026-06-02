@@ -13,6 +13,7 @@ Output: (B, 1, seq_len)  predicted velocity
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 from .lightning_dit import LightningDiTBlock, VectorEmbedder
@@ -23,6 +24,29 @@ from .model_utils import (
     get_1d_sincos_pos_embed,
     modulate,
 )
+
+
+# ─── Learnable Layer Weighted Sum ────────────────────────────────────
+
+class LayerWeightedSum(nn.Module):
+    """Computes a learnable softmax-weighted sum over the layer dimension (dim=1) of a 4D tensor (B, L, T, D) or 3D tensor (B, L, D)."""
+
+    def __init__(self, num_layers: int):
+        super().__init__()
+        self.weights = nn.Parameter(torch.zeros(num_layers))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = torch.softmax(self.weights, dim=0)
+        if x.dim() == 4:
+            # x shape: (B, L, T, D)
+            # w shape: (1, L, 1, 1) -> (B, T, D)
+            return torch.sum(x * w.view(1, -1, 1, 1), dim=1)
+        elif x.dim() == 3:
+            # x shape: (B, L, D)
+            # w shape: (1, L, 1) -> (B, D) -> unsqueeze to (B, 1, D)
+            return torch.sum(x * w.view(1, -1, 1), dim=1).unsqueeze(1)
+        else:
+            raise ValueError(f"Expected 3D or 4D tensor in LayerWeightedSum, got shape {x.shape}")
 
 
 # ─── 1D Patch Embedding ──────────────────────────────────────────────
@@ -101,6 +125,8 @@ class DiT1D(nn.Module):
         use_cross_attn: bool = False,
         y_token_channels: int = 1664,
         y_token_channels_2: int = None,
+        y_token_layers: int = 1,
+        y_token_layers_2: int = 1,
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -127,12 +153,17 @@ class DiT1D(nn.Module):
         # sequence, shared across all blocks.
         self.context_embedder = None
         self.context_embedder_2 = None
+        self.clip_layer_fusion = None
+        self.dino_layer_fusion = None
+
         if use_cross_attn:
+            self.clip_layer_fusion = LayerWeightedSum(y_token_layers) if y_token_layers > 1 else nn.Identity()
             self.context_embedder = nn.Sequential(
                 nn.Linear(y_token_channels, hidden_size),
                 RMSNorm(hidden_size),
             )
             if y_token_channels_2 is not None:
+                self.dino_layer_fusion = LayerWeightedSum(y_token_layers_2) if y_token_layers_2 > 1 else nn.Identity()
                 self.context_embedder_2 = nn.Sequential(
                     nn.Linear(y_token_channels_2, hidden_size),
                     RMSNorm(hidden_size),
@@ -234,9 +265,9 @@ class DiT1D(nn.Module):
             x: (B, C, L) — 1D fMRI signal (C=1 typically)
             t: (B,) — diffusion timestep
             y: (B, D_pool) — CLIP pooled conditioning
-            context: (B, M, D_tok) — CLIP spatial tokens for cross-attention
+            context: (B, L_clip, M, D_tok) or (B, M, D_tok) — CLIP spatial tokens for cross-attention
                      (only used when ``use_cross_attn=True``)
-            context2: (B, M2, D_tok2) — optional second token stream
+            context2: (B, L_dino, M2, D_tok2) or (B, M2, D_tok2) — optional second token stream
                      (e.g. DINOv2); concatenated with ``context``.
 
         Returns:
@@ -249,8 +280,11 @@ class DiT1D(nn.Module):
 
         ctx = None
         if self.use_cross_attn and context is not None:
+            context = self.clip_layer_fusion(context)
             ctx = self.context_embedder(context)    # (B, M, D)
+
             if self.context_embedder_2 is not None and context2 is not None:
+                context2 = self.dino_layer_fusion(context2)
                 ctx2 = self.context_embedder_2(context2)        # (B, M2, D)
                 ctx = torch.cat([ctx, ctx2], dim=1)             # (B, M+M2, D)
 

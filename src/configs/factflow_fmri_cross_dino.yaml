@@ -13,8 +13,8 @@ data:
   data_dir: NSD/data/nsd
   subject: 1
   fmri_mode: zscore
-  clip_feature: sdxl_clip
-  dino_feature: dinov2_vitl14   # second token stream (257, 1024)
+  clip_feature: sdxl_clip_multi
+  dino_feature: dinov2_vitl14_multilayer   # second token stream (257, 1024)
   n_voxels: 15724
   pad_to: 16384
   avg_reps: true
@@ -40,6 +40,8 @@ stage_2:
     use_cross_attn: true
     y_token_channels: 1664       # CLIP token dim
     y_token_channels_2: 1024     # DINOv2 token dim (second context stream)
+    y_token_layers: 48           # Number of CLIP feature layers
+    y_token_layers_2: 4          # Number of DINOv2 feature layers
 
 # --- Transport (Flow Matching) ---
 transport:
