@@ -233,9 +233,16 @@ class FactFlowEvaluator:
                     context=context, context2=context2,
                 )
             pred = traj[-1].float()
+            # Free all intermediate ODE/SDE steps immediately
+            del traj, x0, clip_tokens, clip_pool, dino_tokens, context, context2
 
-            pred_flat = pred.reshape(B, -1)[:, : self.n_voxels]
-            all_preds.append(pred_flat.cpu().numpy())
+            pred_flat = pred.reshape(B, -1)[:, : self.n_voxels].cpu().numpy()
+            del pred
+            all_preds.append(pred_flat)
+
+        # Release GPU memory before returning to the next pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return np.concatenate(all_preds, axis=0)
 
