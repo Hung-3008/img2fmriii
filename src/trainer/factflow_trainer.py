@@ -183,10 +183,16 @@ class FactFlowTrainer:
         self.use_align = self.loss_cfg.get("use_align_loss", True)
         self.align_weight = float(self.loss_cfg.get("align_loss_weight", 1.0))
         self.align_type = self.loss_cfg.get("align_loss_type", "normalized_l2")
+        # Correlation-aware reconstruction loss in x̂₁ space (metric-aligned).
+        self.use_recon = bool(self.loss_cfg.get("use_recon_loss", False))
+        self.recon_weight = float(self.loss_cfg.get("recon_loss_weight", 0.0))
+        self.recon_type = self.loss_cfg.get("recon_loss_type", "pearson")
         self.detach_ut = self.loss_cfg.get("detach_ut", False)
         self.clip_logvar_min = float(self.loss_cfg.get("clip_logvar_min", -10.0))
         self.clip_logvar_max = float(self.loss_cfg.get("clip_logvar_max", 10.0))
         self.use_source = bool(self.cfg.get("use_source_encoder", True))
+        # Use the source-encoder mean (μ) instead of a sampled x₀ at eval time.
+        self.eval_use_mean = bool(self.cfg.get("eval_use_mean", False))
 
         # ── Cross-attention conditioning (CLIP / DINOv2 tokens → DiT) ──
         self.use_cross_attn = bool(
@@ -297,6 +303,23 @@ class FactFlowTrainer:
     # Forward + loss
     # ──────────────────────────────────────────────────────────────────
 
+    def _reparam_source(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+        """Sample source tokens x₀ = μ + ε·σ with σ from the *clamped* log-variance.
+
+        The encoder's ``forward`` samples internally using the raw, unclamped
+        log-variance, which can diverge early in training while the KLD term only
+        ever sees the clamped value. Re-sampling here from the clamped
+        log-variance keeps the noise injected into x₀ consistent with the
+        regulariser. Falls back to μ for a non-variational encoder.
+        """
+        if log_var is None:
+            return mu
+        log_var = torch.clamp(
+            log_var, min=self.clip_logvar_min, max=self.clip_logvar_max,
+        )
+        std = (0.5 * log_var).exp()
+        return mu + torch.randn_like(mu) * std
+
     def _compute_loss(
         self,
         x1: torch.Tensor,
@@ -312,12 +335,14 @@ class FactFlowTrainer:
 
         # 1) Source x₀
         if self.use_source:
-            x0_tok, mu, log_var = self.wrapper.encode_source(clip_tokens)
+            _, mu, log_var = self.wrapper.encode_source(clip_tokens)
             if log_var is not None:
                 log_var = torch.clamp(
                     log_var, min=self.clip_logvar_min, max=self.clip_logvar_max,
                 )
-            # Reshape: (B, Q, D) → (B, C, H, W)
+            # Sample x₀ = μ + ε·σ from the clamped log-variance (consistent with
+            # the KLD term), then reshape (B, Q, D) → (B, C, H, W).
+            x0_tok = self._reparam_source(mu, log_var)
             x0 = x0_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
         else:
             # Pure Gaussian noise source (standard flow matching)
@@ -362,12 +387,46 @@ class FactFlowTrainer:
                 align_val = F.mse_loss(mu_reshaped, x1)
             total = total + self.align_weight * align_val
 
+        # 7) Reconstruction loss in x̂₁ space (correlation-aware, metric-aligned).
+        # From the linear path xₜ=(1-t)x₀+t·x₁ and uₜ=x₁-x₀, the target is
+        # recovered exactly as x₁ = xₜ + (1-t)·uₜ; substituting the predicted
+        # velocity gives a differentiable estimate x̂₁ to score against x₁.
+        recon_val = torch.tensor(0.0, device=self.device)
+        if self.use_recon:
+            t_b = t.view(B, *([1] * (x1.dim() - 1)))
+            x1_hat = xt + (1.0 - t_b) * v_pred
+            recon_val = self._recon_loss(x1_hat, x1)
+            total = total + self.recon_weight * recon_val
+
         return {
             "total": total,
             "diff": diff_loss.detach(),
             "kld": kld_val.detach(),
             "align": align_val.detach(),
+            "recon": recon_val.detach(),
         }
+
+    def _recon_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Loss on the reconstructed target x̂₁, restricted to real voxels.
+
+        ``pearson`` — 1 − profile Pearson r per sample (over voxels), averaged.
+        Scale/shift-invariant, so it must *not* be the velocity loss, but as an
+        auxiliary on x̂₁ it directly rewards the ``voxel_pearson`` eval metric.
+        ``mse`` — plain masked MSE on x̂₁ (magnitude-aware).
+        """
+        B = pred.shape[0]
+        mask = self.pad_mask.to(pred.device)
+        p = pred.reshape(B, -1)[:, mask].float()
+        g = target.reshape(B, -1)[:, mask].float()
+        if self.recon_type == "pearson":
+            p = p - p.mean(dim=1, keepdim=True)
+            g = g - g.mean(dim=1, keepdim=True)
+            num = (p * g).sum(dim=1)
+            den = p.norm(dim=1) * g.norm(dim=1) + 1e-8
+            return (1.0 - num / den).mean()
+        elif self.recon_type == "mse":
+            return F.mse_loss(p, g)
+        raise ValueError(f"Unknown recon_loss_type: {self.recon_type}")
 
     # ──────────────────────────────────────────────────────────────────
     # Inline evaluation (quick subset during training)
@@ -387,9 +446,21 @@ class FactFlowTrainer:
         dino_tok = batch["dino_tokens"].to(self.device) if self.use_dino else None
 
         # Source from raw model encoder
+        src_std = None
+        src_corr = None
         if self.use_source:
-            x0_tok, _, _ = self.wrapper.encode_source(clip_tok)
-            x0 = x0_tok.permute(0, 2, 1).contiguous().view(n_eval, *self.latent_size)
+            _, mu, log_var = self.wrapper.encode_source(clip_tok)
+            src = mu if self.eval_use_mean else self._reparam_source(mu, log_var)
+            x0 = src.permute(0, 2, 1).contiguous().view(n_eval, *self.latent_size)
+            # Diagnostics: is the source a genuine distribution (σ>0) that does
+            # NOT merely copy the target (low corr(μ, x₁))?
+            if log_var is not None:
+                src_std = log_var.float().mul(0.5).exp().mean().item()
+            mu_flat = mu.permute(0, 2, 1).contiguous().view(n_eval, -1)[:, self.pad_mask]
+            src_corr = voxel_pearson(
+                mu_flat.float(),
+                fmri_gt.reshape(n_eval, -1)[:, self.pad_mask].float(),
+            ).mean().item()
         else:
             x0 = torch.randn(n_eval, *self.latent_size, device=self.device)
 
@@ -407,9 +478,15 @@ class FactFlowTrainer:
         gts_flat = fmri_gt.reshape(n_eval, -1)[:, self.pad_mask]
         voxel_r = voxel_pearson(preds_flat, gts_flat).mean().item()
         mse_val = masked_mse(pred, fmri_gt, self.pad_mask).item()
+        src_msg = ""
+        if src_std is not None or src_corr is not None:
+            src_msg = "  [src σ=%s corr(μ,x₁)=%s]" % (
+                f"{src_std:.3f}" if src_std is not None else "n/a",
+                f"{src_corr:.3f}" if src_corr is not None else "n/a",
+            )
         self.logger.info(
-            "  [Eval step=%d] voxel_r=%.4f  mse=%.5f",
-            self.train_steps, voxel_r, mse_val,
+            "  [Eval step=%d] voxel_r=%.4f  mse=%.5f%s",
+            self.train_steps, voxel_r, mse_val, src_msg,
         )
         self.wrapper.train()
 
@@ -441,8 +518,9 @@ class FactFlowTrainer:
             B = fmri_gt.shape[0]
 
             if self.use_source:
-                x0_tok, _, _ = model.encode_source(clip_tok)
-                x0 = x0_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
+                _, mu, log_var = model.encode_source(clip_tok)
+                src = mu if self.eval_use_mean else self._reparam_source(mu, log_var)
+                x0 = src.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
             else:
                 x0 = torch.randn(B, *self.latent_size, device=self.device)
 
@@ -505,14 +583,26 @@ class FactFlowTrainer:
         history_writer = csv.writer(history_file)
         if not history_exists:
             history_writer.writerow([
-                "epoch", "step", "train_loss", "val_mse", "val_voxel_r", "lr",
+                "epoch", "step", "train_loss", "train_diff", "train_kld", "train_align", "train_recon", "val_mse", "val_voxel_r", "lr",
             ])
             history_file.flush()
 
         # ── Accumulators ──
         running_loss = 0.0   # since last log_every
+        running_diff = 0.0
+        running_kld = 0.0
+        running_align = 0.0
+        running_recon = 0.0
         epoch_loss = 0.0     # since last validation
+        epoch_diff = 0.0
+        epoch_kld = 0.0
+        epoch_align = 0.0
+        epoch_recon = 0.0
         step_loss = 0.0      # current optimizer step (across micro-batches)
+        step_diff = 0.0
+        step_kld = 0.0
+        step_align = 0.0
+        step_recon = 0.0
         epoch_steps = 0
         log_steps = 0
         accum_counter = 0
@@ -555,8 +645,22 @@ class FactFlowTrainer:
 
                 # Accumulate micro-batch loss (rescaled to full-step units)
                 micro_loss = losses["total"].item() / self.grad_accum
+                micro_diff = losses["diff"].item() / self.grad_accum
+                micro_kld = losses["kld"].item() / self.grad_accum
+                micro_align = losses["align"].item() / self.grad_accum
+                micro_recon = losses["recon"].item() / self.grad_accum
+
                 running_loss += micro_loss
+                running_diff += micro_diff
+                running_kld += micro_kld
+                running_align += micro_align
+                running_recon += micro_recon
+
                 step_loss += micro_loss
+                step_diff += micro_diff
+                step_kld += micro_kld
+                step_align += micro_align
+                step_recon += micro_recon
 
                 if accum_counter < self.grad_accum:
                     continue
@@ -575,8 +679,17 @@ class FactFlowTrainer:
                 self.train_steps += 1
 
                 epoch_loss += step_loss
+                epoch_diff += step_diff
+                epoch_kld += step_kld
+                epoch_align += step_align
+                epoch_recon += step_recon
                 epoch_steps += 1
+
                 step_loss = 0.0
+                step_diff = 0.0
+                step_kld = 0.0
+                step_align = 0.0
+                step_recon = 0.0
 
                 # ── Periodic logging ──
                 if self.train_steps % self.log_every == 0:
@@ -584,11 +697,18 @@ class FactFlowTrainer:
                     sps = log_steps / elapsed if elapsed > 0 else 0
                     lr = self.scheduler.get_last_lr()[0]
                     self.logger.info(
-                        "[step=%07d ep=%d] loss=%.5f lr=%.2e steps/s=%.1f",
+                        "[step=%07d ep=%d] loss=%.5f (diff=%.5f kld=%.5f align=%.5f recon=%.5f) lr=%.2e steps/s=%.1f",
                         self.train_steps, epoch,
-                        running_loss / log_steps, lr, sps,
+                        running_loss / log_steps,
+                        running_diff / log_steps, running_kld / log_steps,
+                        running_align / log_steps, running_recon / log_steps,
+                        lr, sps,
                     )
                     running_loss = 0.0
+                    running_diff = 0.0
+                    running_kld = 0.0
+                    running_align = 0.0
+                    running_recon = 0.0
                     log_steps = 0
                     wall_start = time()
 
@@ -631,6 +751,10 @@ class FactFlowTrainer:
                 history_writer.writerow([
                     epoch + 1, self.train_steps,
                     f"{epoch_loss / ep_n:.6f}",
+                    f"{epoch_diff / ep_n:.6f}",
+                    f"{epoch_kld / ep_n:.6f}",
+                    f"{epoch_align / ep_n:.6f}",
+                    f"{epoch_recon / ep_n:.6f}",
                     f"{val['mse']:.6f}",
                     f"{val['voxel_r']:.6f}",
                     f"{lr:.2e}",
@@ -639,6 +763,10 @@ class FactFlowTrainer:
 
                 # Reset epoch accumulators
                 epoch_loss = 0.0
+                epoch_diff = 0.0
+                epoch_kld = 0.0
+                epoch_align = 0.0
+                epoch_recon = 0.0
                 epoch_steps = 0
 
                 # Save best checkpoint by voxel-wise Pearson r
