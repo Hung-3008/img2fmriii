@@ -77,6 +77,9 @@ class FactFlowEvaluator:
         self.logger = create_logger(name="factflow_eval")
 
         # ── Data ──────────────────────────────────────────────────────
+        # Always use avg_reps=True for evaluation: 1000 images with
+        # rep-averaged GT (mean of 3 trials).  This matches the trainer's
+        # _validate() and published NSD benchmarks.
         dc = self.data_cfg
         self.n_voxels = dc["n_voxels"]
         self.test_ds = FactFlowfMRIDataset(
@@ -90,6 +93,7 @@ class FactFlowEvaluator:
             fmri_channels=dc.get("fmri_channels", 1),
             fmri_spatial=dc.get("fmri_spatial", None),
             dino_feature=dc.get("dino_feature", None),
+            avg_reps=True,
         )
         self.test_loader = DataLoader(
             self.test_ds,
@@ -267,10 +271,12 @@ class FactFlowEvaluator:
         )
 
         # ── Metrics ───────────────────────────────────────────────────
+        # Since avg_reps=True, each sample IS already a unique image with
+        # rep-averaged GT → n_reps=1, n_images=N.
         metrics = compute_full_metrics(
             preds, targets,
             n_voxels=self.n_voxels,
-            n_reps=self.test_ds.n_reps,
+            n_reps=1,
             n_images=self.test_ds.n_images,
         )
 
@@ -280,7 +286,7 @@ class FactFlowEvaluator:
         self.logger.info("EVALUATION RESULTS")
         self.logger.info("  Scenario: %s  |  K trials: %d", self.scenario, self.k_trials)
         self.logger.info("=" * 60)
-        self.logger.info("  Single-trial metrics (N=%d):", n_samples)
+        self.logger.info("  Rep-averaged metrics (N=%d images):", n_samples)
         self.logger.info("    Per-voxel Pearson r (mean):   %.4f", metrics.mean_voxel_r)
         self.logger.info("    Per-voxel Pearson r (median): %.4f", metrics.median_voxel_r)
         self.logger.info("    Profile Pearson r (mean):     %.4f", metrics.mean_profile_r)
