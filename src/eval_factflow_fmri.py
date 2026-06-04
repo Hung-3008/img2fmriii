@@ -7,27 +7,34 @@ Supports three inference scenarios:
 
   1. ``deterministic`` — PerceiverVE uses μ (no sampling), ODE solver (no noise).
   2. ``perceiver_stochastic`` — PerceiverVE samples x₀ = μ + ε·σ, ODE solver.
-     With K>1 trials, results are averaged (multi-trial enhancement).
   3. ``flow_stochastic`` — PerceiverVE uses μ, SDE solver (noise injection).
-     With K>1 trials, results are averaged.
+
+For stochastic scenarios, runs ``--max_trials`` forward passes (default 10),
+saves each individual pass, then computes metrics for each K in ``--k_values``
+(default 1,5,10) by averaging the first K passes.
 
 Usage::
 
-    # Scenario 1: fully deterministic (baseline)
-    python src/eval_factflow_fmri.py \
-        --config src/configs/factflow_fmri_cross_dino_srcdist_v2.yaml \
-        --ckpt exps/.../checkpoints/best.pt \
-        --scenario deterministic
+    # Scenario 1: fully deterministic
+    python src/eval_factflow_fmri.py \\
+        --config src/configs/factflow_fmri_cross_dino_srcdist_v2.yaml \\
+        --ckpt exps/.../checkpoints/best.pt \\
+        --scenario deterministic \\
+        --output results/eval_deterministic
 
-    # Scenario 2: perceiver stochastic, K=5 trials
-    python src/eval_factflow_fmri.py \
-        --config ... --ckpt ... \
-        --scenario perceiver_stochastic --k_trials 5
+    # Scenario 2: perceiver stochastic, 10 passes → metrics for K=1,5,10
+    python src/eval_factflow_fmri.py \\
+        --config ... --ckpt ... \\
+        --scenario perceiver_stochastic \\
+        --max_trials 10 --k_values 1,5,10 \\
+        --output results/eval_perceiver_stochastic
 
-    # Scenario 3: flow stochastic, K=10 trials
-    python src/eval_factflow_fmri.py \
-        --config ... --ckpt ... \
-        --scenario flow_stochastic --k_trials 10
+    # Scenario 3: flow stochastic, 10 passes → metrics for K=1,5,10
+    python src/eval_factflow_fmri.py \\
+        --config ... --ckpt ... \\
+        --scenario flow_stochastic \\
+        --max_trials 10 --k_values 1,5,10 \\
+        --output results/eval_flow_stochastic
 """
 
 import argparse
@@ -53,7 +60,7 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="",
                         help="Device (default: auto-detect)")
     parser.add_argument("--output", type=str, default=None,
-                        help="Path to save .npz results")
+                        help="Directory to save results (per-pass .npy + avg .npz)")
 
     # ── Scenario arguments ────────────────────────────────────────────
     parser.add_argument(
@@ -67,8 +74,12 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--k_trials", type=int, default=1,
-        help="Number of stochastic trials to average (only for stochastic scenarios)",
+        "--max_trials", type=int, default=10,
+        help="Number of stochastic forward passes to run (default: 10)",
+    )
+    parser.add_argument(
+        "--k_values", type=str, default="1,5,10",
+        help="Comma-separated K values to average and report (default: 1,5,10)",
     )
     parser.add_argument(
         "--sde_num_steps", type=int, default=250,
@@ -80,7 +91,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--csv_out", type=str, default=None,
-        help="Path to append results as a CSV row",
+        help="Path to append results as CSV rows (one row per K value)",
     )
 
     args = parser.parse_args()

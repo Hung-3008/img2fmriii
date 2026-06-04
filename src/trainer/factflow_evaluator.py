@@ -7,15 +7,17 @@ Supports three inference scenarios:
 
   1. **deterministic** — PerceiverVE mean μ → ODE solver (fully deterministic).
   2. **perceiver_stochastic** — PerceiverVE samples x₀ = μ + ε·σ → ODE solver.
-     With K > 1, generates K predictions per image and averages them.
   3. **flow_stochastic** — PerceiverVE mean μ → SDE solver (noise-injected flow).
-     With K > 1, generates K predictions per image and averages them.
+
+For stochastic scenarios, runs ``max_trials`` forward passes (default 10),
+saves each individual pass, then computes metrics for each K in ``k_values``
+(default [1, 5, 10]) by averaging the first K passes.  This avoids redundant
+computation — 10 passes total instead of 1+5+10 = 16.
 
 Metrics:
   - Per-voxel Pearson r (encoding metric, mean & median)
   - Profile Pearson r (mean)
   - MSE
-  - Image-level metrics (rep-averaged)
 
 Results can be saved to ``.npz`` and/or appended to a CSV file.
 """
@@ -24,10 +26,9 @@ from __future__ import annotations
 
 import csv
 import logging
-import math
 import os
 from argparse import Namespace
-from typing import Dict, Optional
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -61,9 +62,22 @@ class FactFlowEvaluator:
 
         # ── Scenario ──────────────────────────────────────────────────
         self.scenario = getattr(args, "scenario", "deterministic")
-        self.k_trials = getattr(args, "k_trials", 1)
+
+        # For stochastic scenarios: run max_trials passes, then compute
+        # metrics for each K in k_values by averaging the first K passes.
+        self.max_trials = getattr(args, "max_trials", 10)
+        k_str = getattr(args, "k_values", "1,5,10")
+        self.k_values: List[int] = sorted(
+            int(x) for x in str(k_str).split(",")
+        )
+
         if self.scenario == "deterministic":
-            self.k_trials = 1  # deterministic → always 1 trial
+            # Deterministic: only 1 pass, only K=1 makes sense
+            self.max_trials = 1
+            self.k_values = [1]
+
+        # Ensure max_trials >= max(k_values)
+        self.max_trials = max(self.max_trials, max(self.k_values))
 
         # ── Device ────────────────────────────────────────────────────
         self.device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -226,53 +240,16 @@ class FactFlowEvaluator:
         return np.concatenate(all_preds, axis=0)
 
     # ──────────────────────────────────────────────────────────────────
-    # Main evaluation
+    # Metrics helper
     # ──────────────────────────────────────────────────────────────────
 
-    @torch.no_grad()
-    def evaluate(self) -> Dict[str, float]:
-        """Run inference and compute all metrics."""
-
-        self.logger.info("=" * 60)
-        self.logger.info(
-            "Scenario: %s  |  K trials: %d", self.scenario, self.k_trials,
-        )
-        self.logger.info(
-            "Running inference on %d test samples...", len(self.test_ds),
-        )
-        self.logger.info("=" * 60)
-
-        # ── Collect ground truth ──────────────────────────────────────
-        all_targets = []
-        for batch in self.test_loader:
-            fmri_gt = batch["fmri"]
-            B = fmri_gt.shape[0]
-            gt_flat = fmri_gt.reshape(B, -1)[:, : self.n_voxels]
-            all_targets.append(gt_flat.numpy())
-        targets = np.concatenate(all_targets, axis=0)
-
-        # ── Run K trials ──────────────────────────────────────────────
-        preds_accum = None
-        for k in range(self.k_trials):
-            if self.k_trials > 1:
-                self.logger.info("Trial %d / %d ...", k + 1, self.k_trials)
-
-            preds_k = self._run_single_pass()
-
-            if preds_accum is None:
-                preds_accum = preds_k.astype(np.float64)
-            else:
-                preds_accum += preds_k.astype(np.float64)
-
-        preds = (preds_accum / self.k_trials).astype(np.float32)
-
-        self.logger.info(
-            "Predictions: %s,  Targets: %s", preds.shape, targets.shape,
-        )
-
-        # ── Metrics ───────────────────────────────────────────────────
-        # Since avg_reps=True, each sample IS already a unique image with
-        # rep-averaged GT → n_reps=1, n_images=N.
+    def _compute_and_report(
+        self,
+        preds: np.ndarray,
+        targets: np.ndarray,
+        k: int,
+    ) -> Dict[str, float]:
+        """Compute metrics for a given K-averaged prediction and log results."""
         metrics = compute_full_metrics(
             preds, targets,
             n_voxels=self.n_voxels,
@@ -280,80 +257,134 @@ class FactFlowEvaluator:
             n_images=self.test_ds.n_images,
         )
 
-        # ── Report ────────────────────────────────────────────────────
-        n_samples = preds.shape[0]
-        self.logger.info("=" * 60)
-        self.logger.info("EVALUATION RESULTS")
-        self.logger.info("  Scenario: %s  |  K trials: %d", self.scenario, self.k_trials)
-        self.logger.info("=" * 60)
-        self.logger.info("  Rep-averaged metrics (N=%d images):", n_samples)
+        self.logger.info("  ── K=%d ──", k)
         self.logger.info("    Per-voxel Pearson r (mean):   %.4f", metrics.mean_voxel_r)
         self.logger.info("    Per-voxel Pearson r (median): %.4f", metrics.median_voxel_r)
         self.logger.info("    Profile Pearson r (mean):     %.4f", metrics.mean_profile_r)
         self.logger.info("    MSE:                          %.6f", metrics.mse)
-
-        if metrics.mean_img_profile_r is not None:
-            self.logger.info(
-                "  Image-level metrics (N=%d, rep-averaged):",
-                self.test_ds.n_images,
-            )
-            self.logger.info(
-                "    Per-voxel Pearson r (mean):   %.4f",
-                metrics.mean_img_voxel_r,
-            )
-            self.logger.info(
-                "    Profile Pearson r (mean):     %.4f",
-                metrics.mean_img_profile_r,
-            )
-        self.logger.info("=" * 60)
-
-        # ── Save .npz ────────────────────────────────────────────────
-        if self.args.output:
-            os.makedirs(os.path.dirname(self.args.output) or ".", exist_ok=True)
-            save_dict = dict(
-                preds=preds,
-                targets=targets,
-                voxel_r=metrics.voxel_r,
-                profile_r=metrics.profile_r,
-            )
-            if metrics.img_profile_r is not None:
-                save_dict["img_profile_r"] = metrics.img_profile_r
-                save_dict["img_voxel_r"] = metrics.img_voxel_r
-            np.savez(self.args.output, **save_dict)
-            self.logger.info("Saved results to %s", self.args.output)
-
-        # ── Append to CSV ─────────────────────────────────────────────
-        csv_path = getattr(self.args, "csv_out", None)
-        if csv_path:
-            os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-            header = [
-                "scenario", "k_trials",
-                "mean_voxel_r", "median_voxel_r",
-                "mean_profile_r", "mse",
-                "mean_img_voxel_r", "mean_img_profile_r",
-                "ckpt",
-            ]
-            write_header = not os.path.exists(csv_path)
-            with open(csv_path, "a", newline="") as f:
-                writer = csv.writer(f)
-                if write_header:
-                    writer.writerow(header)
-                writer.writerow([
-                    self.scenario,
-                    self.k_trials,
-                    f"{metrics.mean_voxel_r:.6f}",
-                    f"{metrics.median_voxel_r:.6f}",
-                    f"{metrics.mean_profile_r:.6f}",
-                    f"{metrics.mse:.6f}",
-                    f"{metrics.mean_img_voxel_r:.6f}" if metrics.mean_img_voxel_r is not None else "",
-                    f"{metrics.mean_img_profile_r:.6f}" if metrics.mean_img_profile_r is not None else "",
-                    self.args.ckpt,
-                ])
-            self.logger.info("Appended CSV row to %s", csv_path)
 
         return {
             "mean_voxel_r": metrics.mean_voxel_r,
             "median_voxel_r": metrics.median_voxel_r,
             "mean_profile_r": metrics.mean_profile_r,
             "mse": metrics.mse,
+            "voxel_r": metrics.voxel_r,
+            "profile_r": metrics.profile_r,
+        }
+
+    def _append_csv(
+        self, k: int, result: Dict[str, float],
+    ) -> None:
+        """Append one CSV row for a given K."""
+        csv_path = getattr(self.args, "csv_out", None)
+        if not csv_path:
+            return
+        os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+        header = [
+            "scenario", "k_trials",
+            "mean_voxel_r", "median_voxel_r",
+            "mean_profile_r", "mse",
+            "ckpt",
+        ]
+        write_header = not os.path.exists(csv_path)
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(header)
+            writer.writerow([
+                self.scenario,
+                k,
+                f"{result['mean_voxel_r']:.6f}",
+                f"{result['median_voxel_r']:.6f}",
+                f"{result['mean_profile_r']:.6f}",
+                f"{result['mse']:.6f}",
+                self.args.ckpt,
+            ])
+        self.logger.info("    → CSV row appended to %s", csv_path)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Main evaluation
+    # ──────────────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def evaluate(self) -> Dict[str, float]:
+        """Run inference and compute all metrics.
+
+        For stochastic scenarios, runs ``max_trials`` forward passes, saves
+        each individual pass to ``.npz``, then computes metrics for each K
+        in ``k_values`` by averaging the first K passes.
+        """
+        self.logger.info("=" * 60)
+        self.logger.info(
+            "Scenario: %s  |  max_trials: %d  |  k_values: %s",
+            self.scenario, self.max_trials, self.k_values,
+        )
+        self.logger.info(
+            "Running inference on %d test images (avg_reps=True)...",
+            len(self.test_ds),
+        )
+        self.logger.info("=" * 60)
+
+        # ── Collect ground truth (once) ───────────────────────────────
+        all_targets = []
+        for batch in self.test_loader:
+            fmri_gt = batch["fmri"]
+            B = fmri_gt.shape[0]
+            gt_flat = fmri_gt.reshape(B, -1)[:, : self.n_voxels]
+            all_targets.append(gt_flat.numpy())
+        targets = np.concatenate(all_targets, axis=0)  # (N, V)
+
+        # ── Run max_trials forward passes ─────────────────────────────
+        # Store each pass individually: list of (N, V) arrays
+        all_passes: List[np.ndarray] = []
+        out_dir = getattr(self.args, "output", None)
+
+        for t in range(self.max_trials):
+            self.logger.info(
+                "Pass %d / %d ...", t + 1, self.max_trials,
+            )
+            preds_t = self._run_single_pass()  # (N, V)
+            all_passes.append(preds_t)
+
+            # Save individual pass
+            if out_dir:
+                pass_dir = os.path.join(out_dir, "passes")
+                os.makedirs(pass_dir, exist_ok=True)
+                pass_path = os.path.join(pass_dir, f"pass_{t:02d}.npy")
+                np.save(pass_path, preds_t)
+                self.logger.info("  Saved pass %d → %s", t + 1, pass_path)
+
+        # ── Compute metrics for each K ────────────────────────────────
+        self.logger.info("=" * 60)
+        self.logger.info("EVALUATION RESULTS  (scenario=%s)", self.scenario)
+        self.logger.info("=" * 60)
+
+        last_result = {}
+        for k in self.k_values:
+            # Average first K passes
+            preds_avg = np.stack(all_passes[:k], axis=0).mean(axis=0).astype(np.float32)
+            result = self._compute_and_report(preds_avg, targets, k)
+            self._append_csv(k, result)
+
+            # Save averaged prediction .npz
+            if out_dir:
+                avg_path = os.path.join(out_dir, f"avg_k{k:02d}.npz")
+                np.savez(
+                    avg_path,
+                    preds=preds_avg,
+                    targets=targets,
+                    voxel_r=result["voxel_r"],
+                    profile_r=result["profile_r"],
+                )
+                self.logger.info("    → Saved avg_k%d → %s", k, avg_path)
+
+            last_result = result
+
+        self.logger.info("=" * 60)
+
+        return {
+            "mean_voxel_r": last_result.get("mean_voxel_r", 0.0),
+            "median_voxel_r": last_result.get("median_voxel_r", 0.0),
+            "mean_profile_r": last_result.get("mean_profile_r", 0.0),
+            "mse": last_result.get("mse", 0.0),
         }
