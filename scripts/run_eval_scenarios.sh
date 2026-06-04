@@ -7,9 +7,8 @@
 # Strategy:
 #   1. deterministic         — 1 pass  (μ + ODE, fully deterministic)
 #   2. perceiver_stochastic  — 10 passes → metrics for K=1,5,10
-#   3. flow_stochastic       — 10 passes → metrics for K=1,5,10
 #
-# Total: 1 + 10 + 10 = 21 forward passes (not 1+16+16=33).
+# Total: 1 + 10 = 11 forward passes.
 # Individual per-pass predictions are saved; K-averaged metrics computed
 # post-hoc from the same set of passes.
 #
@@ -27,7 +26,7 @@ set -euo pipefail
 # ── Defaults ─────────────────────────────────────────────────────────
 CONFIG=""
 CKPT=""
-BATCH_SIZE=32
+BATCH_SIZE=128
 DEVICE=""
 OUT_DIR="results/eval_scenarios"
 NUM_WORKERS=4
@@ -115,27 +114,6 @@ $PYTHON src/eval_factflow_fmri.py \
 
 echo "  ✓ Scenario 2 complete"
 
-# ── Scenario 3: Flow stochastic (10 passes → K=1,5,10) ──────────────
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Scenario 3: flow_stochastic (10 passes → K=1,5,10)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-$PYTHON src/eval_factflow_fmri.py \
-    --config "$CONFIG" \
-    --ckpt "$CKPT" \
-    --batch_size "$BATCH_SIZE" \
-    --num_workers "$NUM_WORKERS" \
-    $DEVICE_ARG \
-    --scenario flow_stochastic \
-    --max_trials 10 \
-    --k_values "1,5,10" \
-    --sde_num_steps 250 \
-    --output "${OUT_DIR}/flow_stochastic" \
-    --csv_out "$CSV_OUT"
-
-echo "  ✓ Scenario 3 complete"
-
 # ── Summary ───────────────────────────────────────────────────────────
 echo ""
 echo "=============================================================="
@@ -144,16 +122,11 @@ echo "=============================================================="
 echo ""
 echo "Output structure:"
 echo "  ${OUT_DIR}/"
-echo "  ├── eval_results.csv              ← all metrics (7 rows)"
+echo "  ├── eval_results.csv              ← all metrics (4 rows)"
 echo "  ├── deterministic/"
 echo "  │   └── avg_k01.npz"
-echo "  ├── perceiver_stochastic/"
-echo "  │   ├── passes/pass_00..09.npy    ← individual passes"
-echo "  │   ├── avg_k01.npz"
-echo "  │   ├── avg_k05.npz"
-echo "  │   └── avg_k10.npz"
-echo "  └── flow_stochastic/"
-echo "      ├── passes/pass_00..09.npy"
+echo "  └── perceiver_stochastic/"
+echo "      ├── passes/pass_00..09.npy    ← individual passes"
 echo "      ├── avg_k01.npz"
 echo "      ├── avg_k05.npz"
 echo "      └── avg_k10.npz"
