@@ -1,23 +1,13 @@
 # =============================================================================
-# FactFlow fMRI — Subject 1  [srcdist v2: STABILISED against decoder collapse]
-# v1 (factflow_fmri_cross_dino_srcdist.yaml) collapsed: learned σ shrank to the
-# clamp floor (≈0) → x₀≈μ→x₁ → velocity≈0 (diff/recon→0, kld saturated) → the
-# PerceiverVE memorised the training fMRI and val_voxel_r dropped (0.157→0.108).
-#
-# Fix (Hướng A — keep an informed source but stop the collapse):
-#   1) σ FLOOR via clip_logvar_min=-1.4 (σ≥~0.5). The sampled x₀=μ+ε·σ now
-#      always carries real noise, so uₜ=x₁-x₀ never degenerates to 0 — the flow
-#      always has a denoising job and cannot be short-circuited by μ→x₁.
-#   2) kld_loss_weight 0.005→0.05 (×10) to hold q(x₀|c) nearer the N(0,I) prior.
-#   3) recon loss OFF — on the linear path it is minimised by the SAME x₀→x₁
-#      collapse (x̂₁=xₜ when v≈0), so it amplified the failure instead of adding
-#      an independent, metric-aligned signal.
-#   4) lr 2e-4→1e-4 — 83M params on 9000 images overfits/collapses fast.
-#
-# Expectation: diff/recon settle at a NON-zero denoising residual, kld stays
-# bounded (σ pinned near the floor, not blowing up), val_voxel_r keeps climbing.
-# Watch the inline-eval "[src σ=… corr(μ,x₁)=…]": σ≈0.5 (floored, healthy),
-# corr(μ,x₁) moderate (informed, not →1 = not a pure copy).
+# FactFlow fMRI — Subject 1  [srcdist v2 + ROI-aware]
+# Extends factflow_fmri_cross_dino_srcdist_v2.yaml with:
+#   1) auto_pad — per-subject native sizing (no dead padding).
+#   2) ROI conditioning — voxels reordered by streams-7 ROI; a per-patch ROI
+#      embedding + an optional within-ROI masked self-attention branch run
+#      ALONGSIDE the CLIP/DINOv2 cross-attention. Both ROI components are
+#      zero-initialised, so the model starts identical to the non-ROI DiT and
+#      learns the ROI structure on top (clean A/B vs the base config).
+# Requires roi_meta_sub{S}.npz (build with: python src/data/build_roi_meta.py).
 # =============================================================================
 
 use_source_encoder: true
@@ -32,7 +22,7 @@ data:
   dino_feature: dinov2_vitl14
   n_voxels: 15724
   pad_to: 16384          # fallback; overridden when auto_pad=true (sub1 → 15744)
-  auto_pad: true         # size seq_len/num_queries to this subject's voxels (drop dead padding)
+  auto_pad: true         # size seq_len/num_queries to this subject's voxels
   avg_reps: true
 
 # --- Stage 2: Velocity model (DiT1D — native 1D) ---
@@ -56,6 +46,9 @@ stage_2:
     use_cross_attn: true
     y_token_channels: 1664       # CLIP token dim
     y_token_channels_2: 1024     # DINOv2 token dim (second context stream)
+    use_roi: true                # per-patch ROI embedding (streams-7) + reorder
+    n_roi: 8                     # streams 1..7 + "other"(0); pad id = n_roi
+    roi_masked_attn: true        # within-ROI masked self-attention branch
 
 # --- Source encoder (PerceiverVE): CLIP tokens → learned source DISTRIBUTION ---
 source_encoder:
@@ -86,7 +79,7 @@ transport:
     prediction: velocity
     loss_weight: null
     time_dist_type: "logit-normal_-1.0_1.0"
-    time_dist_shift: 16384
+    time_dist_shift: 16384         # base; set to pad_to by auto_pad (shift→1.0)
 
 # --- ODE sampler ---
 sampler:
@@ -102,13 +95,13 @@ sampler:
 losses:
   use_kld_loss: true
   kld_loss_type: kld             # FULL KLD (incl. -μ²)
-  kld_loss_weight: 0.05          # ×10 vs v1 — hold q(x₀|c) near the prior
+  kld_loss_weight: 0.05
   kld_target_std: 1.0
   kld_reduction: mean
-  clip_logvar_min: -1.4          # σ floor ≈ 0.5 — KEEPS x₀ noisy, blocks collapse
+  clip_logvar_min: -1.4          # σ floor ≈ 0.5 — keeps x₀ noisy, blocks collapse
   clip_logvar_max: 10.0
   use_align_loss: false
-  use_recon_loss: false          # OFF — rewarded the x₀→x₁ collapse on linear path
+  use_recon_loss: false
   recon_loss_type: pearson
   recon_loss_weight: 0.0
   detach_ut: false
@@ -117,7 +110,7 @@ losses:
 # --- Training ---
 training:
   global_seed: 42
-  epochs: 200
+  epochs: 100
   batch_size: 32
   grad_accum_steps: 8
   num_workers: 4
@@ -126,7 +119,7 @@ training:
   sample_every: 2000
   val_every: 5
   optimizer:
-    lr: 1.0e-04                  # halved vs v1 — slow the overfit/collapse
+    lr: 1.0e-04
     betas: [0.9, 0.95]
     weight_decay: 0.01
   base_lr: 1.0e-04

@@ -135,7 +135,10 @@ for s in "${SUBJECTS[@]}"; do
     echo "  Experiment: ${EXP_NAME}"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    # Generate per-subject config by patching the base config
+    # Generate per-subject config by patching the base config.
+    # Only subject/n_voxels/epochs/batch_size are overridden — pad_to, seq_len
+    # and num_queries are sized to n_voxels at runtime by data.auto_pad (set in
+    # the base config), so no per-subject pad_to is hardcoded here.
     $PYTHON -c "
 from omegaconf import OmegaConf
 cfg = OmegaConf.load('${CONFIG}')
@@ -145,7 +148,8 @@ cfg.training.epochs = ${EPOCHS}
 cfg.training.batch_size = ${BATCH_SIZE}
 OmegaConf.save(cfg, '${SUB_CONFIG}')
 print(f'  Generated config: ${SUB_CONFIG}')
-print(f'    subject={cfg.data.subject}, n_voxels={cfg.data.n_voxels}, epochs={cfg.training.epochs}')
+print(f'    subject={cfg.data.subject}, n_voxels={cfg.data.n_voxels}, '
+      f'auto_pad={cfg.data.get(\"auto_pad\", False)}, epochs={cfg.training.epochs}')
 "
 
     DEVICE_ARG=""

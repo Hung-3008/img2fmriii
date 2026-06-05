@@ -7,7 +7,8 @@ data:
   clip_feature: sdxl_clip
   dino_feature: dinov2_vitl14
   n_voxels: 13039
-  pad_to: 16384
+  pad_to: 16384          # fallback; overridden when auto_pad=true (sub5 → 13056)
+  auto_pad: true         # size seq_len/num_queries to this subject's voxels (drop dead padding)
   avg_reps: true
 stage_2:
   target: model.dit_1d.DiT1D

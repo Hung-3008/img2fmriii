@@ -363,13 +363,19 @@ class PerceiverVE(nn.Module):
         self.query_tokens = nn.Parameter(torch.randn(1, num_queries, hidden_size))
         
         self.grid_size = int(math.sqrt(num_queries))
-        if self.grid_size * self.grid_size != num_queries:
-            raise ValueError(f"num_queries ({num_queries}) must be a perfect square.")
-        
+
         self.pos_emb_type = pos_emb_type
         if pos_emb_type == 'learned':
+            # Flat learned table indexed by query position — no 2D grid, so
+            # num_queries can be any integer (enables per-subject native sizing).
             self.query_pos_emb_2d = nn.Parameter(torch.randn(1, num_queries, hidden_size))
         elif pos_emb_type == 'sincos':
+            # 2D sin-cos grid requires a square number of queries.
+            if self.grid_size * self.grid_size != num_queries:
+                raise ValueError(
+                    f"num_queries ({num_queries}) must be a perfect square "
+                    f"for pos_emb_type='sincos'."
+                )
             pos_emb = get_2d_sincos_pos_embed(hidden_size, self.grid_size)
             self.register_buffer('query_pos_emb_2d', torch.from_numpy(pos_emb).float().unsqueeze(0))
         else:

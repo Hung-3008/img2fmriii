@@ -41,7 +41,11 @@ from data.factflow_fmri_dataset import FactFlowfMRIDataset
 from model.factflow_factory import build_models, build_transport, build_sampler
 from model.transport import Sampler
 from utils.checkpoint import load_checkpoint
-from utils.fmri_utils import get_latent_size
+from utils.fmri_utils import (
+    auto_size_config,
+    build_roi_patch_layout,
+    get_latent_size,
+)
 from utils.logging_utils import create_logger
 from utils.metrics import compute_full_metrics
 
@@ -54,6 +58,11 @@ class FactFlowEvaluator:
     def __init__(self, args: Namespace) -> None:
         # ── Config ────────────────────────────────────────────────────
         self.cfg = OmegaConf.load(args.config)
+        # Per-subject native sizing — must match training (no-op unless
+        # data.auto_pad is set), so the model matches the checkpoint shapes.
+        _autosize_msg = auto_size_config(self.cfg)
+        if _autosize_msg:
+            logger.info(_autosize_msg)
         self.data_cfg = OmegaConf.to_container(self.cfg.data, resolve=True)
         self.loss_cfg = OmegaConf.to_container(
             self.cfg.get("losses", {}), resolve=True,
@@ -96,6 +105,10 @@ class FactFlowEvaluator:
         # _validate() and published NSD benchmarks.
         dc = self.data_cfg
         self.n_voxels = dc["n_voxels"]
+        # ROI-aware model? Then the dataset reorders voxels by ROI; predictions
+        # are un-sorted back to anatomical order before metrics/saving so output
+        # is identical in layout to non-ROI runs.
+        self.use_roi = bool(self.cfg.stage_2.get("params", {}).get("use_roi", False))
         self.test_ds = FactFlowfMRIDataset(
             data_dir=dc["data_dir"],
             subject=dc["subject"],
@@ -108,7 +121,10 @@ class FactFlowEvaluator:
             fmri_spatial=dc.get("fmri_spatial", None),
             dino_feature=dc.get("dino_feature", None),
             avg_reps=True,
+            use_roi=self.use_roi,
         )
+        # Index that maps ROI-sorted voxels back to anatomical order (or None).
+        self.unsort_idx = self.test_ds.unsort_idx if self.use_roi else None
         self.test_loader = DataLoader(
             self.test_ds,
             batch_size=args.batch_size,
@@ -133,6 +149,15 @@ class FactFlowEvaluator:
 
         # ── Model ─────────────────────────────────────────────────────
         self.wrapper = build_models(self.cfg, self.device)
+        if self.use_roi:
+            patch_size = int(self.cfg.stage_2.params.patch_size)
+            patch_roi, roi_mask = build_roi_patch_layout(
+                self.test_ds.roi_labels, self.test_ds.sort_idx,
+                int(self.test_ds.n_roi), int(dc["pad_to"]), patch_size,
+            )
+            self.wrapper.dit.set_roi(
+                torch.from_numpy(patch_roi), torch.from_numpy(roi_mask),
+            )
         self.transport = build_transport(self.cfg, self.latent_size)
 
         # Build ODE sampler (always needed for scenarios 1 & 2)
@@ -237,6 +262,8 @@ class FactFlowEvaluator:
             del traj, x0, clip_tokens, clip_pool, dino_tokens, context, context2
 
             pred_flat = pred.reshape(B, -1)[:, : self.n_voxels].cpu().numpy()
+            if self.unsort_idx is not None:
+                pred_flat = pred_flat[:, self.unsort_idx]  # → anatomical order
             del pred
             all_preds.append(pred_flat)
 
@@ -337,8 +364,10 @@ class FactFlowEvaluator:
         for batch in self.test_loader:
             fmri_gt = batch["fmri"]
             B = fmri_gt.shape[0]
-            gt_flat = fmri_gt.reshape(B, -1)[:, : self.n_voxels]
-            all_targets.append(gt_flat.numpy())
+            gt_flat = fmri_gt.reshape(B, -1)[:, : self.n_voxels].numpy()
+            if self.unsort_idx is not None:
+                gt_flat = gt_flat[:, self.unsort_idx]  # → anatomical order
+            all_targets.append(gt_flat)
         targets = np.concatenate(all_targets, axis=0)  # (N, V)
 
         # ── Run max_trials forward passes ─────────────────────────────

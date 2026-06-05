@@ -101,6 +101,9 @@ class DiT1D(nn.Module):
         use_cross_attn: bool = False,
         y_token_channels: int = 1664,
         y_token_channels_2: int = None,
+        use_roi: bool = False,
+        n_roi: int = 8,
+        roi_masked_attn: bool = False,
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -113,6 +116,11 @@ class DiT1D(nn.Module):
         self.learn_sigma = learn_sigma
         self.depth = depth
         self.use_cross_attn = use_cross_attn
+        # ROI-aware conditioning: a per-patch ROI embedding (always when use_roi)
+        # plus an optional within-ROI masked self-attention branch.
+        self.use_roi = use_roi
+        self.n_roi = n_roi
+        self.roi_masked_attn = use_roi and roi_masked_attn
 
         num_patches = seq_len // patch_size
 
@@ -143,6 +151,29 @@ class DiT1D(nn.Module):
             torch.zeros(1, num_patches, hidden_size), requires_grad=False
         )
 
+        # ── ROI conditioning ─────────────────────────────────────────
+        # Per-patch ROI embedding (id 0..n_roi-1 real, id n_roi = padding) added
+        # like pos_embed; zero-initialised so it starts neutral and is learned.
+        # ``patch_roi`` / ``roi_mask`` are constant per subject — set via
+        # ``set_roi`` and stored as buffers so the sampler needs no extra args.
+        if use_roi:
+            self.roi_embed = nn.Embedding(n_roi + 1, hidden_size)
+            # patch_roi default = padding id (overwritten by set_roi); roi_mask
+            # default = all-True (global attention, harmless no-op fallback).
+            self.register_buffer(
+                "patch_roi",
+                torch.full((num_patches,), n_roi, dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "roi_mask",
+                torch.ones(num_patches, num_patches, dtype=torch.bool),
+                persistent=False,
+            )
+            self._roi_set = False
+        else:
+            self.roi_embed = None
+
         # 1D Rotary Position Embedding
         if use_rope:
             head_dim = hidden_size // num_heads
@@ -160,6 +191,7 @@ class DiT1D(nn.Module):
                 use_rmsnorm=use_rmsnorm,
                 wo_shift=wo_shift,
                 use_cross_attn=use_cross_attn,
+                use_roi_attn=self.roi_masked_attn,
             ) for _ in range(depth)
         ])
 
@@ -214,6 +246,31 @@ class DiT1D(nn.Module):
                 nn.init.constant_(block.cross_attn.proj.weight, 0)
                 nn.init.constant_(block.cross_attn.proj.bias, 0)
 
+        # Zero-out ROI components → start as an exact no-op (model identical to
+        # the non-ROI DiT at step 0), then learn the ROI embedding and within-ROI
+        # masked attention on top.
+        if self.roi_embed is not None:
+            nn.init.constant_(self.roi_embed.weight, 0)
+        for block in self.blocks:
+            if getattr(block, "use_roi_attn", False):
+                nn.init.constant_(block.roi_attn.proj.weight, 0)
+                nn.init.constant_(block.roi_attn.proj.bias, 0)
+
+    def set_roi(self, patch_roi: torch.Tensor, roi_mask: torch.Tensor) -> None:
+        """Install the per-subject ROI layout (constant across a run).
+
+        Args:
+            patch_roi: ``(num_patches,)`` long — ROI id of each patch
+                       (``n_roi`` marks padding patches).
+            roi_mask:  ``(num_patches, num_patches)`` bool — ``True`` where a
+                       query patch may attend to a key patch (same ROI).
+        """
+        assert self.use_roi, "set_roi called but model built with use_roi=False"
+        dev = self.pos_embed.device
+        self.patch_roi = patch_roi.to(device=dev, dtype=torch.long)
+        self.roi_mask = roi_mask.to(device=dev, dtype=torch.bool)
+        self._roi_set = True
+
     def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (B, N, patch_size * out_channels) → (B, out_channels, seq_len)
@@ -243,6 +300,9 @@ class DiT1D(nn.Module):
             (B, C, L) — predicted velocity
         """
         x = self.x_embedder(x) + self.pos_embed   # (B, N, D)
+        # Per-patch ROI embedding (constant per subject; zero-init at start).
+        if self.use_roi:
+            x = x + self.roi_embed(self.patch_roi).unsqueeze(0)  # (1, N, D)
         t = self.t_embedder(t)                      # (B, D)
         y = self.y_embedder(y)                      # (B, D)
         c = t + y                                    # (B, D)
@@ -254,8 +314,9 @@ class DiT1D(nn.Module):
                 ctx2 = self.context_embedder_2(context2)        # (B, M2, D)
                 ctx = torch.cat([ctx, ctx2], dim=1)             # (B, M+M2, D)
 
+        roi_mask = self.roi_mask if self.roi_masked_attn else None
         for block in self.blocks:
-            x = block(x, c, feat_rope=self.feat_rope, context=ctx)
+            x = block(x, c, feat_rope=self.feat_rope, context=ctx, roi_mask=roi_mask)
 
         x = self.final_layer(x, c)   # (B, N, P*C)
         x = self.unpatchify(x)       # (B, C, L)
