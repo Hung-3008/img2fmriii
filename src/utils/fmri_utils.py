@@ -10,41 +10,8 @@ from __future__ import annotations
 import math
 from typing import Dict, Optional, Tuple, Union
 
-import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
-
-
-def build_roi_patch_layout(
-    roi_labels: "np.ndarray",
-    sort_idx: "np.ndarray",
-    n_roi: int,
-    pad_to: int,
-    patch_size: int,
-) -> Tuple["np.ndarray", "np.ndarray"]:
-    """Per-patch ROI ids and the within-ROI attention mask for ROI-masked attn.
-
-    Voxels are reordered by ``sort_idx`` (clustering ROIs), so each ``patch_size``
-    block is (almost) ROI-pure. Returns:
-
-    - ``patch_roi`` ``(num_patches,)`` — majority ROI id per patch; patches that
-      fall entirely in the padding region get id ``n_roi``.
-    - ``roi_mask`` ``(num_patches, num_patches)`` bool — ``True`` iff two patches
-      share a ROI id. The diagonal is always ``True`` so no query row is fully
-      masked (a softmax over an all-masked row would be NaN).
-    """
-    n_voxels = int(sort_idx.shape[0])
-    num_patches = pad_to // patch_size
-    sorted_labels = roi_labels[sort_idx]                 # non-decreasing
-    padded = np.full(pad_to, n_roi, dtype=np.int64)
-    padded[:n_voxels] = sorted_labels
-    labels_2d = padded.reshape(num_patches, patch_size)
-    patch_roi = np.array(
-        [np.bincount(row, minlength=n_roi + 1).argmax() for row in labels_2d],
-        dtype=np.int64,
-    )
-    roi_mask = patch_roi[:, None] == patch_roi[None, :]  # (P, P) bool
-    return patch_roi, roi_mask
 
 
 def auto_size_config(cfg: DictConfig) -> Optional[str]:

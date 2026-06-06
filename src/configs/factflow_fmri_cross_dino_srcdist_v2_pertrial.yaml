@@ -1,13 +1,20 @@
 # =============================================================================
-# FactFlow fMRI — Subject 1  [srcdist v2 + ROI-aware]
-# Extends factflow_fmri_cross_dino_srcdist_v2.yaml with:
-#   1) auto_pad — per-subject native sizing (no dead padding).
-#   2) ROI conditioning — voxels reordered by streams-7 ROI; a per-patch ROI
-#      embedding + an optional within-ROI masked self-attention branch run
-#      ALONGSIDE the CLIP/DINOv2 cross-attention. Both ROI components are
-#      zero-initialised, so the model starts identical to the non-ROI DiT and
-#      learns the ROI structure on top (clean A/B vs the base config).
-# Requires roi_meta_sub{S}.npz (build with: python src/data/build_roi_meta.py).
+# FactFlow fMRI — Subject 1  [srcdist v2 + per-subject sizing + ROI order + PER-TRIAL]
+# Plain cross-attention DiT (ROI attention mechanisms removed — they gave ~0 gain:
+# roi_embed/routing redundant with pos_embed/attention, masked-attn redundant with
+# global self-attn). Kept the two data-level changes that are free/principled:
+#   - auto_pad : per-subject native sizing (no dead padding)
+#   - roi_order: voxels reordered by streams-7 ROI (contiguous, coherent patches);
+#                predictions un-sorted back to anatomical order at eval.
+#
+# MAIN CHANGE — per-trial training (avg_reps=false): 9000 images × 3 reps = 27000
+# samples instead of 9000 rep-averaged. The earlier avg-rep run peaked at val
+# 0.3626 (ep44) then OVERFIT through ep200 (inline val 0.37→0.34). Per-trial gives
+# 3× data + noisier targets = regularisation against that overfit. Validation is
+# unchanged (always rep-averaged GT, 1000 images) for a comparable metric.
+#
+# Requires roi_meta_sub{S}.npz (python src/data/build_roi_meta.py).
+# ~105 opt steps/epoch (27000/32/8); best.pt tracks the val peak — fine to stop early.
 # =============================================================================
 
 use_source_encoder: true
@@ -22,10 +29,11 @@ data:
   dino_feature: dinov2_vitl14
   n_voxels: 15724
   pad_to: 16384          # fallback; overridden when auto_pad=true (sub1 → 15744)
-  auto_pad: true         # size seq_len/num_queries to this subject's voxels
-  avg_reps: true
+  auto_pad: true         # per-subject native sizing (drop dead padding)
+  roi_order: true        # reorder voxels by streams-7 ROI (data-level only)
+  avg_reps: false        # PER-TRIAL: 9000×3 = 27000 training samples
 
-# --- Stage 2: Velocity model (DiT1D — native 1D) ---
+# --- Stage 2: Velocity model (DiT1D — native 1D, plain cross-attn) ---
 stage_2:
   target: model.dit_1d.DiT1D
   params:
@@ -46,9 +54,6 @@ stage_2:
     use_cross_attn: true
     y_token_channels: 1664       # CLIP token dim
     y_token_channels_2: 1024     # DINOv2 token dim (second context stream)
-    use_roi: true                # per-patch ROI embedding (streams-7) + reorder
-    n_roi: 8                     # streams 1..7 + "other"(0); pad id = n_roi
-    roi_masked_attn: true        # within-ROI masked self-attention branch
 
 # --- Source encoder (PerceiverVE): CLIP tokens → learned source DISTRIBUTION ---
 source_encoder:
@@ -70,7 +75,7 @@ source_encoder:
     use_variational: true
     use_per_token_logvar: false
     init_logvar: 0.0
-    fixed_std: null               # σ learned, but floored by clip_logvar_min below
+    fixed_std: null
 
 # --- Transport (Flow Matching) ---
 transport:
@@ -94,14 +99,14 @@ sampler:
 # --- Losses ---
 losses:
   use_kld_loss: true
-  kld_loss_type: kld             # FULL KLD (incl. -μ²)
+  kld_loss_type: kld
   kld_loss_weight: 0.05
   kld_target_std: 1.0
   kld_reduction: mean
-  clip_logvar_min: -1.4          # σ floor ≈ 0.5 — keeps x₀ noisy, blocks collapse
+  clip_logvar_min: -1.4
   clip_logvar_max: 10.0
   use_align_loss: false
-  use_recon_loss: false
+  use_recon_loss: false          # OFF — tested, no effect
   recon_loss_type: pearson
   recon_loss_weight: 0.0
   detach_ut: false

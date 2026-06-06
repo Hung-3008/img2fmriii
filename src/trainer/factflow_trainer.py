@@ -39,12 +39,7 @@ from utils.checkpoint import (
     save_checkpoint,
     save_rolling_last,
 )
-from utils.fmri_utils import (
-    auto_size_config,
-    build_roi_patch_layout,
-    create_pad_mask,
-    get_latent_size,
-)
+from utils.fmri_utils import auto_size_config, create_pad_mask, get_latent_size
 from utils.logging_utils import create_logger
 from utils.metrics import masked_mse, voxel_pearson, compute_voxel_reliability
 from utils.training_utils import build_optimizer_and_scheduler
@@ -107,10 +102,10 @@ class FactFlowTrainer:
         self.loss_cfg = OmegaConf.to_container(self.cfg.losses, resolve=True)
         self.args = args
 
-        # ROI-aware conditioning (per-patch ROI embedding + within-ROI masked
-        # attention). Driven by the DiT params; the dataset must reorder voxels
-        # by ROI when this is on.
-        self.use_roi = bool(self.cfg.stage_2.get("params", {}).get("use_roi", False))
+        # ROI voxel ordering: reorder voxels so same-ROI voxels are contiguous
+        # (data-level only; the model is a plain cross-attention DiT). Predictions
+        # are un-sorted back to anatomical order at eval/export time.
+        self.roi_order = bool(self.data_cfg.get("roi_order", False))
 
         # ── Device & seed ─────────────────────────────────────────────
         self.device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -152,10 +147,6 @@ class FactFlowTrainer:
         self.wrapper = build_models(self.cfg, self.device)
         self.transport = build_transport(self.cfg, self.latent_size)
         self.sample_fn = build_sampler(self.transport, self.cfg.sampler)
-
-        # ── ROI layout → DiT buffers (constant per subject) ───────────
-        if self.use_roi:
-            self._setup_roi()
 
         # ── Optimizer & scheduler ─────────────────────────────────────
         batch_size = int(self.train_cfg.get("batch_size", 64))
@@ -234,7 +225,7 @@ class FactFlowTrainer:
         )  # (V,) — original voxel order
         # The loss is computed in the (possibly ROI-reordered) voxel space, so
         # the per-voxel weight must follow the same permutation.
-        if self.use_roi and self.train_ds.sort_idx is not None:
+        if self.roi_order and self.train_ds.sort_idx is not None:
             nc = nc[self.train_ds.sort_idx]
         w = np.zeros(self.data_cfg["pad_to"], dtype=np.float64)
         w[: self.data_cfg["n_voxels"]] = nc
@@ -250,42 +241,6 @@ class FactFlowTrainer:
             int((nc > 0.1).sum()), nc.shape[0],
         )
         return torch.tensor(w, dtype=torch.float32, device=self.device)
-
-    def _setup_roi(self) -> None:
-        """Compute per-patch ROI ids + within-ROI attention mask, push to the DiT.
-
-        Voxels are already ROI-reordered in the dataset, so each 32-voxel patch
-        is (almost) ROI-pure. ``patch_roi`` is the majority ROI per patch (pad
-        patches get id ``n_roi``); ``roi_mask[i,j]`` is True iff patches i and j
-        share a ROI id. The diagonal is always True so no query row is fully
-        masked (avoids a NaN softmax over an all-masked row).
-        """
-        ds = self.train_ds
-        n_roi = int(ds.n_roi)
-        n_voxels = int(self.data_cfg["n_voxels"])
-        pad_to = int(self.data_cfg["pad_to"])
-        patch_size = int(self.cfg.stage_2.params.patch_size)
-        num_patches = pad_to // patch_size
-
-        model_n_roi = int(self.cfg.stage_2.get("params", {}).get("n_roi", n_roi))
-        assert model_n_roi == n_roi, (
-            f"DiT n_roi={model_n_roi} != roi_meta n_roi={n_roi}"
-        )
-
-        patch_roi, roi_mask = build_roi_patch_layout(
-            ds.roi_labels, ds.sort_idx, n_roi, pad_to, patch_size,
-        )
-        self.wrapper.dit.set_roi(
-            torch.from_numpy(patch_roi), torch.from_numpy(roi_mask),
-        )
-
-        uniq, cnt = np.unique(patch_roi, return_counts=True)
-        self.logger.info(
-            "ROI setup: %d patches, masked_attn=%s; patch_roi dist=%s",
-            num_patches,
-            bool(self.cfg.stage_2.get("params", {}).get("roi_masked_attn", False)),
-            {int(u): int(c) for u, c in zip(uniq, cnt)},
-        )
 
     # ──────────────────────────────────────────────────────────────────
     # Dataset construction
@@ -304,7 +259,7 @@ class FactFlowTrainer:
             fmri_spatial=dc.get("fmri_spatial", None),
             avg_reps=dc.get("avg_reps", False),
             dino_feature=dc.get("dino_feature", None),
-            use_roi=self.use_roi,
+            roi_order=self.roi_order,
         )
         self.train_ds = FactFlowfMRIDataset(mode="train", **ds_kwargs)
         self.test_ds  = FactFlowfMRIDataset(mode="test",  **ds_kwargs)

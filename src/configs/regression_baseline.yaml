@@ -1,0 +1,60 @@
+# =============================================================================
+# Regression baseline — Subject 1
+# Direct CLIP+DINOv2 → fMRI regression (no flow / source / ODE), same backbone
+# capacity as the FactFlow DiT (cross-attention over CLIP+DINO, depth 12,
+# hidden 512). Trained with masked SNR-weighted MSE = the conditional-mean
+# objective. Decides whether the ~0.37 flow plateau is a feature ceiling
+# (regression ≈ 0.37) or a decoder limit (regression >> 0.37).
+# =============================================================================
+
+# --- Data ---
+data:
+  data_dir: NSD/data/nsd
+  subject: 1
+  fmri_mode: zscore
+  clip_feature: sdxl_clip
+  dino_feature: dinov2_vitl14
+  n_voxels: 15724
+  avg_reps: true          # rep-averaged targets = clean conditional mean
+
+# --- Model: cross-attention regressor (DiT backbone, no diffusion) ---
+model:
+  target: model.regression_net.CrossAttnRegressor
+  params:
+    seq_len: 16384         # overridden to pad_to = ceil(n_voxels/patch)*patch
+    patch_size: 32
+    hidden_size: 512
+    depth: 12
+    num_heads: 8
+    mlp_ratio: 4.0
+    y_in_channels: 1280    # CLIP pool dim (AdaLN conditioning)
+    y_token_channels: 1664 # CLIP token dim (cross-attn)
+    y_token_channels_2: 1024  # DINOv2 token dim (cross-attn)
+    use_qknorm: true
+    use_swiglu: true
+    use_rmsnorm: true
+    use_rope: true
+
+# --- Losses ---
+losses:
+  use_snr_weight: true
+
+# --- Training ---
+training:
+  global_seed: 42
+  epochs: 100
+  batch_size: 32
+  grad_accum_steps: 8
+  num_workers: 4
+  log_every: 50
+  val_every: 5
+  optimizer:
+    lr: 1.0e-04
+    betas: [0.9, 0.95]
+    weight_decay: 0.01
+  base_lr: 1.0e-04
+  final_lr: 1.0e-05
+  schedule_type: cosine
+  warmup_steps: 500
+  clip_grad: 1.0
+  precision: bf16

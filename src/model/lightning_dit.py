@@ -43,46 +43,6 @@ class CrossAttention(nn.Module):
         return self.proj(out)
 
 
-class ROIAttention(nn.Module):
-    """Self-attention restricted to within-ROI tokens via a boolean mask.
-
-    Identical to the global self-attention except a fixed ``(N, N)`` boolean
-    mask (``True`` = attend) confines each voxel-patch to patches of the same
-    ROI. The output projection is zero-initialised in the parent model so the
-    branch starts as a no-op and the model *learns* whether/how to use within-
-    ROI mixing on top of the global self-attention and the image cross-attention.
-    """
-
-    def __init__(self, dim, num_heads, qk_norm=False):
-        super().__init__()
-        assert dim % num_heads == 0, "dim must be divisible by num_heads"
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
-        self.proj = nn.Linear(dim, dim, bias=True)
-        if qk_norm:
-            self.q_norm = RMSNorm(self.head_dim)
-            self.k_norm = RMSNorm(self.head_dim)
-        else:
-            self.q_norm = nn.Identity()
-            self.k_norm = nn.Identity()
-
-    def forward(self, x, mask, rope=None):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
-        if rope is not None:
-            q = rope(q)
-            k = rope(k)
-        q = q.to(v.dtype)
-        k = k.to(v.dtype)
-        # mask: (N, N) bool broadcasts over (B, H, N, N). True = keep.
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        out = out.transpose(1, 2).reshape(B, N, C)
-        return self.proj(out)
-
-
 class VectorEmbedder(nn.Module):
     """Embeds a flat vector of dimension input_dim"""
 
@@ -117,7 +77,6 @@ class LightningDiTBlock(nn.Module):
         use_rmsnorm=True,
         wo_shift=False,
         use_cross_attn=False,
-        use_roi_attn=False,
         **block_kwargs
     ):
         super().__init__()
@@ -141,16 +100,6 @@ class LightningDiTBlock(nn.Module):
             else:
                 self.norm_cross = RMSNorm(hidden_size)
             self.cross_attn = CrossAttention(hidden_size, num_heads, qk_norm=use_qknorm)
-
-        # Optional ROI-masked self-attention branch (within-ROI mixing). Also
-        # zero-initialised at the output projection → starts as a no-op.
-        self.use_roi_attn = use_roi_attn
-        if use_roi_attn:
-            if not use_rmsnorm:
-                self.norm_roi = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-            else:
-                self.norm_roi = RMSNorm(hidden_size)
-            self.roi_attn = ROIAttention(hidden_size, num_heads, qk_norm=use_qknorm)
 
         # Initialize attention layer
         self.attn = NormAttention(
@@ -189,7 +138,7 @@ class LightningDiTBlock(nn.Module):
             )
         self.wo_shift = wo_shift
 
-    def forward(self, x, c, feat_rope=None, context=None, roi_mask=None):
+    def forward(self, x, c, feat_rope=None, context=None):
         if self.wo_shift:
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(4, dim=1)
             shift_msa = None
@@ -197,8 +146,6 @@ class LightningDiTBlock(nn.Module):
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
-        if self.use_roi_attn and roi_mask is not None:
-            x = x + self.roi_attn(self.norm_roi(x), roi_mask, rope=feat_rope)
         if self.use_cross_attn and context is not None:
             x = x + self.cross_attn(self.norm_cross(x), context)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))

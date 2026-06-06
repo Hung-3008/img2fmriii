@@ -44,7 +44,7 @@ class FactFlowfMRIDataset(Dataset):
         fmri_spatial: int = None,
         avg_reps: bool = False,
         dino_feature: str = None,
-        use_roi: bool = False,
+        roi_order: bool = False,
     ):
         super().__init__()
         self.mode = mode
@@ -55,7 +55,7 @@ class FactFlowfMRIDataset(Dataset):
         self.fmri_spatial = fmri_spatial
         self.avg_reps = avg_reps
         self.dino_feature = dino_feature
-        self.use_roi = use_roi
+        self.roi_order = roi_order
 
         # Determine reshape mode
         if fmri_spatial is not None and fmri_spatial > 0:
@@ -111,27 +111,23 @@ class FactFlowfMRIDataset(Dataset):
         # --- Optional ROI reordering: cluster same-ROI voxels contiguously ---
         # ``sorted_fmri[i] = raw_fmri[sort_idx[i]]`` — applied to every sample so
         # the velocity field operates on an ROI-grouped sequence (patches become
-        # ROI-pure). The metric is permutation-invariant (pred & GT both sorted),
-        # so no un-sort is needed for training/eval; ``unsort_idx`` is exposed for
-        # restoring anatomical order when exporting predictions.
+        # ROI-coherent). The metric is permutation-invariant (pred & GT both
+        # sorted), so no un-sort is needed for training/eval; ``unsort_idx`` is
+        # exposed for restoring anatomical order when exporting predictions.
         self.sort_idx = None
         self.unsort_idx = None
-        self.roi_labels = None
-        self.n_roi = None
-        if use_roi:
+        if roi_order:
             roi_path = os.path.join(subj_dir, f"roi_meta_sub{subject}.npz")
             meta = np.load(roi_path)
             self.sort_idx = meta["sort_idx"].astype(np.int64)
             self.unsort_idx = meta["unsort_idx"].astype(np.int64)
-            self.roi_labels = meta["roi_labels"].astype(np.int64)
-            self.n_roi = int(meta["n_roi"])
             assert self.sort_idx.shape[0] == n_voxels, (
                 f"roi_meta sort_idx has {self.sort_idx.shape[0]} voxels, "
                 f"expected n_voxels={n_voxels}"
             )
             logger.info(
-                "ROI reorder ON: subj=%d, n_roi=%d, voxels=%d (atlas=streams)",
-                subject, self.n_roi, n_voxels,
+                "ROI voxel ordering ON: subj=%d, voxels=%d (atlas=streams)",
+                subject, n_voxels,
             )
 
         shape_str = (
