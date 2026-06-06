@@ -67,8 +67,7 @@ class FactFlowWrapper(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         y: torch.Tensor,
-        context: torch.Tensor = None,
-        context2: torch.Tensor = None,
+        contexts=None,
     ) -> torch.Tensor:
         """Run the velocity network (DiT).
 
@@ -76,14 +75,14 @@ class FactFlowWrapper(nn.Module):
             x: ``(B, C, H, W)`` noisy latent.
             t: ``(B,)`` timestep.
             y: ``(B, D_pool)`` conditioning (CLIP pooled).
-            context: ``(B, M, D_tok)`` CLIP tokens for cross-attention
-                     (ignored unless the DiT was built with ``use_cross_attn``).
-            context2: ``(B, M2, D_tok2)`` optional second token stream (DINOv2).
+            contexts: list of ``(B, Mᵢ, Dᵢ)`` cross-attention streams (CLIP,
+                     DINOv2, multi-layer DINOv2, Gabor, …); ignored unless the
+                     DiT was built with ``use_cross_attn``.
 
         Returns:
             ``(B, C, H, W)`` predicted velocity.
         """
-        return self.dit(x=x, t=t, y=y, context=context, context2=context2)
+        return self.dit(x=x, t=t, y=y, contexts=contexts)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

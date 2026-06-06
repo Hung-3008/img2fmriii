@@ -45,6 +45,7 @@ class FactFlowfMRIDataset(Dataset):
         avg_reps: bool = False,
         dino_feature: str = None,
         roi_order: bool = False,
+        context_features=None,
     ):
         super().__init__()
         self.mode = mode
@@ -91,15 +92,25 @@ class FactFlowfMRIDataset(Dataset):
         )
         self.clip_pool = np.load(clip_pool_path, mmap_mode="r")
 
-        # --- Optional DINOv2 tokens: (N_images, T2, D2) ---
-        # Second visual-feature stream for cross-attention (early-visual cortex).
-        self.dino_tokens = None
-        if dino_feature is not None:
-            dino_path = os.path.join(
-                subj_dir, f"nsd_{dino_feature}_{mode}_sub{subject}.npy"
-            )
-            self.dino_tokens = np.load(dino_path, mmap_mode="r")
-            assert self.dino_tokens.shape[0] == self.n_images
+        # --- Cross-attention context streams (one or more token sequences) ---
+        # Each stream is a separate image-feature source (CLIP, DINOv2, multi-layer
+        # DINOv2, Gabor energy, …). ``context_features`` is a list of feature names;
+        # if unset it falls back to the legacy [clip_feature (+ dino_feature)] pair.
+        # Features stored as (N, T, D) are token sequences; (N, L, T, D) multi-layer
+        # features are flattened to (L*T, D) per sample.
+        if context_features is None:
+            context_features = [clip_feature]
+            if dino_feature is not None:
+                context_features.append(dino_feature)
+        self.context_features = list(context_features)
+        self.context_mmaps = []
+        for feat in self.context_features:
+            p = os.path.join(subj_dir, f"nsd_{feat}_{mode}_sub{subject}.npy")
+            m = np.load(p, mmap_mode="r")
+            assert m.shape[0] == self.n_images, f"{feat}: {m.shape[0]} != {self.n_images}"
+            self.context_mmaps.append(m)
+        # Per-stream feature dim (last axis) — used to size the model embedders.
+        self.context_dims = [int(m.shape[-1]) for m in self.context_mmaps]
 
         assert self.clip_tokens.shape[0] == self.n_images
         assert self.clip_pool.shape[0] == self.n_images
@@ -137,10 +148,10 @@ class FactFlowfMRIDataset(Dataset):
         logger.info(
             "FactFlowfMRIDataset: subj=%d, mode=%s, images=%d, reps=%d, "
             "samples=%d, voxels=%d→%d, shape=%s, "
-            "clip_tokens=%s, clip_pool=%s",
+            "contexts=%s dims=%s",
             subject, mode, self.n_images, self.n_reps,
             self.n_samples, n_voxels, pad_to, shape_str,
-            self.clip_tokens.shape, self.clip_pool.shape,
+            self.context_features, self.context_dims,
         )
 
     def __len__(self):
@@ -169,15 +180,21 @@ class FactFlowfMRIDataset(Dataset):
         clip_tok = self.clip_tokens[image_idx].astype(np.float32)
         clip_p = self.clip_pool[image_idx].astype(np.float32)
 
+        # --- Cross-attention context streams ---
+        contexts = []
+        for m in self.context_mmaps:
+            arr = np.asarray(m[image_idx]).astype(np.float32)
+            if arr.ndim == 3:                    # (L, T, D) multi-layer → (L*T, D)
+                arr = arr.reshape(-1, arr.shape[-1])
+            contexts.append(torch.from_numpy(arr))
+
         sample = {
             "fmri": torch.from_numpy(fmri_out),
-            "clip_tokens": torch.from_numpy(clip_tok), # (T, D)
-            "clip_pool": torch.from_numpy(clip_p),     # (D_pool,)
+            "clip_tokens": torch.from_numpy(clip_tok), # (T, D) — for source encoder
+            "clip_pool": torch.from_numpy(clip_p),     # (D_pool,) — AdaLN conditioning
             "pad_mask": torch.from_numpy(self.pad_mask.copy()),  # (V_pad,)
+            "contexts": contexts,              # list of (Tᵢ, Dᵢ) cross-attn streams
         }
-        if self.dino_tokens is not None:
-            dino_tok = self.dino_tokens[image_idx].astype(np.float32)
-            sample["dino_tokens"] = torch.from_numpy(dino_tok)  # (T2, D2)
         return sample
 
     @property

@@ -118,9 +118,12 @@ class FactFlowEvaluator:
             dino_feature=dc.get("dino_feature", None),
             avg_reps=True,
             roi_order=self.roi_order,
+            context_features=dc.get("context_features", None),
         )
         # Index that maps ROI-sorted voxels back to anatomical order (or None).
         self.unsort_idx = self.test_ds.unsort_idx if self.roi_order else None
+        # Context streams define the per-stream embedder dims (matches training).
+        self.cfg.stage_2.params.context_dims = list(self.test_ds.context_dims)
         self.test_loader = DataLoader(
             self.test_ds,
             batch_size=args.batch_size,
@@ -133,10 +136,6 @@ class FactFlowEvaluator:
         self.latent_size = get_latent_size(self.data_cfg)
         self.use_cross_attn = bool(
             self.cfg.stage_2.get("params", {}).get("use_cross_attn", False)
-        )
-        self.use_dino = (
-            self.use_cross_attn
-            and self.data_cfg.get("dino_feature") is not None
         )
 
         # ── Source encoder config ─────────────────────────────────────
@@ -224,9 +223,7 @@ class FactFlowEvaluator:
         for batch in tqdm(self.test_loader, desc="Inference", dynamic_ncols=True):
             clip_tokens = batch["clip_tokens"].to(self.device)
             clip_pool = batch["clip_pool"].to(self.device)
-            dino_tokens = (
-                batch["dino_tokens"].to(self.device) if self.use_dino else None
-            )
+            contexts = [c.to(self.device) for c in batch["contexts"]]
             B = clip_tokens.shape[0]
 
             # Source x₀
@@ -237,16 +234,14 @@ class FactFlowEvaluator:
                 x0 = self._get_x0_deterministic(clip_tokens, B)
 
             # Flow sampling (ODE or SDE)
-            context = clip_tokens if self.use_cross_attn else None
-            context2 = dino_tokens if self.use_dino else None
+            ctx = contexts if self.use_cross_attn else None
             with autocast(**self.autocast_kwargs):
                 traj = sample_fn(
-                    x0, self.wrapper.dit.forward, y=clip_pool,
-                    context=context, context2=context2,
+                    x0, self.wrapper.dit.forward, y=clip_pool, contexts=ctx,
                 )
             pred = traj[-1].float()
             # Free all intermediate ODE/SDE steps immediately
-            del traj, x0, clip_tokens, clip_pool, dino_tokens, context, context2
+            del traj, x0, clip_tokens, clip_pool, contexts, ctx
 
             pred_flat = pred.reshape(B, -1)[:, : self.n_voxels].cpu().numpy()
             if self.unsort_idx is not None:

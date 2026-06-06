@@ -45,6 +45,7 @@ class CrossAttnRegressor(nn.Module):
         y_in_channels: int = 1280,
         y_token_channels: int = 1664,
         y_token_channels_2: int = None,
+        context_dims=None,
         use_qknorm: bool = True,
         use_swiglu: bool = True,
         use_rmsnorm: bool = True,
@@ -69,15 +70,17 @@ class CrossAttnRegressor(nn.Module):
         # Global conditioning (CLIP pooled) → AdaLN vector c.
         self.y_embedder = VectorEmbedder(y_in_channels, hidden_size)
 
-        # Context stems: CLIP (+ optional DINOv2) tokens → hidden, concatenated.
-        self.context_embedder = nn.Sequential(
-            nn.Linear(y_token_channels, hidden_size), RMSNorm(hidden_size),
-        )
-        self.context_embedder_2 = None
-        if y_token_channels_2 is not None:
-            self.context_embedder_2 = nn.Sequential(
-                nn.Linear(y_token_channels_2, hidden_size), RMSNorm(hidden_size),
-            )
+        # Context stems: one embedder per cross-attention stream (CLIP, DINOv2,
+        # multi-layer DINOv2, Gabor, …) → hidden, concatenated along tokens.
+        if context_dims is None:
+            context_dims = [y_token_channels]
+            if y_token_channels_2 is not None:
+                context_dims.append(y_token_channels_2)
+        self.context_dims = list(context_dims)
+        self.context_embedders = nn.ModuleList([
+            nn.Sequential(nn.Linear(int(d), hidden_size), RMSNorm(hidden_size))
+            for d in self.context_dims
+        ])
 
         if use_rope:
             self.feat_rope = RotaryEmbedding1D(dim=hidden_size // num_heads, seq_len=num_patches)
@@ -133,14 +136,14 @@ class CrossAttnRegressor(nn.Module):
         x = x.reshape(B, N, p, c).permute(0, 3, 1, 2).reshape(B, c, N * p)
         return x
 
-    def forward(self, clip_pool, context, context2=None):
+    def forward(self, clip_pool, contexts):
+        """clip_pool: (B, D_pool); contexts: list of (B, Mᵢ, Dᵢ) cross-attn streams."""
         B = clip_pool.shape[0]
         x = self.query.expand(B, -1, -1) + self.pos_embed
         c = self.y_embedder(clip_pool)
 
-        ctx = self.context_embedder(context)
-        if self.context_embedder_2 is not None and context2 is not None:
-            ctx = torch.cat([ctx, self.context_embedder_2(context2)], dim=1)
+        embedded = [emb(ctx) for emb, ctx in zip(self.context_embedders, contexts)]
+        ctx = torch.cat(embedded, dim=1) if len(embedded) > 1 else embedded[0]
 
         for block in self.blocks:
             x = block(x, c, feat_rope=self.feat_rope, context=ctx)

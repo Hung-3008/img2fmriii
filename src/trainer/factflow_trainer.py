@@ -209,7 +209,6 @@ class FactFlowTrainer:
         self.use_cross_attn = bool(
             self.cfg.stage_2.get("params", {}).get("use_cross_attn", False)
         )
-        self.use_dino = self.use_cross_attn and self.data_cfg.get("dino_feature") is not None
 
         # ── SNR-weighted voxel loss ───────────────────────────────────
         self.voxel_weight = self._build_voxel_weight()
@@ -260,9 +259,14 @@ class FactFlowTrainer:
             avg_reps=dc.get("avg_reps", False),
             dino_feature=dc.get("dino_feature", None),
             roi_order=self.roi_order,
+            context_features=dc.get("context_features", None),
         )
         self.train_ds = FactFlowfMRIDataset(mode="train", **ds_kwargs)
         self.test_ds  = FactFlowfMRIDataset(mode="test",  **ds_kwargs)
+
+        # Single source of truth: the dataset's loaded context streams define the
+        # per-stream embedder dims, injected into the DiT config before build.
+        self.cfg.stage_2.params.context_dims = list(self.train_ds.context_dims)
 
         # ── Rep-averaged validation dataset ───────────────────────────
         # Always validate against rep-averaged GT (mean of 3 reps) so that:
@@ -341,7 +345,7 @@ class FactFlowTrainer:
         x1: torch.Tensor,
         clip_tokens: torch.Tensor,
         clip_pool: torch.Tensor,
-        dino_tokens: torch.Tensor = None,
+        contexts=None,
     ) -> Dict[str, torch.Tensor]:
         """One forward pass: source encoding → interpolation → velocity prediction → losses.
 
@@ -369,11 +373,10 @@ class FactFlowTrainer:
         t = self.transport.sample_timestep(x1)
         t, xt, ut = self.transport.path_sampler.plan(t, x0, x1)
 
-        # 3) Predict velocity (cross-attend to CLIP/DINOv2 tokens if enabled)
-        context = clip_tokens if self.use_cross_attn else None
-        context2 = dino_tokens if self.use_dino else None
+        # 3) Predict velocity (cross-attend to the context streams if enabled)
+        ctx = contexts if self.use_cross_attn else None
         v_pred = self.wrapper.predict_velocity(
-            x=xt, t=t, y=clip_pool, context=context, context2=context2,
+            x=xt, t=t, y=clip_pool, contexts=ctx,
         )
 
         # 4) Diffusion loss (masked, optionally SNR-weighted, MSE on real voxels)
@@ -459,7 +462,7 @@ class FactFlowTrainer:
         fmri_gt = batch["fmri"].to(self.device)
         clip_tok = batch["clip_tokens"].to(self.device)
         clip_pool = batch["clip_pool"].to(self.device)
-        dino_tok = batch["dino_tokens"].to(self.device) if self.use_dino else None
+        contexts = [c.to(self.device) for c in batch["contexts"]]
 
         # Source from raw model encoder
         src_std = None
@@ -481,12 +484,10 @@ class FactFlowTrainer:
             x0 = torch.randn(n_eval, *self.latent_size, device=self.device)
 
         # ODE sampling
-        context = clip_tok if self.use_cross_attn else None
-        context2 = dino_tok if self.use_dino else None
+        ctx = contexts if self.use_cross_attn else None
         with autocast(**self.autocast_kwargs):
             traj = self.sample_fn(
-                x0, self.wrapper.dit.forward, y=clip_pool,
-                context=context, context2=context2,
+                x0, self.wrapper.dit.forward, y=clip_pool, contexts=ctx,
             )
         pred = traj[-1].float()
 
@@ -530,7 +531,7 @@ class FactFlowTrainer:
             fmri_gt = batch["fmri"].to(self.device)
             clip_tok = batch["clip_tokens"].to(self.device)
             clip_pool = batch["clip_pool"].to(self.device)
-            dino_tok = batch["dino_tokens"].to(self.device) if self.use_dino else None
+            contexts = [c.to(self.device) for c in batch["contexts"]]
             B = fmri_gt.shape[0]
 
             if self.use_source:
@@ -540,12 +541,10 @@ class FactFlowTrainer:
             else:
                 x0 = torch.randn(B, *self.latent_size, device=self.device)
 
-            context = clip_tok if self.use_cross_attn else None
-            context2 = dino_tok if self.use_dino else None
+            ctx = contexts if self.use_cross_attn else None
             with autocast(**self.autocast_kwargs):
                 traj = self.sample_fn(
-                    x0, model.dit.forward, y=clip_pool,
-                    context=context, context2=context2,
+                    x0, model.dit.forward, y=clip_pool, contexts=ctx,
                 )
             pred = traj[-1].float()
 
@@ -641,13 +640,11 @@ class FactFlowTrainer:
                 x1 = batch["fmri"].to(self.device)
                 clip_tokens = batch["clip_tokens"].to(self.device)
                 clip_pool = batch["clip_pool"].to(self.device)
-                dino_tokens = (
-                    batch["dino_tokens"].to(self.device) if self.use_dino else None
-                )
+                contexts = [c.to(self.device) for c in batch["contexts"]]
 
                 with autocast(**self.autocast_kwargs):
                     losses = self._compute_loss(
-                        x1, clip_tokens, clip_pool, dino_tokens,
+                        x1, clip_tokens, clip_pool, contexts,
                     )
 
                 # Backward (scale by grad_accum)

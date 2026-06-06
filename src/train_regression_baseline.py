@@ -58,17 +58,16 @@ def build_voxel_weight(train_ds, n_voxels, pad_to, device, logger):
 
 
 @torch.no_grad()
-def validate(model, loader, pad_mask, device, autocast_kwargs, use_dino):
+def validate(model, loader, pad_mask, device, autocast_kwargs):
     model.eval()
     preds, gts = [], []
     for batch in loader:
         fmri = batch["fmri"].to(device)
         clip_pool = batch["clip_pool"].to(device)
-        clip_tok = batch["clip_tokens"].to(device)
-        dino_tok = batch["dino_tokens"].to(device) if use_dino else None
+        contexts = [c.to(device) for c in batch["contexts"]]
         B = fmri.shape[0]
         with autocast(**autocast_kwargs):
-            pred = model(clip_pool, clip_tok, dino_tok).float()
+            pred = model(clip_pool, contexts).float()
         preds.append(pred.reshape(B, -1)[:, pad_mask].cpu())
         gts.append(fmri.reshape(B, -1)[:, pad_mask].cpu())
     preds = torch.cat(preds, 0)
@@ -114,12 +113,12 @@ def main() -> None:
         OmegaConf.save(cfg, os.path.join(exp_dir, "config.yaml"))
 
     # ── Data ──
-    use_dino = data_cfg.get("dino_feature") is not None
     ds_kwargs = dict(
         data_dir=data_cfg["data_dir"], subject=data_cfg["subject"],
         fmri_mode=data_cfg["fmri_mode"], clip_feature=data_cfg["clip_feature"],
         n_voxels=n_voxels, pad_to=pad_to,
         dino_feature=data_cfg.get("dino_feature"),
+        context_features=data_cfg.get("context_features", None),
     )
     train_ds = FactFlowfMRIDataset(mode="train", avg_reps=data_cfg.get("avg_reps", True), **ds_kwargs)
     val_ds = FactFlowfMRIDataset(mode="test", avg_reps=True, **ds_kwargs)
@@ -131,6 +130,9 @@ def main() -> None:
     logger.info("Train: %d samples, Val(avg_reps): %d images", len(train_ds), len(val_ds))
 
     # ── Model / optim ──
+    # Context streams (CLIP, DINO, multi-layer DINO, Gabor, …) define the
+    # per-stream embedder dims — single source of truth = the dataset.
+    cfg.model.params.context_dims = list(train_ds.context_dims)
     model = instantiate_from_config(cfg.model).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info("Regressor params: %.2fM", n_params / 1e6)
@@ -168,10 +170,9 @@ def main() -> None:
         for batch in pbar:
             fmri = batch["fmri"].to(device)
             clip_pool = batch["clip_pool"].to(device)
-            clip_tok = batch["clip_tokens"].to(device)
-            dino_tok = batch["dino_tokens"].to(device) if use_dino else None
+            contexts = [c.to(device) for c in batch["contexts"]]
             with autocast(**autocast_kwargs):
-                pred = model(clip_pool, clip_tok, dino_tok)
+                pred = model(clip_pool, contexts)
                 loss = masked_mse(pred, fmri, pad_mask, weight=voxel_weight)
             (loss / grad_accum).backward()
             accum += 1
@@ -193,7 +194,7 @@ def main() -> None:
                 break
 
         if (epoch + 1) % val_every == 0 or (epoch + 1) == epochs:
-            val_r = validate(model, val_loader, pad_mask, device, autocast_kwargs, use_dino)
+            val_r = validate(model, val_loader, pad_mask, device, autocast_kwargs)
             lr = scheduler.get_last_lr()[0]
             logger.info("[Val ep=%d] voxel_r=%.4f  (train_mse=%.5f)", epoch + 1, val_r, ep_loss / max(ep_n, 1))
             writer.writerow([epoch + 1, train_steps, f"{ep_loss / max(ep_n, 1):.6f}",

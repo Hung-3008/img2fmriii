@@ -101,6 +101,7 @@ class DiT1D(nn.Module):
         use_cross_attn: bool = False,
         y_token_channels: int = 1664,
         y_token_channels_2: int = None,
+        context_dims=None,
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -121,22 +122,23 @@ class DiT1D(nn.Module):
         self.t_embedder = GaussianFourierEmbedding(hidden_size)
         self.y_embedder = VectorEmbedder(y_in_channels, hidden_size)
 
-        # ── Context stem(s): feature tokens → hidden for cross-attention ─
-        # Each stream (CLIP, optionally DINOv2) is projected once and the
-        # results are concatenated along the token axis to form one context
-        # sequence, shared across all blocks.
-        self.context_embedder = None
-        self.context_embedder_2 = None
+        # ── Context stems: feature tokens → hidden for cross-attention ─
+        # One embedder per context stream (CLIP, DINOv2, multi-layer DINOv2,
+        # Gabor, …). Each stream is projected once and the results are
+        # concatenated along the token axis into one shared context sequence.
+        # ``context_dims`` is the per-stream input dim; falls back to the legacy
+        # [y_token_channels (+ y_token_channels_2)] pair for old configs.
+        self.context_embedders = None
         if use_cross_attn:
-            self.context_embedder = nn.Sequential(
-                nn.Linear(y_token_channels, hidden_size),
-                RMSNorm(hidden_size),
-            )
-            if y_token_channels_2 is not None:
-                self.context_embedder_2 = nn.Sequential(
-                    nn.Linear(y_token_channels_2, hidden_size),
-                    RMSNorm(hidden_size),
-                )
+            if context_dims is None:
+                context_dims = [y_token_channels]
+                if y_token_channels_2 is not None:
+                    context_dims.append(y_token_channels_2)
+            self.context_dims = list(context_dims)
+            self.context_embedders = nn.ModuleList([
+                nn.Sequential(nn.Linear(int(d), hidden_size), RMSNorm(hidden_size))
+                for d in self.context_dims
+            ])
 
         # 1D positional embedding (fixed sin-cos)
         self.pos_embed = nn.Parameter(
@@ -226,7 +228,14 @@ class DiT1D(nn.Module):
         x = x.reshape(B, c, N * p)    # (B, C, N*P) = (B, C, seq_len)
         return x
 
-    def forward(self, x, t=None, y=None, context=None, context2=None):
+    def _embed_contexts(self, contexts):
+        """Project each context stream to hidden and concat along the token axis."""
+        if not self.use_cross_attn or contexts is None or self.context_embedders is None:
+            return None
+        embedded = [emb(c) for emb, c in zip(self.context_embedders, contexts)]
+        return torch.cat(embedded, dim=1) if len(embedded) > 1 else embedded[0]
+
+    def forward(self, x, t=None, y=None, contexts=None):
         """
         Forward pass of DiT1D.
 
@@ -234,10 +243,10 @@ class DiT1D(nn.Module):
             x: (B, C, L) — 1D fMRI signal (C=1 typically)
             t: (B,) — diffusion timestep
             y: (B, D_pool) — CLIP pooled conditioning
-            context: (B, M, D_tok) — CLIP spatial tokens for cross-attention
-                     (only used when ``use_cross_attn=True``)
-            context2: (B, M2, D_tok2) — optional second token stream
-                     (e.g. DINOv2); concatenated with ``context``.
+            contexts: list of (B, Mᵢ, Dᵢ) cross-attention streams (CLIP, DINOv2,
+                     multi-layer DINOv2, Gabor, …), embedded per-stream and
+                     concatenated along the token axis (only used when
+                     ``use_cross_attn=True``).
 
         Returns:
             (B, C, L) — predicted velocity
@@ -247,12 +256,7 @@ class DiT1D(nn.Module):
         y = self.y_embedder(y)                      # (B, D)
         c = t + y                                    # (B, D)
 
-        ctx = None
-        if self.use_cross_attn and context is not None:
-            ctx = self.context_embedder(context)    # (B, M, D)
-            if self.context_embedder_2 is not None and context2 is not None:
-                ctx2 = self.context_embedder_2(context2)        # (B, M2, D)
-                ctx = torch.cat([ctx, ctx2], dim=1)             # (B, M+M2, D)
+        ctx = self._embed_contexts(contexts)
 
         for block in self.blocks:
             x = block(x, c, feat_rope=self.feat_rope, context=ctx)
