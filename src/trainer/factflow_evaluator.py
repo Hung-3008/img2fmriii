@@ -119,6 +119,7 @@ class FactFlowEvaluator:
             avg_reps=True,
             roi_order=self.roi_order,
             context_features=dc.get("context_features", None),
+            subdirs=dc.get("subdirs", None),
         )
         # Index that maps ROI-sorted voxels back to anatomical order (or None).
         self.unsort_idx = self.test_ds.unsort_idx if self.roi_order else None

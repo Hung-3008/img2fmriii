@@ -119,6 +119,7 @@ def main() -> None:
         n_voxels=n_voxels, pad_to=pad_to,
         dino_feature=data_cfg.get("dino_feature"),
         context_features=data_cfg.get("context_features", None),
+        subdirs=data_cfg.get("subdirs", None),
     )
     train_ds = FactFlowfMRIDataset(mode="train", avg_reps=data_cfg.get("avg_reps", True), **ds_kwargs)
     val_ds = FactFlowfMRIDataset(mode="test", avg_reps=True, **ds_kwargs)

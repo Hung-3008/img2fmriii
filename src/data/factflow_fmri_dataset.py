@@ -46,6 +46,7 @@ class FactFlowfMRIDataset(Dataset):
         dino_feature: str = None,
         roi_order: bool = False,
         context_features=None,
+        subdirs=None,
     ):
         super().__init__()
         self.mode = mode
@@ -69,11 +70,16 @@ class FactFlowfMRIDataset(Dataset):
             self.reshape_2d = False
 
         subj_dir = os.path.join(data_dir, f"subj0{subject}")
+        self.subj_dir = subj_dir
+        # Config-driven sub-directory layout. ``data.subdirs`` maps a category
+        # (``"fmri"`` or a feature basename like ``sdxl_clip``) to its sub-folder
+        # under the subject dir. The final path is a single relative join:
+        #   data_dir / subj0{S} / subdirs[key] / filename
+        # A key absent from the map resolves to the subject root ("").
+        self.subdirs = dict(subdirs or {})
 
         # --- fMRI: (N_images, 3, V) ---
-        fmri_path = os.path.join(
-            subj_dir, f"nsd_{mode}_fmri_{fmri_mode}_sub{subject}.npy"
-        )
+        fmri_path = self._resolve(f"nsd_{mode}_fmri_{fmri_mode}_sub{subject}.npy", "fmri")
         self.fmri_data = np.load(fmri_path, mmap_mode="r")  # (N_img, 3, V)
         self.n_images = self.fmri_data.shape[0]
         self.n_reps = self.fmri_data.shape[1]
@@ -81,14 +87,14 @@ class FactFlowfMRIDataset(Dataset):
         self.n_samples = self.n_images if avg_reps else self.n_images * self.n_reps
 
         # --- CLIP tokens: (N_images, T, D) ---
-        clip_tok_path = os.path.join(
-            subj_dir, f"nsd_{clip_feature}_{mode}_sub{subject}.npy"
+        clip_tok_path = self._resolve(
+            f"nsd_{clip_feature}_{mode}_sub{subject}.npy", clip_feature
         )
         self.clip_tokens = np.load(clip_tok_path, mmap_mode="r")
 
-        # --- CLIP pooled: (N_images, D_pool) ---
-        clip_pool_path = os.path.join(
-            subj_dir, f"nsd_{clip_feature}_pool_{mode}_sub{subject}.npy"
+        # --- CLIP pooled: (N_images, D_pool) --- (lives alongside the clip tokens)
+        clip_pool_path = self._resolve(
+            f"nsd_{clip_feature}_pool_{mode}_sub{subject}.npy", clip_feature
         )
         self.clip_pool = np.load(clip_pool_path, mmap_mode="r")
 
@@ -105,7 +111,7 @@ class FactFlowfMRIDataset(Dataset):
         self.context_features = list(context_features)
         self.context_mmaps = []
         for feat in self.context_features:
-            p = os.path.join(subj_dir, f"nsd_{feat}_{mode}_sub{subject}.npy")
+            p = self._resolve(f"nsd_{feat}_{mode}_sub{subject}.npy", feat)
             m = np.load(p, mmap_mode="r")
             assert m.shape[0] == self.n_images, f"{feat}: {m.shape[0]} != {self.n_images}"
             self.context_mmaps.append(m)
@@ -153,6 +159,12 @@ class FactFlowfMRIDataset(Dataset):
             self.n_samples, n_voxels, pad_to, shape_str,
             self.context_features, self.context_dims,
         )
+
+    def _resolve(self, filename: str, key: str) -> str:
+        """Join the config-declared sub-folder for ``key`` into one relative path:
+        ``data_dir / subj0{S} / subdirs[key] / filename`` (root if ``key`` unmapped).
+        """
+        return os.path.join(self.subj_dir, self.subdirs.get(key, ""), filename)
 
     def __len__(self):
         return self.n_samples

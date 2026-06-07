@@ -9,6 +9,12 @@ use_source_encoder: false
 # --- Data ---
 data:
   data_dir: NSD/data/nsd
+  subdirs:
+    fmri: fmri
+    sdxl_clip: clip
+    dinov2_vitl14: dino
+    dinov2_vitl14_multilayer: dino
+    gabor: gabor
   subject: 1
   fmri_mode: zscore          # "scale" or "zscore"
   clip_feature: sdxl_clip   # feature prefix

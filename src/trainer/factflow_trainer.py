@@ -260,6 +260,7 @@ class FactFlowTrainer:
             dino_feature=dc.get("dino_feature", None),
             roi_order=self.roi_order,
             context_features=dc.get("context_features", None),
+            subdirs=dc.get("subdirs", None),
         )
         self.train_ds = FactFlowfMRIDataset(mode="train", **ds_kwargs)
         self.test_ds  = FactFlowfMRIDataset(mode="test",  **ds_kwargs)
