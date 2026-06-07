@@ -128,6 +128,17 @@ MODEL_CONFIGS = {
     }
 }
 
+# Output sub-folder per backbone family (matches the dataset's ``data.subdirs``
+# convention). Features are written to NSD/data/nsd/subj0{S}/<subdir>/ rather than
+# the subject root, so each feature type stays grouped.
+MODEL_TYPE_SUBDIR = {
+    'dinov2': 'dino',
+    'sdxl_clip': 'clip',
+    'resnet': 'resnet',
+    'sam': 'sam',
+    'qwen3vl': 'qwen',
+}
+
 # ==============================================================================
 # Unified Dataset Class
 # ==============================================================================
@@ -360,7 +371,15 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=None,
                         help="Override default batch size.")
     parser.add_argument('--layers', type=str, nargs='+', default=None,
-                        help="Override layer indices/names for multilayer extraction.")
+                        help="Override layer indices/names for multilayer extraction. "
+                             "Pass 'all' to use every transformer block.")
+    parser.add_argument('--subdir', type=str, default=None,
+                        help="Output sub-folder under the subject dir "
+                             "(default: per-model, e.g. clip/ for sdxl_clip, dino/ for dinov2).")
+    parser.add_argument('--multi_mode', type=str, default='spatial', choices=['spatial', 'cls'],
+                        help="DINOv2 multilayer output: 'spatial' = CLS+patch per layer "
+                             "(L,1+N,D) → _multilayer_; 'cls' = CLS-only per layer (L,D) → _multi_. "
+                             "Ignored by other backbones.")
     parser.add_argument('--device', type=str, default='',
                         help="Device to run on (default: cuda if available, else cpu)")
     parser.add_argument('--model_path', type=str, default=None,
@@ -380,19 +399,26 @@ def main():
     config = MODEL_CONFIGS[model_key]
     model_type = config['model_type']
     file_prefix = config['file_prefix']
-    
+    subdir = args.subdir if args.subdir is not None else MODEL_TYPE_SUBDIR.get(model_type, '')
+    # DINOv2 'cls' multilayer mode is CLS-only-per-layer (global) → use the _multi_
+    # suffix so it doesn't collide with the spatial _multilayer_ file.
+    multi_suffix = '_multi_' if (model_type == 'dinov2' and args.multi_mode == 'cls') else config['multi_suffix']
+
     # ── Override Config Parameters ──
     batch_size = args.batch_size if args.batch_size is not None else config['batch_size']
-    
+
     # Layers parsing
     if args.layers is not None:
-        # If layers are integers, convert them, otherwise keep as strings
-        layers = []
-        for l in args.layers:
-            try:
-                layers.append(int(l))
-            except ValueError:
-                layers.append(l)
+        if len(args.layers) == 1 and str(args.layers[0]).lower() == 'all':
+            layers = 'all'  # sentinel: expanded to every block once the model loads
+        else:
+            # If layers are integers, convert them, otherwise keep as strings
+            layers = []
+            for l in args.layers:
+                try:
+                    layers.append(int(l))
+                except ValueError:
+                    layers.append(l)
     else:
         layers = config['default_layers']
         
@@ -401,6 +427,20 @@ def main():
         model_key, model_path_override=args.model_path, device=device
     )
     
+    # Expand the 'all' sentinel to every transformer block now the model is loaded.
+    if layers == 'all':
+        if model_type == 'dinov2':
+            layers = list(range(len(model.blocks)))
+        elif model_type == 'sdxl_clip':
+            layers = list(range(len(model.model.visual.transformer.resblocks)))
+        elif model_type == 'resnet':
+            layers = ['layer1', 'layer2', 'layer3', 'layer4']
+        elif model_type == 'sam':
+            layers = list(range(model.config.vision_config.num_hidden_layers))
+        else:
+            raise ValueError(f"--layers all is not supported for model_type={model_type}")
+        print(f"'all' layers → {len(layers)} blocks: {layers}")
+
     # DINOv2 layers setup if default layers needed calculation
     if model_type == 'dinov2' and layers is None:
         num_layers = len(model.blocks)
@@ -443,7 +483,10 @@ def main():
         if not os.path.exists(save_path):
             print(f"\nSubject {subj} folder not found at {save_path}, skipping...")
             continue
-            
+        # Images stay at the subject root ({mode}_img/); features go into the subdir.
+        out_dir = os.path.join(save_path, subdir) if subdir else save_path
+        os.makedirs(out_dir, exist_ok=True)
+
         print(f"\n{'='*60}")
         print(f"Processing Subject {subj}...")
         print(f"{'='*60}")
@@ -465,12 +508,12 @@ def main():
                 dummy_paths = [image_paths[0]]
                 dummy_pooled, dummy_multi = extract_qwen_batch(model, processor_or_transform, dummy_paths, layers, device)
                 
-                out_pool_path = os.path.join(save_path, f'nsd_{file_prefix}_pool_{mode}_sub{subj}.npy')
+                out_pool_path = os.path.join(out_dir, f'nsd_{file_prefix}_pool_{mode}_sub{subj}.npy')
                 pool_mmap = np.lib.format.open_memmap(out_pool_path, mode='w+', dtype=np.float16, shape=tuple(int(x) for x in (num_images, dummy_pooled.shape[1])))
                 
                 multi_mmap = None
                 if dummy_multi is not None:
-                    out_multi_path = os.path.join(save_path, f'nsd_{file_prefix}{config["multi_suffix"]}{mode}_sub{subj}.npy')
+                    out_multi_path = os.path.join(out_dir, f'nsd_{file_prefix}{multi_suffix}{mode}_sub{subj}.npy')
                     multi_mmap = np.lib.format.open_memmap(out_multi_path, mode='w+', dtype=np.float16, shape=tuple(int(x) for x in (num_images, dummy_multi.shape[1], dummy_multi.shape[2])))
                 
                 for start_idx in tqdm(range(0, num_images, batch_size), desc=f"  Extracting {mode}"):
@@ -511,9 +554,14 @@ def main():
                     full_features = torch.cat([cls_token.unsqueeze(1), patch_tokens], dim=1)
                     
                     intermediate = model.get_intermediate_layers(dummy_img, n=layers, reshape=False, return_class_token=True)
-                    multi_features = torch.stack([
-                        torch.cat([c.unsqueeze(1), p], dim=1) for p, c in intermediate
-                    ], dim=1)
+                    if args.multi_mode == 'cls':
+                        # CLS token per layer (global hierarchy) → (B, L, D)
+                        multi_features = torch.stack([c for p, c in intermediate], dim=1)
+                    else:
+                        # CLS + patch tokens per layer (spatial) → (B, L, 1+N, D)
+                        multi_features = torch.stack([
+                            torch.cat([c.unsqueeze(1), p], dim=1) for p, c in intermediate
+                        ], dim=1)
                     
                 elif model_type == 'resnet':
                     x = model.conv1(dummy_img)
@@ -580,17 +628,17 @@ def main():
                     full_features = z
             
             # Create memmap files based on dummy shapes
-            out_pool_path = os.path.join(save_path, f'nsd_{file_prefix}_pool_{mode}_sub{subj}.npy')
+            out_pool_path = os.path.join(out_dir, f'nsd_{file_prefix}_pool_{mode}_sub{subj}.npy')
             pool_mmap = np.lib.format.open_memmap(out_pool_path, mode='w+', dtype=np.float16, shape=tuple(int(x) for x in (num_images, cls_token.shape[1])))
             
             token_mmap = None
             if config['has_tokens'] and full_features is not None:
-                out_tokens_path = os.path.join(save_path, f'nsd_{file_prefix}_{mode}_sub{subj}.npy')
+                out_tokens_path = os.path.join(out_dir, f'nsd_{file_prefix}_{mode}_sub{subj}.npy')
                 token_mmap = np.lib.format.open_memmap(out_tokens_path, mode='w+', dtype=np.float16, shape=tuple(int(x) for x in (num_images, full_features.shape[1], full_features.shape[2])))
                 
             multi_mmap = None
             if multi_features is not None:
-                out_multi_path = os.path.join(save_path, f'nsd_{file_prefix}{config["multi_suffix"]}{mode}_sub{subj}.npy')
+                out_multi_path = os.path.join(out_dir, f'nsd_{file_prefix}{multi_suffix}{mode}_sub{subj}.npy')
                 multi_shape_tuple = tuple(int(x) for x in (num_images,) + multi_features.shape[1:])
                 multi_mmap = np.lib.format.open_memmap(out_multi_path, mode='w+', dtype=np.float16, shape=multi_shape_tuple)
             
@@ -615,11 +663,14 @@ def main():
                         # Full features
                         full_features = torch.cat([cls_token.unsqueeze(1), patch_tokens], dim=1)
                         
-                        # Multilayer CLS + patches
+                        # Multilayer features (spatial CLS+patch, or CLS-only per layer)
                         intermediate = model.get_intermediate_layers(batch_data, n=layers, reshape=False, return_class_token=True)
-                        multi_features = torch.stack([
-                            torch.cat([c.unsqueeze(1), p], dim=1) for p, c in intermediate
-                        ], dim=1)
+                        if args.multi_mode == 'cls':
+                            multi_features = torch.stack([c for p, c in intermediate], dim=1)
+                        else:
+                            multi_features = torch.stack([
+                                torch.cat([c.unsqueeze(1), p], dim=1) for p, c in intermediate
+                            ], dim=1)
                         
                         pool_mmap[start_idx:end_idx] = cls_token.cpu().half().numpy()
                         if token_mmap is not None:
