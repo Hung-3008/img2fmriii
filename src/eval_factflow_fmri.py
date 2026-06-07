@@ -17,7 +17,7 @@ Usage::
 
     # Scenario 1: fully deterministic
     python src/eval_factflow_fmri.py \\
-        --config src/configs/factflow_fmri_cross_dino_srcdist_v2.yaml \\
+        --config src/configs/factflow/srcdist_v2/factflow_fmri_cross_dino_srcdist_v2.yaml \\
         --ckpt exps/.../checkpoints/best.pt \\
         --scenario deterministic \\
         --output results/eval_deterministic
@@ -51,7 +51,7 @@ from trainer.factflow_evaluator import FactFlowEvaluator
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="FactFlow fMRI Evaluation")
-    parser.add_argument("--config", type=str, default="src/configs/factflow_fmri.yaml",
+    parser.add_argument("--config", type=str, default="src/configs/factflow/base/factflow_fmri.yaml",
                         help="Path to YAML config file")
     parser.add_argument("--ckpt", type=str, required=True,
                         help="Checkpoint to evaluate")

@@ -14,7 +14,7 @@
 #
 # Usage:
 #   bash scripts/run_eval_scenarios.sh \
-#       --config src/configs/factflow_fmri_cross_dino_srcdist_v2.yaml \
+#       --config src/configs/factflow/srcdist_v2/factflow_fmri_cross_dino_srcdist_v2.yaml \
 #       --ckpt exps/srcdist_v2/checkpoints/best.pt
 #
 # Optional:

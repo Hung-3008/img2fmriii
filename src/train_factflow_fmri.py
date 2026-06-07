@@ -5,9 +5,9 @@ Entry point for FactFlow fMRI synthesis training.
 
 Usage::
 
-    python src/train_factflow_fmri.py --config src/configs/factflow_fmri.yaml
-    python src/train_factflow_fmri.py --config src/configs/factflow_fmri.yaml --resume_last
-    python src/train_factflow_fmri.py --config src/configs/factflow_fmri.yaml --max_steps 10
+    python src/train_factflow_fmri.py --config src/configs/factflow/base/factflow_fmri.yaml
+    python src/train_factflow_fmri.py --config src/configs/factflow/base/factflow_fmri.yaml --resume_last
+    python src/train_factflow_fmri.py --config src/configs/factflow/base/factflow_fmri.yaml --max_steps 10
 """
 
 import argparse
@@ -25,7 +25,7 @@ from trainer.factflow_trainer import FactFlowTrainer
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="FactFlow fMRI Synthesis Training")
-    parser.add_argument("--config", type=str, default="src/configs/factflow_fmri.yaml",
+    parser.add_argument("--config", type=str, default="src/configs/factflow/base/factflow_fmri.yaml",
                         help="Path to YAML config file")
     parser.add_argument("--exps_dir", type=str, default="exps",
                         help="Root directory for experiments")

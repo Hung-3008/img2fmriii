@@ -26,7 +26,7 @@ set -euo pipefail
 EPOCHS=100
 BATCH_SIZE=32
 DEVICE=""
-CONFIG="src/configs/factflow_fmri_cross_dino_gabor.yaml"
+CONFIG="src/configs/factflow/gabor/factflow_fmri_cross_dino_gabor.yaml"
 DATA_DIR="NSD/data/nsd"
 
 # ── Parse arguments ──────────────────────────────────────────────────
@@ -136,7 +136,7 @@ if [[ "$ALL_OK" != "true" ]]; then
 fi
 
 # ── Step 3: Generate per-subject configs & train ──────────────────────
-CONFIG_DIR="src/configs"
+CONFIG_DIR="src/configs/factflow/gabor"
 mkdir -p "$CONFIG_DIR"
 
 for s in "${SUBJECTS[@]}"; do
@@ -200,7 +200,7 @@ echo ""
 echo "To evaluate, run:"
 for s in "${SUBJECTS[@]}"; do
     echo "  bash scripts/run_eval_scenarios.sh \\"
-    echo "    --config src/configs/factflow_fmri_cross_dino_gabor_sub${s}.yaml \\"
+    echo "    --config src/configs/factflow/gabor/factflow_fmri_cross_dino_gabor_sub${s}.yaml \\"
     echo "    --ckpt exps/srcdist_v2_gabor_sub${s}/checkpoints/best.pt \\"
     echo "    --out_dir results/eval_scenarios_gabor_sub${s}"
     echo ""

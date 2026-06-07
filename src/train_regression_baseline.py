@@ -14,7 +14,7 @@ identical to the flow trainer (rep-averaged GT, voxel-wise Pearson r).
 
 Usage::
 
-    python src/train_regression_baseline.py --config src/configs/regression_baseline.yaml
+    python src/train_regression_baseline.py --config src/configs/regression/regression_baseline.yaml
 """
 
 import argparse
