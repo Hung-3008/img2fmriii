@@ -13,6 +13,7 @@ Usage examples:
 
 import argparse
 import os
+import shutil
 import sys
 import numpy as np
 import torch
@@ -359,6 +360,69 @@ def extract_qwen_batch(model, processor, image_paths, layers, device):
                 
     return pooled, multi_embeddings
 
+
+def extract_clip_multilayer(model, img, layers, multi_mode):
+    """Per-layer features from the OpenCLIP visual transformer.
+
+    Uses the official ``forward_intermediates`` API (open_clip >= 2.26), which is
+    the direct analogue of DINOv2's ``get_intermediate_layers``. ``ln_post`` is
+    applied to every intermediate (``normalize_intermediates=True``) so the output
+    matches DINOv2 (``norm=True``) and CLIP's own final-layer tokens.
+
+    Args:
+        model: FrozenOpenCLIPImageEmbedder (preprocessing happens here).
+        img:   raw image batch (B, 3, H, W); ``model.preprocess`` is applied.
+        layers: list of block indices to take.
+        multi_mode: 'spatial' → (B, L, 1+N, D) CLS+patch per layer;
+                    'cls'     → (B, L, D)       CLS-only per layer.
+    """
+    visual = model.model.visual
+    img_pp = model.preprocess(img)
+    out = visual.forward_intermediates(
+        img_pp,
+        indices=layers,
+        normalize_intermediates=True,
+        output_fmt='NLC',
+        output_extra_tokens=True,
+        intermediates_only=True,
+    )
+    patches = out['image_intermediates']          # list[L] of (B, N, D)
+    prefix = out['image_intermediates_prefix']    # list[L] of (B, 1, D)
+    if multi_mode == 'cls':
+        return torch.stack([c[:, 0] for c in prefix], dim=1)        # (B, L, D)
+    return torch.stack(
+        [torch.cat([c, s], dim=1) for c, s in zip(prefix, patches)],
+        dim=1,
+    )                                                               # (B, L, 1+N, D)
+
+
+def copy_test_features(ref_subj, dst_subj, ref_out_dir, dst_out_dir,
+                       file_prefix, multi_suffix, has_tokens):
+    """Reuse one subject's test features for another.
+
+    NSD's test set is the shared-1000 stimuli — byte-identical across subjects — so
+    test image features only need extracting once. For the other subjects we copy
+    the reference subject's test files, renaming the ``_sub{ref}`` suffix. (fMRI and
+    roi_meta stay per-subject and are untouched.)
+    """
+    candidates = [f'nsd_{file_prefix}_pool_test_sub{ref_subj}.npy']
+    if has_tokens:
+        candidates.append(f'nsd_{file_prefix}_test_sub{ref_subj}.npy')
+    candidates.append(f'nsd_{file_prefix}{multi_suffix}test_sub{ref_subj}.npy')
+
+    copied = 0
+    for fn in candidates:
+        src = os.path.join(ref_out_dir, fn)
+        if not os.path.exists(src):
+            print(f"  ⚠️  ref test file missing, skipped: {src}")
+            continue
+        dst_fn = fn.replace(f'_sub{ref_subj}.npy', f'_sub{dst_subj}.npy')
+        dst = os.path.join(dst_out_dir, dst_fn)
+        shutil.copyfile(src, dst)
+        copied += 1
+        print(f"  📋 Copied test: {fn} → {dst_fn} ({os.path.getsize(dst)/1e6:.1f}MB)")
+    return copied
+
 # ==============================================================================
 # Main function
 # ==============================================================================
@@ -376,8 +440,13 @@ def parse_args():
     parser.add_argument('--subdir', type=str, default=None,
                         help="Output sub-folder under the subject dir "
                              "(default: per-model, e.g. clip/ for sdxl_clip, dino/ for dinov2).")
+    parser.add_argument('--share_test_from', type=int, default=None,
+                        help="Reuse test features from this subject (NSD test stimuli are "
+                             "identical across subjects). The other subjects copy that "
+                             "subject's test files instead of re-extracting; train is always "
+                             "extracted per-subject. The reference subject is processed first.")
     parser.add_argument('--multi_mode', type=str, default='spatial', choices=['spatial', 'cls'],
-                        help="DINOv2 multilayer output: 'spatial' = CLS+patch per layer "
+                        help="DINOv2/CLIP multilayer output: 'spatial' = CLS+patch per layer "
                              "(L,1+N,D) → _multilayer_; 'cls' = CLS-only per layer (L,D) → _multi_. "
                              "Ignored by other backbones.")
     parser.add_argument('--device', type=str, default='',
@@ -400,9 +469,12 @@ def main():
     model_type = config['model_type']
     file_prefix = config['file_prefix']
     subdir = args.subdir if args.subdir is not None else MODEL_TYPE_SUBDIR.get(model_type, '')
-    # DINOv2 'cls' multilayer mode is CLS-only-per-layer (global) → use the _multi_
-    # suffix so it doesn't collide with the spatial _multilayer_ file.
-    multi_suffix = '_multi_' if (model_type == 'dinov2' and args.multi_mode == 'cls') else config['multi_suffix']
+    # DINOv2/CLIP honour --multi_mode: spatial → _multilayer_ (CLS+patch per layer),
+    # cls → _multi_ (CLS-only per layer). Other backbones keep their config suffix.
+    if model_type in ('dinov2', 'sdxl_clip'):
+        multi_suffix = '_multi_' if args.multi_mode == 'cls' else '_multilayer_'
+    else:
+        multi_suffix = config['multi_suffix']
 
     # ── Override Config Parameters ──
     batch_size = args.batch_size if args.batch_size is not None else config['batch_size']
@@ -465,20 +537,18 @@ def main():
             layer_module = getattr(model, layer_name)
             hooks.append(layer_module.register_forward_hook(get_activation(layer_name)))
             
-    elif model_type == 'sdxl_clip':
-        # OpenCLIP visual transformer blocks
-        try:
-            vit_model = model.model.visual.transformer
-            resblocks = vit_model.resblocks
-            for idx in layers:
-                if idx < len(resblocks):
-                    hooks.append(resblocks[idx].register_forward_hook(get_activation(idx)))
-            print(f"OpenCLIP hooks registered successfully on layers: {layers}")
-        except Exception as e:
-            print(f"Warning: Cannot access OpenCLIP ViT internals for hooks: {e}")
-            hooks = []
-                # ── Loop over subjects ──
-    for subj in args.subjects:
+    # sdxl_clip uses the official forward_intermediates API (extract_clip_multilayer),
+    # so no forward hooks are needed.
+
+    # ── Loop over subjects ──
+    # Shared-test reuse: process the reference subject first so its test features
+    # exist on disk before the others copy them.
+    subjects = list(args.subjects)
+    if args.share_test_from is not None and args.share_test_from in subjects:
+        subjects.remove(args.share_test_from)
+        subjects.insert(0, args.share_test_from)
+
+    for subj in subjects:
         save_path = os.path.join(PROCESSED_DATA_DIR, f'subj0{subj}')
         if not os.path.exists(save_path):
             print(f"\nSubject {subj} folder not found at {save_path}, skipping...")
@@ -490,8 +560,20 @@ def main():
         print(f"\n{'='*60}")
         print(f"Processing Subject {subj}...")
         print(f"{'='*60}")
-        
+
         for mode in ['train', 'test']:
+            # Reuse the reference subject's test features (NSD test stimuli are
+            # identical across subjects) — copy instead of re-extracting.
+            if (mode == 'test' and args.share_test_from is not None
+                    and subj != args.share_test_from):
+                ref = args.share_test_from
+                ref_out_dir = os.path.join(PROCESSED_DATA_DIR, f'subj0{ref}', subdir) if subdir \
+                    else os.path.join(PROCESSED_DATA_DIR, f'subj0{ref}')
+                print(f"  Reusing test features from subject {ref} (shared NSD test set)...")
+                copy_test_features(ref, subj, ref_out_dir, out_dir,
+                                   file_prefix, multi_suffix, config['has_tokens'])
+                continue
+
             image_dir = os.path.join(save_path, f'{mode}_img')
             if not os.path.exists(image_dir):
                 print(f"  {mode}_img not found, skipping...")
@@ -612,18 +694,7 @@ def main():
                     
                 elif model_type == 'sdxl_clip':
                     z, z_pool = model(dummy_img)
-                    multi_cls = []
-                    if intermediate_outputs:
-                        for idx in sorted(intermediate_outputs.keys()):
-                            out = intermediate_outputs[idx]
-                            if out.dim() == 3 and out.shape[0] != dummy_img.shape[0]:
-                                cls = out[0]
-                            else:
-                                cls = out[:, 0]
-                            multi_cls.append(cls)
-                        multi_features = torch.stack(multi_cls, dim=1)
-                    else:
-                        multi_features = None
+                    multi_features = extract_clip_multilayer(model, dummy_img, layers, args.multi_mode)
                     cls_token = z_pool
                     full_features = z
             
@@ -740,20 +811,11 @@ def main():
                         
                     elif model_type == 'sdxl_clip':
                         z, z_pool = model(batch_data)
-                        
-                        multi_cls = []
-                        if intermediate_outputs:
-                            for idx in sorted(intermediate_outputs.keys()):
-                                out = intermediate_outputs[idx]
-                                if out.dim() == 3 and out.shape[0] != batch_data.shape[0]:
-                                    cls = out[0]
-                                else:
-                                    cls = out[:, 0]
-                                multi_cls.append(cls)
-                            multi_stack = torch.stack(multi_cls, dim=1)
-                            if multi_mmap is not None:
-                                multi_mmap[start_idx:end_idx] = multi_stack.cpu().half().numpy()
-                            
+
+                        if multi_mmap is not None:
+                            multi_stack = extract_clip_multilayer(model, batch_data, layers, args.multi_mode)
+                            multi_mmap[start_idx:end_idx] = multi_stack.cpu().half().numpy()
+
                         pool_mmap[start_idx:end_idx] = z_pool.cpu().half().numpy()
                         if token_mmap is not None:
                             token_mmap[start_idx:end_idx] = z.cpu().half().numpy()

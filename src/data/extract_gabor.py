@@ -25,6 +25,7 @@ Usage::
 import argparse
 import math
 import os
+import shutil
 
 import numpy as np
 import torch
@@ -95,6 +96,10 @@ def main() -> None:
     ap.add_argument("--grid", type=int, default=16, help="output spatial grid (tokens = grid²)")
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--share_test_from", type=int, default=None,
+                    help="Reuse test features from this subject (NSD test stimuli are "
+                         "identical across subjects); the others copy its test file "
+                         "instead of recomputing. The reference subject is processed first.")
     args = ap.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -106,15 +111,33 @@ def main() -> None:
     print(f"Gabor bank: {args.orient} orient × {len(args.wavelengths)} freq = {n_filters} filters, "
           f"ksize={ksize}, img={args.img}, grid={args.grid} → tokens=({args.grid**2},{n_filters})")
 
-    for sub in args.subjects:
+    # Process the reference subject first so its test feature exists before copying.
+    subjects = list(args.subjects)
+    if args.share_test_from is not None and args.share_test_from in subjects:
+        subjects.remove(args.share_test_from)
+        subjects.insert(0, args.share_test_from)
+
+    for sub in subjects:
         subj_dir = os.path.join(args.data_root, f"subj{sub:02d}")
         for mode in ("train", "test"):
+            out_path = os.path.join(subj_dir, f"nsd_gabor_{mode}_sub{sub}.npy")
+
+            # Reuse the reference subject's test feature (shared NSD test set).
+            if (mode == "test" and args.share_test_from is not None
+                    and sub != args.share_test_from):
+                ref = args.share_test_from
+                src = os.path.join(args.data_root, f"subj{ref:02d}", f"nsd_gabor_test_sub{ref}.npy")
+                if not os.path.exists(src):
+                    print(f"  ⚠️  ref test file missing, skipped: {src}"); continue
+                shutil.copyfile(src, out_path)
+                print(f"  subj{sub:02d} test: 📋 copied from subj{ref:02d} → {out_path}")
+                continue
+
             stim_path = os.path.join(subj_dir, f"nsd_{mode}_stim_sub{sub}.npy")
             if not os.path.exists(stim_path):
                 print(f"  [skip] {stim_path} not found"); continue
             stim = np.load(stim_path, mmap_mode="r")           # (N,425,425,3) uint8
             feats = extract(stim, even, odd, ksize, args.grid, args.img, device, args.batch)
-            out_path = os.path.join(subj_dir, f"nsd_gabor_{mode}_sub{sub}.npy")
             np.save(out_path, feats)
             print(f"  subj{sub:02d} {mode}: {stim.shape[0]} imgs → {feats.shape} {feats.dtype}  "
                   f"[mean={feats.astype(np.float32).mean():.3f}] → {out_path}")
