@@ -284,7 +284,7 @@ class FactFlowTrainer:
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=bool(self.train_cfg.get("pin_memory", True)),
             drop_last=True,
             persistent_workers=num_workers > 0,
         )

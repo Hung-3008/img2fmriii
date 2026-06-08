@@ -112,7 +112,8 @@ training:
   epochs: 50
   batch_size: 32
   grad_accum_steps: 8
-  num_workers: 4
+  num_workers: 2
+  pin_memory: false  # pinned RAM is non-reclaimable → raises memory PSI → systemd-oomd kill
   log_every: 50
   ckpt_every: 5000
   sample_every: 2000
