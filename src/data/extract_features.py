@@ -396,6 +396,27 @@ def extract_clip_multilayer(model, img, layers, multi_mode):
     )                                                               # (B, L, 1+N, D)
 
 
+def pool_spatial_grid(multi, factor, n_cls=1):
+    """Average-pool the ViT patch grid of a spatial multilayer tensor.
+
+    ``multi`` is (B, L, n_cls + G*G, D); the first ``n_cls`` prefix tokens (CLS)
+    pass through unchanged and the G*G patch tokens are reshaped to the G*G grid
+    and averaged in ``factor``*``factor`` blocks → (B, L, n_cls + (G/factor)**2, D).
+    The mean is computed in float32 for stability (caller casts back to fp16).
+    """
+    B, L, T, D = multi.shape
+    n_patch = T - n_cls
+    g = int(round(n_patch ** 0.5))
+    assert g * g == n_patch, f"patch count {n_patch} (T={T} - cls={n_cls}) is not a perfect square"
+    assert g % factor == 0, f"grid {g}x{g} not divisible by pool factor {factor}"
+    go = g // factor
+    cls = multi[:, :, :n_cls, :].float()
+    patch = multi[:, :, n_cls:, :].float().reshape(B, L, g, g, D)
+    patch = patch.reshape(B, L, go, factor, go, factor, D).mean(dim=(3, 5))
+    patch = patch.reshape(B, L, go * go, D)
+    return torch.cat([cls, patch], dim=2)
+
+
 def copy_test_features(ref_subj, dst_subj, ref_out_dir, dst_out_dir,
                        file_prefix, multi_suffix, has_tokens):
     """Reuse one subject's test features for another.
@@ -449,6 +470,10 @@ def parse_args():
                         help="DINOv2/CLIP multilayer output: 'spatial' = CLS+patch per layer "
                              "(L,1+N,D) → _multilayer_; 'cls' = CLS-only per layer (L,D) → _multi_. "
                              "Ignored by other backbones.")
+    parser.add_argument('--pool_spatial', type=int, default=None,
+                        help="Average-pool the ViT patch grid by this factor at extract time "
+                             "(spatial multi_mode, dinov2/sdxl_clip only): factor 2 → 16x16->8x8, "
+                             "257->65 tokens, CLS kept. Output suffix → _multilayer{N}p_; ~factor^2 less storage.")
     parser.add_argument('--device', type=str, default='',
                         help="Device to run on (default: cuda if available, else cpu)")
     parser.add_argument('--model_path', type=str, default=None,
@@ -522,6 +547,19 @@ def main():
         
     print(f"Batch size: {batch_size}")
     print(f"Selected layers for multilayer extraction: {layers}")
+
+    # ── Spatial token pooling (extract directly at the optimized resolution) ──
+    pool_factor = args.pool_spatial or 0
+    if pool_factor:
+        if args.multi_mode != 'spatial':
+            raise ValueError("--pool_spatial requires --multi_mode spatial (it pools the patch grid).")
+        if model_type not in ('dinov2', 'sdxl_clip'):
+            raise ValueError("--pool_spatial only supports the spatial ViT grids of dinov2/sdxl_clip.")
+        if not isinstance(layers, list):
+            raise ValueError("--pool_spatial needs an explicit layer count (pass --layers ...).")
+        multi_suffix = f'_multilayer{len(layers)}p_'
+        print(f"Spatial pooling ON: factor {pool_factor} → grid /{pool_factor}; "
+              f"multilayer suffix → {multi_suffix}")
     
     # Hook storage setup for models using hooks
     intermediate_outputs = {}
@@ -698,6 +736,10 @@ def main():
                     cls_token = z_pool
                     full_features = z
             
+            # Pool the spatial patch grid (extract directly at the optimized resolution)
+            if pool_factor and multi_features is not None and multi_features.dim() == 4:
+                multi_features = pool_spatial_grid(multi_features, pool_factor)
+
             # Create memmap files based on dummy shapes
             out_pool_path = os.path.join(out_dir, f'nsd_{file_prefix}_pool_{mode}_sub{subj}.npy')
             pool_mmap = np.lib.format.open_memmap(out_pool_path, mode='w+', dtype=np.float16, shape=tuple(int(x) for x in (num_images, cls_token.shape[1])))
@@ -747,6 +789,8 @@ def main():
                         if token_mmap is not None:
                             token_mmap[start_idx:end_idx] = full_features.cpu().half().numpy()
                         if multi_mmap is not None:
+                            if pool_factor and multi_features.dim() == 4:
+                                multi_features = pool_spatial_grid(multi_features, pool_factor)
                             multi_mmap[start_idx:end_idx] = multi_features.cpu().half().numpy()
                         
                     elif model_type == 'resnet':
@@ -814,6 +858,8 @@ def main():
 
                         if multi_mmap is not None:
                             multi_stack = extract_clip_multilayer(model, batch_data, layers, args.multi_mode)
+                            if pool_factor and multi_stack.dim() == 4:
+                                multi_stack = pool_spatial_grid(multi_stack, pool_factor)
                             multi_mmap[start_idx:end_idx] = multi_stack.cpu().half().numpy()
 
                         pool_mmap[start_idx:end_idx] = z_pool.cpu().half().numpy()
