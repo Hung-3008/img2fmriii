@@ -18,14 +18,13 @@
 #   clip_only 0.386 ≈ dino_only 0.388 < clip_dino 0.396  (CLIP+DINO additive +0.008)
 # Open question this run answers: does that CLIP gain still hold on top of Gabor?
 #
-# ~2312 cross-attn tokens (vs 1284 in dino4_gabor) → batch 16 / accum 16 (eff 256,
-# same as the other ablations) to stay within a 24 GB GPU; bump batch if the GPU
-# has headroom.
+# POOLED FEATURES: both cross-attn streams use the 65-token pooled files
+# (multilayer4p, 8×8 grid + CLS): CLIP4p (260) + DINO4p (260) + gabor (256)
+# ≈ 776 cross-attn tokens → batch 32 / accum 8 (eff 256) fits a 24 GB GPU.
 #
-# DATA FOOTPRINT: CLIP-4L (29 GB) + DINO-4L (27 GB) train = ~56 GB > typical RAM
-# → page-cache thrashing on HDD will trigger systemd-oomd. Stage BOTH multilayer
-# files on NVMe (symlink the clip/ + dino/ files) before training — see the
-# I/O-bottleneck note.
+# DATA FOOTPRINT: CLIP-4p (7.3 GB) + DINO-4p (6.7 GB) + CLIP source (7.1 GB)
+# ≈ 21 GB ≪ 46 GB RAM → fits page cache even on HDD; no NVMe symlink or
+# systemd-oomd workaround needed.
 # ==============================================================================
 use_source_encoder: true
 eval_use_mean: true
@@ -34,8 +33,8 @@ data:
   subdirs:
     fmri: fmri
     sdxl_clip: clip
-    sdxl_clip_multilayer4: clip
-    dinov2_vitg14_multilayer4: dino
+    sdxl_clip_multilayer4p: clip
+    dinov2_vitg14_multilayer4p: dino
     gabor: gabor
   subject: 1
   fmri_mode: zscore
@@ -46,8 +45,8 @@ data:
   roi_order: true
   avg_reps: true
   context_features:
-  - sdxl_clip_multilayer4
-  - dinov2_vitg14_multilayer4
+  - sdxl_clip_multilayer4p
+  - dinov2_vitg14_multilayer4p
   - gabor
 stage_2:
   target: model.dit_1d.DiT1D
@@ -119,8 +118,8 @@ losses:
 training:
   global_seed: 42
   epochs: 50
-  batch_size: 16
-  grad_accum_steps: 16
+  batch_size: 32
+  grad_accum_steps: 8
   num_workers: 2
   pin_memory: false  # pinned RAM is non-reclaimable → raises memory PSI → systemd-oomd kill
   log_every: 50

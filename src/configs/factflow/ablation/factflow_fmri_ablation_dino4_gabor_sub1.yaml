@@ -16,9 +16,10 @@
 # orthogonal/low-level signal that the project established as the real ceiling
 # lever (see srcdist_v2_gabor ≈ 0.40).
 #
-# Light: ~1284 cross-attn tokens (vs 4112 in clip_dino) → batch 32 fits the 24 GB
-# GPU. Working set ≈ 36 GB (DINO4 28.4 + gabor + CLIP source) ≈ RAM cache, so it
-# may train acceptably on HDD without the NVMe symlink.
+# POOLED FEATURES: cross-attn DINO uses the 65-token pooled file (multilayer4p,
+# 8×8 grid + CLS) → ~340 cross-attn tokens, batch 32 fits the 24 GB GPU. Working
+# set ≈ 6.7 GB (DINO4p) + CLIP source ≈ 14 GB ≪ 46 GB RAM → fits page cache even
+# on HDD; no NVMe symlink / systemd-oomd workaround needed.
 # ==============================================================================
 use_source_encoder: true
 eval_use_mean: true
@@ -27,7 +28,7 @@ data:
   subdirs:
     fmri: fmri
     sdxl_clip: clip
-    dinov2_vitg14_multilayer4: dino
+    dinov2_vitg14_multilayer4p: dino
     gabor: gabor
   subject: 1
   fmri_mode: zscore
@@ -38,7 +39,7 @@ data:
   roi_order: true
   avg_reps: true
   context_features:
-  - dinov2_vitg14_multilayer4
+  - dinov2_vitg14_multilayer4p
   - gabor
 stage_2:
   target: model.dit_1d.DiT1D
