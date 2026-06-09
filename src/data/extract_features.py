@@ -73,6 +73,28 @@ MODEL_CONFIGS = {
         'has_tokens': True,
         'multi_suffix': '_multilayer_'
     },
+    # ── DINOv3 (patch 16, 4 register tokens, RoPE) — weights are gated; load
+    #    a local checkpoint via torch.hub(source='local'). Feature API
+    #    (forward_features / get_intermediate_layers) is identical to DINOv2,
+    #    so these share the 'dinov3' branch that mirrors the 'dinov2' one. ──
+    'dinov3_vitl16': {
+        'model_type': 'dinov3',
+        'model_name': 'dinov3_vitl16',      # embed dim 1024, 24 blocks
+        'file_prefix': 'dinov3_vitl16',
+        'batch_size': 96,
+        'default_layers': None,             # quartile blocks computed dynamically
+        'has_tokens': True,
+        'multi_suffix': '_multilayer_'
+    },
+    'dinov3_vith16plus': {
+        'model_type': 'dinov3',
+        'model_name': 'dinov3_vith16plus',  # embed dim 1280
+        'file_prefix': 'dinov3_vith16plus',
+        'batch_size': 48,
+        'default_layers': None,
+        'has_tokens': True,
+        'multi_suffix': '_multilayer_'
+    },
     'qwen3vl': {
         'model_type': 'qwen3vl',
         'model_name': 'Qwen/Qwen3-VL-Embedding-2B',
@@ -134,6 +156,7 @@ MODEL_CONFIGS = {
 # the subject root, so each feature type stays grouped.
 MODEL_TYPE_SUBDIR = {
     'dinov2': 'dino',
+    'dinov3': 'dino3',
     'sdxl_clip': 'clip',
     'resnet': 'resnet',
     'sam': 'sam',
@@ -156,7 +179,7 @@ class UnifiedImageDataset(Dataset):
         img_path = self.image_paths[idx]
         img = Image.open(img_path)
         
-        if self.model_type in ['dinov2', 'resnet']:
+        if self.model_type in ['dinov2', 'dinov3', 'resnet']:
             img = img.convert('RGB')
             if self.transform_or_processor:
                 img = self.transform_or_processor(img)
@@ -196,6 +219,39 @@ def load_model_and_processor(model_key, model_path_override=None, device='cuda')
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ])
         
+    elif model_type == 'dinov3':
+        # Gated weights → load the cloned repo locally and point at a checkpoint.
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        repo_dir = os.path.abspath(os.path.join(script_dir, '../../NSD/notes/dinov3'))
+        if model_path_override:
+            weights_path = model_path_override
+        else:
+            ckpt_dir = os.path.abspath(os.path.join(script_dir, '../../NSD/checkpoints/dinov3'))
+            weights_path = os.path.join(ckpt_dir, f'{model_name_or_path}_pretrain_lvd1689m.pth')
+        if not os.path.exists(weights_path):
+            print(f"ERROR: DINOv3 weights not found at: {weights_path}")
+            print("DINOv3 weights are gated. Get access, then either:")
+            print("  • HF:   huggingface-cli download facebook/"
+                  f"{model_name_or_path.replace('_', '-')}-pretrain-lvd1689m "
+                  "--local-dir <dir>  (after accepting the license + login)")
+            print("  • Meta: request URLs at "
+                  "https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/ "
+                  "then wget the .pth")
+            print(f"  Then place it at {weights_path} or pass --model_path <path>.")
+            sys.exit(1)
+        print(f"Loading {model_name_or_path} from local repo {repo_dir}\n  weights={weights_path}")
+        model = torch.hub.load(repo_dir, model_name_or_path, source='local', weights=weights_path)
+        model = model.to(device).eval()
+
+        # Standard ImageNet eval transform; 224 is a multiple of the patch size
+        # 16 → 14x14 = 196 patch tokens (perfect square, poolable via --pool_spatial).
+        processor_or_transform = transforms.Compose([
+            transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ])
+
     elif model_type == 'resnet':
         print(f"Loading {model_name_or_path} from torchvision...")
         if model_name_or_path == 'resnet50':
@@ -496,7 +552,7 @@ def main():
     subdir = args.subdir if args.subdir is not None else MODEL_TYPE_SUBDIR.get(model_type, '')
     # DINOv2/CLIP honour --multi_mode: spatial → _multilayer_ (CLS+patch per layer),
     # cls → _multi_ (CLS-only per layer). Other backbones keep their config suffix.
-    if model_type in ('dinov2', 'sdxl_clip'):
+    if model_type in ('dinov2', 'dinov3', 'sdxl_clip'):
         multi_suffix = '_multi_' if args.multi_mode == 'cls' else '_multilayer_'
     else:
         multi_suffix = config['multi_suffix']
@@ -526,7 +582,7 @@ def main():
     
     # Expand the 'all' sentinel to every transformer block now the model is loaded.
     if layers == 'all':
-        if model_type == 'dinov2':
+        if model_type in ('dinov2', 'dinov3'):
             layers = list(range(len(model.blocks)))
         elif model_type == 'sdxl_clip':
             layers = list(range(len(model.model.visual.transformer.resblocks)))
@@ -539,7 +595,7 @@ def main():
         print(f"'all' layers → {len(layers)} blocks: {layers}")
 
     # DINOv2 layers setup if default layers needed calculation
-    if model_type == 'dinov2' and layers is None:
+    if model_type in ('dinov2', 'dinov3') and layers is None:
         num_layers = len(model.blocks)
         step = num_layers // 4
         layers = [step - 1, step * 2 - 1, step * 3 - 1, num_layers - 1]
@@ -553,8 +609,8 @@ def main():
     if pool_factor:
         if args.multi_mode != 'spatial':
             raise ValueError("--pool_spatial requires --multi_mode spatial (it pools the patch grid).")
-        if model_type not in ('dinov2', 'sdxl_clip'):
-            raise ValueError("--pool_spatial only supports the spatial ViT grids of dinov2/sdxl_clip.")
+        if model_type not in ('dinov2', 'dinov3', 'sdxl_clip'):
+            raise ValueError("--pool_spatial only supports the spatial ViT grids of dinov2/dinov3/sdxl_clip.")
         if not isinstance(layers, list):
             raise ValueError("--pool_spatial needs an explicit layer count (pass --layers ...).")
         multi_suffix = f'_multilayer{len(layers)}p_'
@@ -667,7 +723,7 @@ def main():
             dummy_img = dataset[0].unsqueeze(0).to(device)
             intermediate_outputs.clear()
             with torch.no_grad(), torch.amp.autocast('cuda', enabled=(device == 'cuda')):
-                if model_type == 'dinov2':
+                if model_type in ('dinov2', 'dinov3'):
                     output = model.forward_features(dummy_img)
                     cls_token = output['x_norm_clstoken']
                     patch_tokens = output['x_norm_patchtokens']
@@ -767,7 +823,7 @@ def main():
                 with torch.no_grad(), torch.amp.autocast('cuda', enabled=(device == 'cuda')):
                     batch_data = batch_data.to(device)
                     
-                    if model_type == 'dinov2':
+                    if model_type in ('dinov2', 'dinov3'):
                         # Forward pass
                         output = model.forward_features(batch_data)
                         cls_token = output['x_norm_clstoken']
