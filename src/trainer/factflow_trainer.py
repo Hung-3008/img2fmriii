@@ -201,6 +201,11 @@ class FactFlowTrainer:
         self.detach_ut = self.loss_cfg.get("detach_ut", False)
         self.clip_logvar_min = float(self.loss_cfg.get("clip_logvar_min", -10.0))
         self.clip_logvar_max = float(self.loss_cfg.get("clip_logvar_max", 10.0))
+        # Source Transport Consistency (STC): sample two x₀ ~ q(·|c) and enforce
+        # that both 1-step predictions agree — the flow should be deterministic given c.
+        self.use_stc = bool(self.loss_cfg.get("use_stc_loss", False))
+        self.stc_weight = float(self.loss_cfg.get("stc_loss_weight", 0.1))
+        self.stc_add_fm = bool(self.loss_cfg.get("stc_add_fm", True))
         self.use_source = bool(self.cfg.get("use_source_encoder", True))
         # Use the source-encoder mean (μ) instead of a sampled x₀ at eval time.
         self.eval_use_mean = bool(self.cfg.get("eval_use_mean", False))
@@ -418,12 +423,37 @@ class FactFlowTrainer:
             recon_val = self._recon_loss(x1_hat, x1)
             total = total + self.recon_weight * recon_val
 
+        # 8) Source Transport Consistency (STC)
+        # Two independent samples x₀ᵃ, x₀ᵇ ~ q(·|c) must flow to the same x₁:
+        #   L_STC = ||x̂₁ᵇ − sg(x̂₁ᵃ)||²_masked,  x̂₁ = xₜ + (1−t)·v_pred
+        # x̂₁ᵃ is stop-gated (used as a reference target) — its backward graph
+        # is already retained by the FM loss in step 4; we don't need a second
+        # backward through v_pred to save activation memory.
+        # stc_add_fm: also adds the FM loss for x₀ᵇ so v_pred_b is anchored to x₁.
+        stc_val = torch.tensor(0.0, device=self.device)
+        if self.use_stc and self.use_source and log_var is not None:
+            t_view = t.view(B, *([1] * (x1.dim() - 1)))
+            x1_hat_a = (xt + (1.0 - t_view) * v_pred).detach()
+            x0b_tok = self._reparam_source(mu, log_var)
+            x0b = x0b_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
+            _, xtb, utb = self.transport.path_sampler.plan(t, x0b, x1)
+            v_pred_b = self.wrapper.predict_velocity(
+                x=xtb, t=t, y=clip_pool, contexts=ctx,
+            )
+            if self.stc_add_fm:
+                utb_target = utb.detach() if self.detach_ut else utb
+                total = total + masked_mse(v_pred_b, utb_target, self.pad_mask, weight=self.voxel_weight)
+            x1_hat_b = xtb + (1.0 - t_view) * v_pred_b
+            stc_val = masked_mse(x1_hat_b, x1_hat_a, self.pad_mask)
+            total = total + self.stc_weight * stc_val
+
         return {
             "total": total,
             "diff": diff_loss.detach(),
             "kld": kld_val.detach(),
             "align": align_val.detach(),
             "recon": recon_val.detach(),
+            "stc": stc_val.detach(),
         }
 
     def _recon_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -599,7 +629,7 @@ class FactFlowTrainer:
         history_writer = csv.writer(history_file)
         if not history_exists:
             history_writer.writerow([
-                "epoch", "step", "train_loss", "train_diff", "train_kld", "train_align", "train_recon", "val_mse", "val_voxel_r", "lr",
+                "epoch", "step", "train_loss", "train_diff", "train_kld", "train_align", "train_recon", "train_stc", "val_mse", "val_voxel_r", "lr",
             ])
             history_file.flush()
 
@@ -609,16 +639,19 @@ class FactFlowTrainer:
         running_kld = 0.0
         running_align = 0.0
         running_recon = 0.0
+        running_stc = 0.0
         epoch_loss = 0.0     # since last validation
         epoch_diff = 0.0
         epoch_kld = 0.0
         epoch_align = 0.0
         epoch_recon = 0.0
+        epoch_stc = 0.0
         step_loss = 0.0      # current optimizer step (across micro-batches)
         step_diff = 0.0
         step_kld = 0.0
         step_align = 0.0
         step_recon = 0.0
+        step_stc = 0.0
         epoch_steps = 0
         log_steps = 0
         accum_counter = 0
@@ -663,18 +696,21 @@ class FactFlowTrainer:
                 micro_kld = losses["kld"].item() / self.grad_accum
                 micro_align = losses["align"].item() / self.grad_accum
                 micro_recon = losses["recon"].item() / self.grad_accum
+                micro_stc = losses["stc"].item() / self.grad_accum
 
                 running_loss += micro_loss
                 running_diff += micro_diff
                 running_kld += micro_kld
                 running_align += micro_align
                 running_recon += micro_recon
+                running_stc += micro_stc
 
                 step_loss += micro_loss
                 step_diff += micro_diff
                 step_kld += micro_kld
                 step_align += micro_align
                 step_recon += micro_recon
+                step_stc += micro_stc
 
                 if accum_counter < self.grad_accum:
                     continue
@@ -697,6 +733,7 @@ class FactFlowTrainer:
                 epoch_kld += step_kld
                 epoch_align += step_align
                 epoch_recon += step_recon
+                epoch_stc += step_stc
                 epoch_steps += 1
 
                 step_loss = 0.0
@@ -704,6 +741,7 @@ class FactFlowTrainer:
                 step_kld = 0.0
                 step_align = 0.0
                 step_recon = 0.0
+                step_stc = 0.0
 
                 # ── Periodic logging ──
                 if self.train_steps % self.log_every == 0:
@@ -711,11 +749,12 @@ class FactFlowTrainer:
                     sps = log_steps / elapsed if elapsed > 0 else 0
                     lr = self.scheduler.get_last_lr()[0]
                     self.logger.info(
-                        "[step=%07d ep=%d] loss=%.5f (diff=%.5f kld=%.5f align=%.5f recon=%.5f) lr=%.2e steps/s=%.1f",
+                        "[step=%07d ep=%d] loss=%.5f (diff=%.5f kld=%.5f align=%.5f recon=%.5f stc=%.5f) lr=%.2e steps/s=%.1f",
                         self.train_steps, epoch,
                         running_loss / log_steps,
                         running_diff / log_steps, running_kld / log_steps,
                         running_align / log_steps, running_recon / log_steps,
+                        running_stc / log_steps,
                         lr, sps,
                     )
                     running_loss = 0.0
@@ -723,6 +762,7 @@ class FactFlowTrainer:
                     running_kld = 0.0
                     running_align = 0.0
                     running_recon = 0.0
+                    running_stc = 0.0
                     log_steps = 0
                     wall_start = time()
 
@@ -769,6 +809,7 @@ class FactFlowTrainer:
                     f"{epoch_kld / ep_n:.6f}",
                     f"{epoch_align / ep_n:.6f}",
                     f"{epoch_recon / ep_n:.6f}",
+                    f"{epoch_stc / ep_n:.6f}",
                     f"{val['mse']:.6f}",
                     f"{val['voxel_r']:.6f}",
                     f"{lr:.2e}",
@@ -781,6 +822,7 @@ class FactFlowTrainer:
                 epoch_kld = 0.0
                 epoch_align = 0.0
                 epoch_recon = 0.0
+                epoch_stc = 0.0
                 epoch_steps = 0
 
                 # Save best checkpoint by voxel-wise Pearson r
