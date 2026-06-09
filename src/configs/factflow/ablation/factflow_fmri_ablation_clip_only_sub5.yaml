@@ -1,6 +1,6 @@
 # ==============================================================================
 # Ablation: CLIP-ONLY (every feature path fed by sdxl_clip / ViT-bigG-14)
-# Subject 1
+# Subject 5
 # ------------------------------------------------------------------------------
 # All three feature paths come from CLIP:
 #   - source encoder (PerceiverVE)  ← clip_tokens = sdxl_clip          (256, 1664)
@@ -15,11 +15,11 @@ data:
     fmri: fmri
     sdxl_clip: clip
     sdxl_clip_multilayer4p: clip
-  subject: 1
+  subject: 5
   fmri_mode: zscore
   clip_feature: sdxl_clip
-  n_voxels: 15724
-  pad_to: 15744
+  n_voxels: 13039
+  pad_to: 16384
   auto_pad: true
   roi_order: true
   avg_reps: true
@@ -28,7 +28,7 @@ data:
 stage_2:
   target: model.dit_1d.DiT1D
   params:
-    seq_len: 15744
+    seq_len: 16384
     patch_size: 32
     in_channels: 1
     hidden_size: 512
@@ -53,7 +53,7 @@ source_encoder:
     num_heads: 8
     mlp_ratio: 4.0
     dropout_prob: 0.0
-    num_queries: 246
+    num_queries: 256
     max_input_len: 256
     pos_emb_type: learned
     use_qknorm: false
@@ -69,7 +69,7 @@ transport:
     prediction: velocity
     loss_weight: null
     time_dist_type: logit-normal_-1.0_1.0
-    time_dist_shift: 15744
+    time_dist_shift: 16384
 sampler:
   mode: ODE
   params:

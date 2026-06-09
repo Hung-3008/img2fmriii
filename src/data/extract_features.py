@@ -223,11 +223,12 @@ def load_model_and_processor(model_key, model_path_override=None, device='cuda')
         processor_or_transform = SamProcessor.from_pretrained(model_name_or_path)
         model = SamModel.from_pretrained(model_name_or_path)
         model = model.to(device).eval()
-        
     elif model_type == 'sdxl_clip':
         # Append SGM path
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        sgm_path = os.path.abspath(os.path.join(script_dir, '../../NSD/notes/SynBrain/src/sdxl'))
+        sgm_path = os.path.abspath(os.path.join(script_dir, '../../reproduces/SynBrain/src/sdxl'))
+        if not os.path.exists(sgm_path):
+            sgm_path = os.path.abspath(os.path.join(script_dir, '../../NSD/notes/SynBrain/src/sdxl'))
         if sgm_path not in sys.path:
             sys.path.append(sgm_path)
             
