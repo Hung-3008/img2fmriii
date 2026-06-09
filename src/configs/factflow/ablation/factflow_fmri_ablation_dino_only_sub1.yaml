@@ -54,7 +54,7 @@ source_encoder:
     mlp_ratio: 4.0
     dropout_prob: 0.0
     num_queries: 246
-    max_input_len: 256
+    max_input_len: 257
     pos_emb_type: learned
     use_qknorm: false
     use_swiglu: true
