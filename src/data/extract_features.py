@@ -223,24 +223,25 @@ def load_model_and_processor(model_key, model_path_override=None, device='cuda')
         # Gated weights → load the cloned repo locally and point at a checkpoint.
         script_dir = os.path.dirname(os.path.abspath(__file__))
         repo_dir = os.path.abspath(os.path.join(script_dir, '../../NSD/notes/dinov3'))
+        config_model_name = config['model_name']
         if model_path_override:
             weights_path = model_path_override
         else:
             ckpt_dir = os.path.abspath(os.path.join(script_dir, '../../NSD/checkpoints/dinov3'))
-            weights_path = os.path.join(ckpt_dir, f'{model_name_or_path}_pretrain_lvd1689m.pth')
+            weights_path = os.path.join(ckpt_dir, f'{config_model_name}_pretrain_lvd1689m-8aa4cbdd.pth')
         if not os.path.exists(weights_path):
             print(f"ERROR: DINOv3 weights not found at: {weights_path}")
             print("DINOv3 weights are gated. Get access, then either:")
             print("  • HF:   huggingface-cli download facebook/"
-                  f"{model_name_or_path.replace('_', '-')}-pretrain-lvd1689m "
+                  f"{config_model_name.replace('_', '-')}-pretrain-lvd1689m "
                   "--local-dir <dir>  (after accepting the license + login)")
             print("  • Meta: request URLs at "
                   "https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/ "
                   "then wget the .pth")
             print(f"  Then place it at {weights_path} or pass --model_path <path>.")
             sys.exit(1)
-        print(f"Loading {model_name_or_path} from local repo {repo_dir}\n  weights={weights_path}")
-        model = torch.hub.load(repo_dir, model_name_or_path, source='local', weights=weights_path)
+        print(f"Loading {config_model_name} from local repo {repo_dir}\n  weights={weights_path}")
+        model = torch.hub.load(repo_dir, config_model_name, source='local', weights=weights_path)
         model = model.to(device).eval()
 
         # Standard ImageNet eval transform; 224 is a multiple of the patch size
