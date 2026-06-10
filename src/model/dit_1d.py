@@ -20,6 +20,7 @@ from .model_utils import (
     GaussianFourierEmbedding,
     RMSNorm,
     RotaryEmbedding1D,
+    StreamRouter,
     get_1d_sincos_pos_embed,
     modulate,
 )
@@ -102,6 +103,10 @@ class DiT1D(nn.Module):
         y_token_channels: int = 1664,
         y_token_channels_2: int = None,
         context_dims=None,
+        # ── ROI-Stratified Feature Routing ───────────────────
+        use_roi_routing: bool = False,
+        n_roi_buckets: int = 3,
+        roi_emb_dim: int = 64,
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -114,6 +119,7 @@ class DiT1D(nn.Module):
         self.learn_sigma = learn_sigma
         self.depth = depth
         self.use_cross_attn = use_cross_attn
+        self.use_roi_routing = use_roi_routing and use_cross_attn
 
         num_patches = seq_len // patch_size
 
@@ -122,12 +128,12 @@ class DiT1D(nn.Module):
         self.t_embedder = GaussianFourierEmbedding(hidden_size)
         self.y_embedder = VectorEmbedder(y_in_channels, hidden_size)
 
-        # ── Context stems: feature tokens → hidden for cross-attention ─
+        # ── Context stems ───────────────────────────────────────
         # One embedder per context stream (CLIP, DINOv2, multi-layer DINOv2,
-        # Gabor, …). Each stream is projected once and the results are
-        # concatenated along the token axis into one shared context sequence.
-        # ``context_dims`` is the per-stream input dim; falls back to the legacy
-        # [y_token_channels (+ y_token_channels_2)] pair for old configs.
+        # Gabor, …). When use_roi_routing is False, results are concatenated
+        # along the token axis into one shared context sequence (legacy).
+        # When use_roi_routing is True, streams stay separate so each block
+        # can attend to them independently with learned per-patch gates.
         self.context_embedders = None
         if use_cross_attn:
             if context_dims is None:
@@ -139,6 +145,27 @@ class DiT1D(nn.Module):
                 nn.Sequential(nn.Linear(int(d), hidden_size), RMSNorm(hidden_size))
                 for d in self.context_dims
             ])
+
+        # ── ROI-Stratified Feature Routing ──────────────────────
+        # StreamRouter maps ROI bucket id → soft gate over n_streams.
+        # bucket_ids is a (1, N) buffer of patch-level ROI bucket indices,
+        # populated once via set_roi_buckets() before training starts.
+        self.stream_router = None
+        if self.use_roi_routing:
+            n_streams = len(self.context_dims)
+            self.stream_router = StreamRouter(
+                n_streams=n_streams,
+                n_buckets=n_roi_buckets,
+                emb_dim=roi_emb_dim,
+            )
+            # Placeholder; will be filled by set_roi_buckets()
+            self.register_buffer(
+                "bucket_ids",
+                torch.zeros(1, num_patches, dtype=torch.long),
+                persistent=True,
+            )
+        else:
+            self.bucket_ids = None
 
         # 1D positional embedding (fixed sin-cos)
         self.pos_embed = nn.Parameter(
@@ -152,7 +179,8 @@ class DiT1D(nn.Module):
         else:
             self.feat_rope = None
 
-        # ── Transformer blocks (reuse LightningDiTBlock) ─────────────
+        # ── Transformer blocks ───────────────────────────────────
+        n_streams_routed = len(context_dims) if (use_cross_attn and self.use_roi_routing) else 0
         self.blocks = nn.ModuleList([
             LightningDiTBlock(
                 hidden_size, num_heads,
@@ -162,6 +190,7 @@ class DiT1D(nn.Module):
                 use_rmsnorm=use_rmsnorm,
                 wo_shift=wo_shift,
                 use_cross_attn=use_cross_attn,
+                n_streams_routed=n_streams_routed,
             ) for _ in range(depth)
         ])
 
@@ -210,11 +239,17 @@ class DiT1D(nn.Module):
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
         # Zero-out cross-attention output proj → block starts as pooled-only
-        # DiT, then learns to use the CLIP-token context.
+        # DiT, then learns to use context.  Handles both legacy (cross_attn)
+        # and routed (cross_attns) paths.
         for block in self.blocks:
             if getattr(block, "use_cross_attn", False):
-                nn.init.constant_(block.cross_attn.proj.weight, 0)
-                nn.init.constant_(block.cross_attn.proj.bias, 0)
+                if block.cross_attn is not None:
+                    nn.init.constant_(block.cross_attn.proj.weight, 0)
+                    nn.init.constant_(block.cross_attn.proj.bias, 0)
+                if hasattr(block, "cross_attns"):
+                    for ca in block.cross_attns:
+                        nn.init.constant_(ca.proj.weight, 0)
+                        nn.init.constant_(ca.proj.bias, 0)
 
     def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -228,11 +263,51 @@ class DiT1D(nn.Module):
         x = x.reshape(B, c, N * p)    # (B, C, N*P) = (B, C, seq_len)
         return x
 
+    def set_roi_buckets(
+        self,
+        voxel_bucket_ids: np.ndarray,
+        pad_to: int,
+        n_roi_buckets: int,
+    ) -> None:
+        """Precompute and cache patch-level ROI bucket IDs.
+
+        Called once after the model is built, before training begins.
+        Aggregates voxel-level bucket ids to patch level by majority-vote
+        (mean → round), then stores as a ``(1, N)`` buffer on the model device.
+
+        Args:
+            voxel_bucket_ids: int array (n_voxels,) — ROI bucket per voxel
+                              in the sorted (roi_order) space.
+            pad_to:           padded sequence length (must match self.seq_len)
+            n_roi_buckets:    total number of buckets (clips values to [0, n-1])
+        """
+        if self.stream_router is None:
+            return
+        P = self.patch_size
+        # Pad to seq_len with bucket 0 (early visual — conservative default)
+        padded = np.zeros(pad_to, dtype=np.float32)
+        padded[: len(voxel_bucket_ids)] = voxel_bucket_ids.astype(np.float32)
+        # Reshape to (N, P) → mean per patch → round → clip
+        n_patches = pad_to // P
+        patch_buckets = padded.reshape(n_patches, P).mean(axis=1).round().astype(np.int64)
+        patch_buckets = np.clip(patch_buckets, 0, n_roi_buckets - 1)
+        buf = torch.from_numpy(patch_buckets).long().unsqueeze(0)  # (1, N)
+        # Store on same device as model
+        self.bucket_ids = buf.to(self.pos_embed.device)
+        self.register_buffer("bucket_ids", self.bucket_ids, persistent=True)
+
     def _embed_contexts(self, contexts):
-        """Project each context stream to hidden and concat along the token axis."""
+        """Project each context stream to hidden dim.
+
+        Returns:
+            If use_roi_routing: list of (B, M_s, D) tensors (one per stream)
+            Else: single (B, M_total, D) tensor (legacy concatenation)
+        """
         if not self.use_cross_attn or contexts is None or self.context_embedders is None:
             return None
         embedded = [emb(c) for emb, c in zip(self.context_embedders, contexts)]
+        if self.use_roi_routing:
+            return embedded               # keep separate for per-stream cross-attn
         return torch.cat(embedded, dim=1) if len(embedded) > 1 else embedded[0]
 
     def forward(self, x, t=None, y=None, contexts=None):
@@ -244,13 +319,14 @@ class DiT1D(nn.Module):
             t: (B,) — diffusion timestep
             y: (B, D_pool) — CLIP pooled conditioning
             contexts: list of (B, Mᵢ, Dᵢ) cross-attention streams (CLIP, DINOv2,
-                     multi-layer DINOv2, Gabor, …), embedded per-stream and
-                     concatenated along the token axis (only used when
-                     ``use_cross_attn=True``).
+                     multi-layer DINOv2, Gabor, …).  In legacy mode these are
+                     embedded and concatenated; in ROI-routing mode they stay
+                     separate and are gated per patch position.
 
         Returns:
             (B, C, L) — predicted velocity
         """
+        B = x.shape[0]
         x = self.x_embedder(x) + self.pos_embed   # (B, N, D)
         t = self.t_embedder(t)                      # (B, D)
         y = self.y_embedder(y)                      # (B, D)
@@ -258,8 +334,16 @@ class DiT1D(nn.Module):
 
         ctx = self._embed_contexts(contexts)
 
-        for block in self.blocks:
-            x = block(x, c, feat_rope=self.feat_rope, context=ctx)
+        if self.use_roi_routing and self.stream_router is not None:
+            # Expand bucket_ids to batch dimension: (1, N) → (B, N)
+            bids = self.bucket_ids.expand(B, -1)          # (B, N)
+            stream_gates = self.stream_router(bids)        # (B, N, S)
+            for block in self.blocks:
+                x = block(x, c, feat_rope=self.feat_rope,
+                          contexts_list=ctx, stream_gates=stream_gates)
+        else:
+            for block in self.blocks:
+                x = block(x, c, feat_rope=self.feat_rope, context=ctx)
 
         x = self.final_layer(x, c)   # (B, N, P*C)
         x = self.unpatchify(x)       # (B, C, L)

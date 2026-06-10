@@ -523,3 +523,56 @@ class LabelEmbedder(nn.Module):
             labels = self.token_drop(labels, force_drop_ids)
         embeddings = self.embedding_table(labels)
         return embeddings
+
+
+class StreamRouter(nn.Module):
+    """ROI-Stratified Feature Routing (RFR).
+
+    Learns a soft gate matrix G ∈ R^{n_buckets × n_streams} that controls how
+    much each context stream contributes to each ROI bucket's cross-attention
+    output.  Biologically: early visual patches (V1/V2/V3) are expected to
+    up-weight low-level streams (Gabor), while higher visual areas (FFA, OPA)
+    should up-weight semantic streams (DINOv2).
+
+    The gate is initialised to uniform (1/n_streams) so the model starts
+    identical to homogeneous cross-attention and learns the routing end-to-end.
+
+    Args:
+        n_streams:  number of separate context streams (e.g. 2: DINO, Gabor)
+        n_buckets:  number of ROI hierarchy levels (e.g. 3: early/mid/high)
+        hidden_size: DiT hidden dimension (used only for the gate embed MLP)
+        emb_dim:    internal ROI embedding dimension (default 64)
+
+    Usage inside a DiT block::
+
+        # pre-compute once per forward (outside the block loop):
+        gates = stream_router(bucket_ids)   # (B, N, n_streams)
+
+        # inside cross-attention:
+        outs = [cross_attn_s(norm(x), ctx_s) for ctx_s in ctx_list]   # n_streams × (B,N,D)
+        x = x + sum(gates[..., s:s+1] * outs[s] for s in range(n_streams))
+    """
+
+    def __init__(self, n_streams: int, n_buckets: int, emb_dim: int = 64):
+        super().__init__()
+        self.n_streams = n_streams
+        self.n_buckets = n_buckets
+        # Learnable ROI-level embedding → gate logits
+        self.bucket_emb = nn.Embedding(n_buckets, emb_dim)
+        self.gate_proj  = nn.Linear(emb_dim, n_streams, bias=True)
+        # Initialise gate to uniform so model starts as homogeneous cross-attn
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.constant_(self.gate_proj.bias, 1.0 / n_streams)
+
+    def forward(self, bucket_ids: torch.Tensor) -> torch.Tensor:
+        """Compute per-patch stream gates.
+
+        Args:
+            bucket_ids: (B, N) long tensor — ROI bucket index for each patch
+
+        Returns:
+            gates: (B, N, n_streams) float, softmax-normalised
+        """
+        emb    = self.bucket_emb(bucket_ids)           # (B, N, emb_dim)
+        logits = self.gate_proj(emb)                   # (B, N, n_streams)
+        return torch.softmax(logits * self.n_streams, dim=-1)  # (B, N, S)

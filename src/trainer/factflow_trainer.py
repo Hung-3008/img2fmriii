@@ -1,32 +1,33 @@
 """
 factflow_trainer.py
 ===================
-Training orchestrator for FactFlow-based fMRI synthesis.
+Training orchestrator for FactFlow fMRI synthesis (no-source flow matching).
 
-Pipeline:  CLIP image features → PerceiverVE (learned source x₀)
-           → Flow Matching (velocity matching) → fMRI voxels
+Pipeline:  Gaussian noise x₀  →  Flow Matching (velocity matching),
+           conditioned on CLIP-pooled (AdaLN) + cross-attention image features
+           (DINOv2, Gabor, …)  →  fMRI voxels.
 
-Adapted from the CSFM paper's training logic with:
-  - No RAE / stage-1 encoder — operates directly on fMRI voxels
-  - No CLIP text encoder — uses pre-extracted CLIP visual features
-  - Masked loss on padded voxels
-  - Single-GPU training
-  - Pearson correlation evaluation
+Details:
+  - Standard flow matching: x₀ ~ N(0, I), velocity-MSE objective.
+  - No source encoder, no auxiliary losses — just a (masked, SNR-weighted)
+    velocity loss on the real voxels.
+  - Validation against rep-averaged GT with noise_scale=0 (deterministic ceiling):
+    reports both voxel-wise (encoding) Pearson r and profile (pattern) Pearson r.
+    best.pt is selected by profile_r (directly comparable to SynBrain / published baselines).
+  - Single-GPU, bf16-capable.
 """
 
 from __future__ import annotations
 
 import csv
-import math
 import os
 from argparse import Namespace
 from time import time
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 from torch import autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -41,50 +42,13 @@ from utils.checkpoint import (
 )
 from utils.fmri_utils import auto_size_config, create_pad_mask, get_latent_size
 from utils.logging_utils import create_logger
-from utils.metrics import masked_mse, voxel_pearson, compute_voxel_reliability
+from utils.metrics import (
+    masked_mse,
+    pearson_corr_per_sample,
+    voxel_pearson,
+    compute_voxel_reliability,
+)
 from utils.training_utils import build_optimizer_and_scheduler
-
-# ── KLD losses (self-contained) ──────────────────────
-
-
-def _kld_loss(
-    mu: torch.Tensor,
-    log_var: torch.Tensor,
-    loss_type: str,
-    reduction: str = "mean",
-    target_std: float = 1.0,
-) -> torch.Tensor:
-    """KL-divergence regularisation on the variational source encoder.
-
-    Supports:
-      - ``"kld"``:     standard KLD: 𝔼[-½(1 + logσ² - μ² - σ²)]
-      - ``"naive_kld"``: stability variant: replaces μ² with (0.3μ)⁶
-      - ``"var_kld"``:  variance-only KLD (ignores μ term)
-    """
-    var = log_var.exp()
-    if target_std != 1.0:
-        sigma2_star = target_std ** 2
-        var = var / sigma2_star
-        log_var = log_var - math.log(sigma2_star)
-
-    if loss_type == "kld":
-        raw = -0.5 * (1 + log_var - mu ** 2 - var)
-    elif loss_type == "naive_kld":
-        raw = -0.5 * (1 + log_var - (0.3 * mu) ** 6 - var)
-    elif loss_type == "var_kld":
-        raw = -0.5 * (1 + log_var - var)
-    else:
-        raise ValueError(f"Unknown KLD type: {loss_type}")
-
-    if reduction == "mean":
-        return raw.mean()
-    elif reduction == "sum":
-        return raw.flatten(1).sum(1).mean()
-    else:
-        raise ValueError(f"Unknown reduction: {reduction}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 
 
 class FactFlowTrainer:
@@ -93,13 +57,12 @@ class FactFlowTrainer:
     def __init__(self, args: Namespace) -> None:
         # ── Config ────────────────────────────────────────────────────
         self.cfg = OmegaConf.load(args.config)
-        # Per-subject native sizing: derive pad_to/seq_len/num_queries from
-        # n_voxels (no-op unless data.auto_pad is set). Must run before the
-        # containers below and before the config snapshot is saved.
+        # Per-subject native sizing: derive pad_to/seq_len from n_voxels
+        # (no-op unless data.auto_pad is set). Must run before the containers
+        # below and before the config snapshot is saved.
         self._autosize_msg = auto_size_config(self.cfg)
         self.data_cfg = OmegaConf.to_container(self.cfg.data, resolve=True)
         self.train_cfg = OmegaConf.to_container(self.cfg.training, resolve=True)
-        self.loss_cfg = OmegaConf.to_container(self.cfg.losses, resolve=True)
         self.args = args
 
         # ROI voxel ordering: reorder voxels so same-ROI voxels are contiguous
@@ -129,7 +92,6 @@ class FactFlowTrainer:
         if self._autosize_msg:
             self.logger.info(self._autosize_msg)
 
-        # Save config snapshot
         cfg_path = os.path.join(self.exp_dir, "config.yaml")
         if not os.path.exists(cfg_path):
             OmegaConf.save(self.cfg, cfg_path)
@@ -143,13 +105,17 @@ class FactFlowTrainer:
             self.data_cfg["n_voxels"], self.data_cfg["pad_to"], self.device,
         )
 
-        # ── Models ────────────────────────────────────────────────────
+        # ── Model / transport / sampler ───────────────────────────────
         self.wrapper = build_models(self.cfg, self.device)
         self.transport = build_transport(self.cfg, self.latent_size)
         self.sample_fn = build_sampler(self.transport, self.cfg.sampler)
 
+        # ── ROI-Stratified Feature Routing setup ─────────────────────
+        # Must run after model build (needs dit.set_roi_buckets) and after
+        # dataset build (needs sort_idx from train_ds).
+        self._setup_roi_routing()
+
         # ── Optimizer & scheduler ─────────────────────────────────────
-        batch_size = int(self.train_cfg.get("batch_size", 64))
         self.grad_accum = int(self.train_cfg.get("grad_accum_steps", 1))
         self.steps_per_epoch = max(len(self.train_loader) // self.grad_accum, 1)
         self.epochs = int(self.train_cfg.get("epochs", 200))
@@ -168,8 +134,9 @@ class FactFlowTrainer:
         # ── State ─────────────────────────────────────────────────────
         self.train_steps = 0
         self.start_epoch = 0
-        self.best_voxel_r = -1.0
-
+        # Best-checkpoint criterion: profile_r (per-image pattern correlation),
+        # which is directly comparable to SynBrain / MindSimulator baselines.
+        self.best_metric = -1.0   # tracks best val_profile_r
         self._maybe_resume()
 
         # ── Training hyper-params ─────────────────────────────────────
@@ -185,47 +152,97 @@ class FactFlowTrainer:
         self.sample_every = int(self.train_cfg.get("sample_every", 2000))
         self.val_every = int(self.train_cfg.get("val_every", 1))
 
-        # Loss config shortcuts
-        self.use_kld = self.loss_cfg.get("use_kld_loss", True)
-        self.kld_weight = float(self.loss_cfg.get("kld_loss_weight", 5.0))
-        self.kld_type = self.loss_cfg.get("kld_loss_type", "var_kld")
-        self.kld_reduction = self.loss_cfg.get("kld_reduction", "mean")
-        self.kld_target_std = float(self.loss_cfg.get("kld_target_std", 1.0))
-        self.use_align = self.loss_cfg.get("use_align_loss", True)
-        self.align_weight = float(self.loss_cfg.get("align_loss_weight", 1.0))
-        self.align_type = self.loss_cfg.get("align_loss_type", "normalized_l2")
-        # Correlation-aware reconstruction loss in x̂₁ space (metric-aligned).
-        self.use_recon = bool(self.loss_cfg.get("use_recon_loss", False))
-        self.recon_weight = float(self.loss_cfg.get("recon_loss_weight", 0.0))
-        self.recon_type = self.loss_cfg.get("recon_loss_type", "pearson")
-        self.detach_ut = self.loss_cfg.get("detach_ut", False)
-        self.clip_logvar_min = float(self.loss_cfg.get("clip_logvar_min", -10.0))
-        self.clip_logvar_max = float(self.loss_cfg.get("clip_logvar_max", 10.0))
-        # Source Transport Consistency (STC): sample two x₀ ~ q(·|c) and enforce
-        # that both 1-step predictions agree — the flow should be deterministic given c.
-        self.use_stc = bool(self.loss_cfg.get("use_stc_loss", False))
-        self.stc_weight = float(self.loss_cfg.get("stc_loss_weight", 0.1))
-        self.stc_add_fm = bool(self.loss_cfg.get("stc_add_fm", True))
-        self.use_source = bool(self.cfg.get("use_source_encoder", True))
-        # Use the source-encoder mean (μ) instead of a sampled x₀ at eval time.
-        self.eval_use_mean = bool(self.cfg.get("eval_use_mean", False))
-        # Scale factor for Gaussian x₀ at eval time when use_source=False.
-        # 1.0 = full noise (default), 0.01 = near-zero (analogous to eval_use_mean).
+        # Stochastic noise scale used by _inline_eval (quick sanity check).
+        # _validate() always uses noise_scale=0 (deterministic ceiling) so that
+        # best.pt reflects the true model capacity, independent of K-averaging.
         self.eval_noise_scale = float(self.cfg.get("eval_noise_scale", 1.0))
 
-        # ── Cross-attention conditioning (CLIP / DINOv2 tokens → DiT) ──
+        # Cross-attention conditioning (DINOv2 / Gabor tokens → DiT).
         self.use_cross_attn = bool(
             self.cfg.stage_2.get("params", {}).get("use_cross_attn", False)
         )
 
-        # ── SNR-weighted voxel loss ───────────────────────────────────
+        # Per-voxel SNR (noise-ceiling) weight for the velocity loss.
         self.voxel_weight = self._build_voxel_weight()
 
         self.wrapper.train()
 
+    def _setup_roi_routing(self) -> None:
+        """Build patch-level ROI bucket IDs and register them in the DiT.
+
+        Only active when ``use_roi_routing: true`` is set in the config.
+        ROI bucket assignment follows the NSD visual hierarchy (streams atlas):
+
+            0 = early visual   (V1v/d, V2v/d, V3v/d)
+            1 = mid visual     (V3A, V3B, hV4, VO1, VO2)
+            2 = high visual    (everything else: LO, PFS, FBA, FFA, OPA, …)
+
+        The voxels are in ROI-sorted order (roi_order=True in config), so the
+        atlas labels from roi_meta must be permuted via sort_idx before mapping
+        to patch space.
+        """
+        dit = self.wrapper.dit
+        if not getattr(dit, "use_roi_routing", False):
+            return
+
+        n_roi_buckets = int(self.cfg.stage_2.params.get("n_roi_buckets", 3))
+        dc = self.data_cfg
+        subject = dc["subject"]
+        roi_path = os.path.join(
+            dc["data_dir"], f"subj0{subject}", f"roi_meta_sub{subject}.npz"
+        )
+        meta = np.load(roi_path)
+
+        # ``roi_labels`` is an integer array (n_voxels,) with streams atlas IDs.
+        # Fallback: use sort_idx position as a proxy bucket if label absent.
+        if "roi_labels" in meta:
+            roi_labels = meta["roi_labels"].astype(np.int64)  # (n_voxels,)
+            # Map streams atlas labels → 3 visual hierarchy buckets.
+            # Verified mapping from roi_meta_sub1.npz:
+            #   0        : unlabeled (nsdgeneral outside named ROIs)  → high (2)
+            #   1-6      : V1v,V1d,V2v,V2d,V3v,V3d                   → early (0)
+            #   7-15     : V3A,V3B,V3CD,V4,hV4,VO1,VO2,PHC1,PHC2     → mid   (1)
+            #   16-34    : LO,PFS,OPA,PPA,RSC,OFA,FFA,FBA,IPS…        → high  (2)
+            bucket = np.full_like(roi_labels, 2)                       # default: high
+            bucket[(roi_labels >= 1) & (roi_labels <= 6)] = 0          # early V1/V2/V3
+            bucket[(roi_labels >= 7) & (roi_labels <= 15)] = 1         # mid V3A-PHC
+        else:
+            # No label info: divide voxels into equal thirds by sorted position
+            n_voxels = dc["n_voxels"]
+            bucket = np.zeros(n_voxels, dtype=np.int64)
+            third = n_voxels // 3
+            bucket[third:2*third] = 1
+            bucket[2*third:] = 2
+            self.logger.warning(
+                "roi_meta has no 'roi_labels' key — using positional thirds "
+                "as ROI buckets (less accurate)."
+            )
+
+        # Apply same sort permutation as applied to fMRI voxels in the dataset
+        if self.roi_order and self.train_ds.sort_idx is not None:
+            bucket = bucket[self.train_ds.sort_idx]  # now in sorted voxel order
+
+        dit.set_roi_buckets(
+            voxel_bucket_ids=bucket,
+            pad_to=dc["pad_to"],
+            n_roi_buckets=n_roi_buckets,
+        )
+        self.logger.info(
+            "ROI routing ON: buckets=%d  early=%d  mid=%d  high=%d  patches=%d",
+            n_roi_buckets,
+            int((bucket == 0).sum()), int((bucket == 1).sum()),
+            int((bucket == 2).sum()),
+            dc["pad_to"] // self.data_cfg.get("patch_size",
+                self.cfg.stage_2.params.get("patch_size", 32)),
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Voxel SNR weight
+    # ──────────────────────────────────────────────────────────────────
+
     def _build_voxel_weight(self) -> Optional[torch.Tensor]:
         """Per-voxel noise-ceiling weight over ``pad_to`` (None if disabled)."""
-        if not self.loss_cfg.get("use_snr_weight", False):
+        if not self.cfg.get("losses", {}).get("use_snr_weight", False):
             return None
         nc = compute_voxel_reliability(
             self.train_ds.fmri_data, self.train_ds.n_reps,
@@ -237,8 +254,7 @@ class FactFlowTrainer:
         w = np.zeros(self.data_cfg["pad_to"], dtype=np.float64)
         w[: self.data_cfg["n_voxels"]] = nc
         # Normalise so the mean weight over real voxels is 1 (keeps loss scale).
-        real = w[: self.data_cfg["n_voxels"]]
-        mean_w = real.mean()
+        mean_w = w[: self.data_cfg["n_voxels"]].mean()
         if mean_w > 0:
             w = w / mean_w
         self.logger.info(
@@ -271,19 +287,16 @@ class FactFlowTrainer:
             subdirs=dc.get("subdirs", None),
         )
         self.train_ds = FactFlowfMRIDataset(mode="train", **ds_kwargs)
-        self.test_ds  = FactFlowfMRIDataset(mode="test",  **ds_kwargs)
+        self.test_ds = FactFlowfMRIDataset(mode="test", **ds_kwargs)
 
         # Single source of truth: the dataset's loaded context streams define the
         # per-stream embedder dims, injected into the DiT config before build.
         self.cfg.stage_2.params.context_dims = list(self.train_ds.context_dims)
 
-        # ── Rep-averaged validation dataset ───────────────────────────
-        # Always validate against rep-averaged GT (mean of 3 reps) so that:
-        #   - ceiling R ≈ 0.620  (vs single-trial ceiling R ≈ 0.148)
-        #   - metric is meaningful and comparable to published benchmarks
-        # This is independent of whether training uses avg_reps or not.
-        val_kwargs = {**ds_kwargs, "avg_reps": True}
-        self.val_ds = FactFlowfMRIDataset(mode="test", **val_kwargs)
+        # Always validate against rep-averaged GT (mean of 3 reps): removes
+        # measurement noise so the metric reflects true signal (ceiling R ≈ 0.62)
+        # and is comparable to published NSD benchmarks.
+        self.val_ds = FactFlowfMRIDataset(mode="test", **{**ds_kwargs, "avg_reps": True})
 
         batch_size = int(self.train_cfg.get("batch_size", 64))
         num_workers = int(self.train_cfg.get("num_workers", 4))
@@ -310,7 +323,6 @@ class FactFlowTrainer:
 
     def _maybe_resume(self) -> None:
         ckpt_path: Optional[str] = None
-
         if self.args.ckpt:
             ckpt_path = self.args.ckpt
         elif self.args.resume_last:
@@ -326,298 +338,121 @@ class FactFlowTrainer:
             )
             self.train_steps = info["train_steps"]
             self.start_epoch = info["epoch"]
-            self.best_voxel_r = info["best_val_pcc"]
+            self.best_metric = info["best_val_pcc"]
 
     # ──────────────────────────────────────────────────────────────────
     # Forward + loss
     # ──────────────────────────────────────────────────────────────────
 
-    def _reparam_source(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
-        """Sample source tokens x₀ = μ + ε·σ with σ from the *clamped* log-variance.
-
-        The encoder's ``forward`` samples internally using the raw, unclamped
-        log-variance, which can diverge early in training while the KLD term only
-        ever sees the clamped value. Re-sampling here from the clamped
-        log-variance keeps the noise injected into x₀ consistent with the
-        regulariser. Falls back to μ for a non-variational encoder.
-        """
-        if log_var is None:
-            return mu
-        log_var = torch.clamp(
-            log_var, min=self.clip_logvar_min, max=self.clip_logvar_max,
-        )
-        std = (0.5 * log_var).exp()
-        return mu + torch.randn_like(mu) * std
-
     def _compute_loss(
         self,
         x1: torch.Tensor,
-        clip_tokens: torch.Tensor,
         clip_pool: torch.Tensor,
         contexts=None,
-    ) -> Dict[str, torch.Tensor]:
-        """One forward pass: source encoding → interpolation → velocity prediction → losses.
-
-        Returns a dict with keys: ``total``, ``diff``, ``kld``, ``align``.
-        """
-        B = x1.shape[0]
-
-        # 1) Source x₀
-        if self.use_source:
-            _, mu, log_var = self.wrapper.encode_source(clip_tokens)
-            if log_var is not None:
-                log_var = torch.clamp(
-                    log_var, min=self.clip_logvar_min, max=self.clip_logvar_max,
-                )
-            # Sample x₀ = μ + ε·σ from the clamped log-variance (consistent with
-            # the KLD term), then reshape (B, Q, D) → (B, C, H, W).
-            x0_tok = self._reparam_source(mu, log_var)
-            x0 = x0_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
-        else:
-            # Pure Gaussian noise source (standard flow matching)
-            x0 = torch.randn_like(x1)
-            mu, log_var = None, None
+    ) -> torch.Tensor:
+        """One flow-matching step: noise source → interpolate → velocity MSE."""
+        # 1) Pure Gaussian source x₀ (standard flow matching)
+        x0 = torch.randn_like(x1)
 
         # 2) Sample timestep & interpolate along the flow path
         t = self.transport.sample_timestep(x1)
         t, xt, ut = self.transport.path_sampler.plan(t, x0, x1)
 
-        # 3) Predict velocity (cross-attend to the context streams if enabled)
+        # 3) Predict velocity (cross-attend to context streams if enabled)
         ctx = contexts if self.use_cross_attn else None
-        v_pred = self.wrapper.predict_velocity(
-            x=xt, t=t, y=clip_pool, contexts=ctx,
-        )
+        v_pred = self.wrapper.predict_velocity(x=xt, t=t, y=clip_pool, contexts=ctx)
 
-        # 4) Diffusion loss (masked, optionally SNR-weighted, MSE on real voxels)
-        ut_target = ut.detach() if self.detach_ut else ut
-        diff_loss = masked_mse(v_pred, ut_target, self.pad_mask, weight=self.voxel_weight)
-        total = diff_loss
+        # 4) Velocity loss (masked, optionally SNR-weighted, MSE on real voxels)
+        return masked_mse(v_pred, ut, self.pad_mask, weight=self.voxel_weight)
 
-        # 5) KLD regularisation on the variational source encoder
-        kld_val = torch.tensor(0.0, device=self.device)
-        if self.use_kld and log_var is not None:
-            kld_val = _kld_loss(
-                mu, log_var, self.kld_type,
-                reduction=self.kld_reduction,
-                target_std=self.kld_target_std,
-            )
-            total = total + self.kld_weight * kld_val
+    # ──────────────────────────────────────────────────────────────────
+    # Inference helper (shared by inline eval & full validation)
+    # ──────────────────────────────────────────────────────────────────
 
-        # 6) Alignment loss (source mean ↔ target)
-        align_val = torch.tensor(0.0, device=self.device)
-        if self.use_align and mu is not None:
-            mu_reshaped = mu.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
-            if self.align_type == "normalized_l2":
-                mu_norm = F.normalize(mu_reshaped.flatten(1), p=2, dim=-1)
-                x1_norm = F.normalize(x1.flatten(1), p=2, dim=-1)
-                align_val = F.mse_loss(mu_norm, x1_norm)
-            elif self.align_type == "l2":
-                align_val = F.mse_loss(mu_reshaped, x1)
-            total = total + self.align_weight * align_val
+    def _sample(self, model: torch.nn.Module, clip_pool, contexts, B: int,
+                noise_scale: float | None = None) -> torch.Tensor:
+        """ODE-sample fMRI from scaled Gaussian noise. Returns ``(B, *latent)``.
 
-        # 7) Reconstruction loss in x̂₁ space (correlation-aware, metric-aligned).
-        # From the linear path xₜ=(1-t)x₀+t·x₁ and uₜ=x₁-x₀, the target is
-        # recovered exactly as x₁ = xₜ + (1-t)·uₜ; substituting the predicted
-        # velocity gives a differentiable estimate x̂₁ to score against x₁.
-        recon_val = torch.tensor(0.0, device=self.device)
-        if self.use_recon:
-            t_b = t.view(B, *([1] * (x1.dim() - 1)))
-            x1_hat = xt + (1.0 - t_b) * v_pred
-            recon_val = self._recon_loss(x1_hat, x1)
-            total = total + self.recon_weight * recon_val
-
-        # 8) Source Transport Consistency (STC)
-        # Two independent samples x₀ᵃ, x₀ᵇ ~ q(·|c) must flow to the same x₁:
-        #   L_STC = ||x̂₁ᵇ − sg(x̂₁ᵃ)||²_masked,  x̂₁ = xₜ + (1−t)·v_pred
-        # x̂₁ᵃ is stop-gated (used as a reference target) — its backward graph
-        # is already retained by the FM loss in step 4; we don't need a second
-        # backward through v_pred to save activation memory.
-        # stc_add_fm: also adds the FM loss for x₀ᵇ so v_pred_b is anchored to x₁.
-        stc_val = torch.tensor(0.0, device=self.device)
-        if self.use_stc and self.use_source and log_var is not None:
-            t_view = t.view(B, *([1] * (x1.dim() - 1)))
-            x1_hat_a = (xt + (1.0 - t_view) * v_pred).detach()
-            x0b_tok = self._reparam_source(mu, log_var)
-            x0b = x0b_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
-            _, xtb, utb = self.transport.path_sampler.plan(t, x0b, x1)
-            v_pred_b = self.wrapper.predict_velocity(
-                x=xtb, t=t, y=clip_pool, contexts=ctx,
-            )
-            if self.stc_add_fm:
-                utb_target = utb.detach() if self.detach_ut else utb
-                total = total + masked_mse(v_pred_b, utb_target, self.pad_mask, weight=self.voxel_weight)
-            x1_hat_b = xtb + (1.0 - t_view) * v_pred_b
-            stc_val = masked_mse(x1_hat_b, x1_hat_a, self.pad_mask)
-            total = total + self.stc_weight * stc_val
-
-        return {
-            "total": total,
-            "diff": diff_loss.detach(),
-            "kld": kld_val.detach(),
-            "align": align_val.detach(),
-            "recon": recon_val.detach(),
-            "stc": stc_val.detach(),
-        }
-
-    def _recon_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Loss on the reconstructed target x̂₁, restricted to real voxels.
-
-        ``pearson`` — 1 − profile Pearson r per sample (over voxels), averaged.
-        Scale/shift-invariant, so it must *not* be the velocity loss, but as an
-        auxiliary on x̂₁ it directly rewards the ``voxel_pearson`` eval metric.
-        ``mse`` — plain masked MSE on x̂₁ (magnitude-aware).
+        Args:
+            noise_scale: Override the instance ``eval_noise_scale``.  Pass
+                ``0.0`` for a fully deterministic (ceiling) prediction.
         """
-        B = pred.shape[0]
-        mask = self.pad_mask.to(pred.device)
-        p = pred.reshape(B, -1)[:, mask].float()
-        g = target.reshape(B, -1)[:, mask].float()
-        if self.recon_type == "pearson":
-            p = p - p.mean(dim=1, keepdim=True)
-            g = g - g.mean(dim=1, keepdim=True)
-            num = (p * g).sum(dim=1)
-            den = p.norm(dim=1) * g.norm(dim=1) + 1e-8
-            return (1.0 - num / den).mean()
-        elif self.recon_type == "mse":
-            return F.mse_loss(p, g)
-        raise ValueError(f"Unknown recon_loss_type: {self.recon_type}")
-
-    # ──────────────────────────────────────────────────────────────────
-    # Inline evaluation (quick subset during training)
-    # ──────────────────────────────────────────────────────────────────
+        scale = self.eval_noise_scale if noise_scale is None else noise_scale
+        x0 = scale * torch.randn(B, *self.latent_size, device=self.device)
+        ctx = contexts if self.use_cross_attn else None
+        with autocast(**self.autocast_kwargs):
+            traj = self.sample_fn(x0, model.dit.forward, y=clip_pool, contexts=ctx)
+        return traj[-1].float()
 
     @torch.no_grad()
     def _inline_eval(self) -> None:
-        """Quick ODE-based eval on a small test subset."""
+        """Quick ODE-based eval on a small test subset (uses eval_noise_scale)."""
         self.wrapper.eval()
         n_eval = min(64, len(self.test_ds))
         loader = DataLoader(self.test_ds, batch_size=n_eval, shuffle=False, num_workers=0)
         batch = next(iter(loader))
 
         fmri_gt = batch["fmri"].to(self.device)
-        clip_tok = batch["clip_tokens"].to(self.device)
         clip_pool = batch["clip_pool"].to(self.device)
         contexts = [c.to(self.device) for c in batch["contexts"]]
 
-        # Source from raw model encoder
-        src_std = None
-        src_corr = None
-        if self.use_source:
-            _, mu, log_var = self.wrapper.encode_source(clip_tok)
-            src = mu if self.eval_use_mean else self._reparam_source(mu, log_var)
-            x0 = src.permute(0, 2, 1).contiguous().view(n_eval, *self.latent_size)
-            # Diagnostics: is the source a genuine distribution (σ>0) that does
-            # NOT merely copy the target (low corr(μ, x₁))?
-            if log_var is not None:
-                src_std = log_var.float().mul(0.5).exp().mean().item()
-            mu_flat = mu.permute(0, 2, 1).contiguous().view(n_eval, -1)[:, self.pad_mask]
-            src_corr = voxel_pearson(
-                mu_flat.float(),
-                fmri_gt.reshape(n_eval, -1)[:, self.pad_mask].float(),
-            ).mean().item()
-        else:
-            x0 = self.eval_noise_scale * torch.randn(n_eval, *self.latent_size, device=self.device)
-
-        # ODE sampling
-        ctx = contexts if self.use_cross_attn else None
-        with autocast(**self.autocast_kwargs):
-            traj = self.sample_fn(
-                x0, self.wrapper.dit.forward, y=clip_pool, contexts=ctx,
-            )
-        pred = traj[-1].float()
-
+        pred = self._sample(self.wrapper, clip_pool, contexts, n_eval)
         preds_flat = pred.reshape(n_eval, -1)[:, self.pad_mask]
         gts_flat = fmri_gt.reshape(n_eval, -1)[:, self.pad_mask]
-        voxel_r = voxel_pearson(preds_flat, gts_flat).mean().item()
-        mse_val = masked_mse(pred, fmri_gt, self.pad_mask).item()
-        src_msg = ""
-        if src_std is not None or src_corr is not None:
-            src_msg = "  [src σ=%s corr(μ,x₁)=%s]" % (
-                f"{src_std:.3f}" if src_std is not None else "n/a",
-                f"{src_corr:.3f}" if src_corr is not None else "n/a",
-            )
+        voxel_r  = voxel_pearson(preds_flat, gts_flat).mean().item()
+        profile_r = pearson_corr_per_sample(pred, fmri_gt, self.pad_mask).mean().item()
+        mse_val   = masked_mse(pred, fmri_gt, self.pad_mask).item()
         self.logger.info(
-            "  [Eval step=%d] voxel_r=%.4f  mse=%.5f%s",
-            self.train_steps, voxel_r, mse_val, src_msg,
+            "  [Eval step=%d] voxel_r=%.4f  profile_r=%.4f  mse=%.5f",
+            self.train_steps, voxel_r, profile_r, mse_val,
         )
         self.wrapper.train()
 
-    # ──────────────────────────────────────────────────────────────────
-    # Full validation (end of epoch)
-    # ──────────────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def _validate(self, epoch: int) -> Dict[str, float]:
+        """Full validation over the rep-averaged test set.
 
-    def _run_val_pass(
-        self,
-        model: torch.nn.Module,
-        loader,
-        label: str,
-        epoch: int,
-    ) -> Dict[str, float]:
-        """Single validation pass over *loader* using *model*.
-
-        Accumulates all predictions/targets, then computes voxel-wise
-        (encoding) Pearson r across the sample axis — the honest NSD metric.
+        Always uses **noise_scale=0** (deterministic ODE) so that the metric
+        reflects the model's ceiling capacity, independent of stochastic
+        averaging.  Reports both voxel_r (encoding) and profile_r (pattern
+        correlation, comparable to SynBrain / MindSimulator).
         """
-        model.eval()
+        loader = DataLoader(
+            self.val_ds, batch_size=32, shuffle=False, num_workers=0, drop_last=False,
+        )
+        self.wrapper.eval()
         preds_all, gts_all = [], []
+        profile_rs = []
         mse_sum, n = 0.0, 0
-
         for batch in loader:
             fmri_gt = batch["fmri"].to(self.device)
-            clip_tok = batch["clip_tokens"].to(self.device)
             clip_pool = batch["clip_pool"].to(self.device)
             contexts = [c.to(self.device) for c in batch["contexts"]]
             B = fmri_gt.shape[0]
 
-            if self.use_source:
-                _, mu, log_var = model.encode_source(clip_tok)
-                src = mu if self.eval_use_mean else self._reparam_source(mu, log_var)
-                x0 = src.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
-            else:
-                x0 = self.eval_noise_scale * torch.randn(B, *self.latent_size, device=self.device)
-
-            ctx = contexts if self.use_cross_attn else None
-            with autocast(**self.autocast_kwargs):
-                traj = self.sample_fn(
-                    x0, model.dit.forward, y=clip_pool, contexts=ctx,
-                )
-            pred = traj[-1].float()
-
+            # Deterministic (noise_scale=0): ceiling prediction E[x|c]
+            pred = self._sample(self.wrapper, clip_pool, contexts, B, noise_scale=0.0)
             mse_sum += masked_mse(pred, fmri_gt, self.pad_mask).item() * B
             n += B
             preds_all.append(pred.reshape(B, -1)[:, self.pad_mask].cpu())
             gts_all.append(fmri_gt.reshape(B, -1)[:, self.pad_mask].cpu())
+            # Profile r: per-image, across voxels (same as SynBrain metric)
+            profile_rs.append(
+                pearson_corr_per_sample(pred, fmri_gt, self.pad_mask).cpu()
+            )
 
-        preds_all = torch.cat(preds_all, dim=0)
-        gts_all = torch.cat(gts_all, dim=0)
-        val_voxel_r = voxel_pearson(preds_all, gts_all).mean().item()
-        val_mse = mse_sum / n
+        preds_cat = torch.cat(preds_all)   # (N, V)
+        gts_cat   = torch.cat(gts_all)     # (N, V)
+        val_voxel_r   = voxel_pearson(preds_cat, gts_cat).mean().item()
+        val_profile_r = torch.cat(profile_rs).mean().item()
+        val_mse       = mse_sum / n
         self.logger.info(
-            "  [Val epoch=%d %s] voxel_r=%.4f  mse=%.5f  n=%d",
-            epoch + 1, label, val_voxel_r, val_mse, n,
+            "  [Val epoch=%d] voxel_r=%.4f  profile_r=%.4f  mse=%.5f  n=%d  "
+            "(noise_scale=0, deterministic)",
+            epoch + 1, val_voxel_r, val_profile_r, val_mse, n,
         )
-        return {"mse": val_mse, "voxel_r": val_voxel_r, "n": n}
-
-    @torch.no_grad()
-    def _validate(self, epoch: int) -> Dict[str, float]:
-        """Full validation over the rep-averaged test set (val_ds, avg_reps=True).
-
-        Reports voxel-wise (encoding) Pearson r: per-voxel correlation across
-        images. Rep-averaging the GT removes measurement noise so the metric
-        reflects true signal rather than the single-trial noise floor.
-        """
-        val_bs = 32
-        loader = DataLoader(
-            self.val_ds,
-            batch_size=val_bs,
-            shuffle=False,
-            num_workers=0,
-            drop_last=False,
-        )
-
-        self.wrapper.eval()
-        metrics = self._run_val_pass(self.wrapper, loader, "avg_reps", epoch)
         self.wrapper.train()
-        return metrics
+        return {"mse": val_mse, "voxel_r": val_voxel_r, "profile_r": val_profile_r, "n": n}
 
     # ──────────────────────────────────────────────────────────────────
     # Main training loop
@@ -625,36 +460,20 @@ class FactFlowTrainer:
 
     def train(self) -> None:
         """Run the full training loop."""
-        # ── CSV history ──
         history_path = os.path.join(self.exp_dir, "history.csv")
         history_exists = os.path.exists(history_path)
         history_file = open(history_path, "a", newline="")
         history_writer = csv.writer(history_file)
         if not history_exists:
-            history_writer.writerow([
-                "epoch", "step", "train_loss", "train_diff", "train_kld", "train_align", "train_recon", "train_stc", "val_mse", "val_voxel_r", "lr",
-            ])
+            history_writer.writerow(
+                ["epoch", "step", "train_loss",
+                 "val_mse", "val_voxel_r", "val_profile_r", "lr"]
+            )
             history_file.flush()
 
-        # ── Accumulators ──
         running_loss = 0.0   # since last log_every
-        running_diff = 0.0
-        running_kld = 0.0
-        running_align = 0.0
-        running_recon = 0.0
-        running_stc = 0.0
         epoch_loss = 0.0     # since last validation
-        epoch_diff = 0.0
-        epoch_kld = 0.0
-        epoch_align = 0.0
-        epoch_recon = 0.0
-        epoch_stc = 0.0
         step_loss = 0.0      # current optimizer step (across micro-batches)
-        step_diff = 0.0
-        step_kld = 0.0
-        step_align = 0.0
-        step_recon = 0.0
-        step_stc = 0.0
         epoch_steps = 0
         log_steps = 0
         accum_counter = 0
@@ -675,45 +494,22 @@ class FactFlowTrainer:
 
             for batch in pbar:
                 x1 = batch["fmri"].to(self.device)
-                clip_tokens = batch["clip_tokens"].to(self.device)
                 clip_pool = batch["clip_pool"].to(self.device)
                 contexts = [c.to(self.device) for c in batch["contexts"]]
 
                 with autocast(**self.autocast_kwargs):
-                    losses = self._compute_loss(
-                        x1, clip_tokens, clip_pool, contexts,
-                    )
+                    loss = self._compute_loss(x1, clip_pool, contexts)
 
-                # Backward (scale by grad_accum)
-                (losses["total"] / self.grad_accum).backward()
+                (loss / self.grad_accum).backward()
                 accum_counter += 1
 
+                micro_loss = loss.item() / self.grad_accum
+                running_loss += micro_loss
+                step_loss += micro_loss
                 pbar.set_postfix(
-                    loss=f"{losses['total'].item():.4f}",
+                    loss=f"{loss.item():.4f}",
                     lr=f"{self.scheduler.get_last_lr()[0]:.2e}",
                 )
-
-                # Accumulate micro-batch loss (rescaled to full-step units)
-                micro_loss = losses["total"].item() / self.grad_accum
-                micro_diff = losses["diff"].item() / self.grad_accum
-                micro_kld = losses["kld"].item() / self.grad_accum
-                micro_align = losses["align"].item() / self.grad_accum
-                micro_recon = losses["recon"].item() / self.grad_accum
-                micro_stc = losses["stc"].item() / self.grad_accum
-
-                running_loss += micro_loss
-                running_diff += micro_diff
-                running_kld += micro_kld
-                running_align += micro_align
-                running_recon += micro_recon
-                running_stc += micro_stc
-
-                step_loss += micro_loss
-                step_diff += micro_diff
-                step_kld += micro_kld
-                step_align += micro_align
-                step_recon += micro_recon
-                step_stc += micro_stc
 
                 if accum_counter < self.grad_accum:
                     continue
@@ -730,21 +526,9 @@ class FactFlowTrainer:
 
                 log_steps += 1
                 self.train_steps += 1
-
                 epoch_loss += step_loss
-                epoch_diff += step_diff
-                epoch_kld += step_kld
-                epoch_align += step_align
-                epoch_recon += step_recon
-                epoch_stc += step_stc
                 epoch_steps += 1
-
                 step_loss = 0.0
-                step_diff = 0.0
-                step_kld = 0.0
-                step_align = 0.0
-                step_recon = 0.0
-                step_stc = 0.0
 
                 # ── Periodic logging ──
                 if self.train_steps % self.log_every == 0:
@@ -752,20 +536,10 @@ class FactFlowTrainer:
                     sps = log_steps / elapsed if elapsed > 0 else 0
                     lr = self.scheduler.get_last_lr()[0]
                     self.logger.info(
-                        "[step=%07d ep=%d] loss=%.5f (diff=%.5f kld=%.5f align=%.5f recon=%.5f stc=%.5f) lr=%.2e steps/s=%.1f",
-                        self.train_steps, epoch,
-                        running_loss / log_steps,
-                        running_diff / log_steps, running_kld / log_steps,
-                        running_align / log_steps, running_recon / log_steps,
-                        running_stc / log_steps,
-                        lr, sps,
+                        "[step=%07d ep=%d] loss=%.5f lr=%.2e steps/s=%.1f",
+                        self.train_steps, epoch, running_loss / log_steps, lr, sps,
                     )
                     running_loss = 0.0
-                    running_diff = 0.0
-                    running_kld = 0.0
-                    running_align = 0.0
-                    running_recon = 0.0
-                    running_stc = 0.0
                     log_steps = 0
                     wall_start = time()
 
@@ -802,43 +576,33 @@ class FactFlowTrainer:
             if not hit_max and is_val_epoch:
                 self.logger.info("End of epoch %d, running validation...", epoch + 1)
                 val = self._validate(epoch)
-
                 lr = self.scheduler.get_last_lr()[0]
                 ep_n = max(1, epoch_steps)
                 history_writer.writerow([
                     epoch + 1, self.train_steps,
                     f"{epoch_loss / ep_n:.6f}",
-                    f"{epoch_diff / ep_n:.6f}",
-                    f"{epoch_kld / ep_n:.6f}",
-                    f"{epoch_align / ep_n:.6f}",
-                    f"{epoch_recon / ep_n:.6f}",
-                    f"{epoch_stc / ep_n:.6f}",
                     f"{val['mse']:.6f}",
                     f"{val['voxel_r']:.6f}",
+                    f"{val['profile_r']:.6f}",
                     f"{lr:.2e}",
                 ])
                 history_file.flush()
-
-                # Reset epoch accumulators
                 epoch_loss = 0.0
-                epoch_diff = 0.0
-                epoch_kld = 0.0
-                epoch_align = 0.0
-                epoch_recon = 0.0
-                epoch_stc = 0.0
                 epoch_steps = 0
 
-                # Save best checkpoint by voxel-wise Pearson r
-                if val["voxel_r"] > self.best_voxel_r:
-                    self.best_voxel_r = val["voxel_r"]
+                # Save best checkpoint by profile_r (per-image pattern correlation,
+                # directly comparable to SynBrain / MindSimulator baselines).
+                if val["profile_r"] > self.best_metric:
+                    self.best_metric = val["profile_r"]
                     save_checkpoint(
                         os.path.join(self.ckpt_dir, "best.pt"),
                         self.wrapper, self.optimizer, self.scheduler,
-                        self.train_steps, epoch, self.best_voxel_r,
+                        self.train_steps, epoch, self.best_metric,
                         val_mse=val["mse"],
                     )
                     self.logger.info(
-                        "New best voxel_r: %.4f", self.best_voxel_r,
+                        "New best profile_r: %.4f  (voxel_r: %.4f)",
+                        self.best_metric, val["voxel_r"],
                     )
 
             if hit_max:

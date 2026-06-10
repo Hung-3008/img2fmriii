@@ -1,20 +1,14 @@
 """
 factflow_evaluator.py
 =====================
-Full evaluation for FactFlow-based fMRI synthesis.
+Full evaluation for FactFlow fMRI synthesis (no-source flow matching).
 
-Supports three inference scenarios:
+The source x₀ is scaled Gaussian noise (``eval_noise_scale``) integrated with an
+ODE solver. With ``eval_noise_scale ≈ 0`` the prediction is near-deterministic
+(K=1); with full noise, ``--max_trials`` passes are averaged and metrics reported
+for each K in ``--k_values`` (e.g. 1,5,10) to reduce sampling variance.
 
-  1. **deterministic** — PerceiverVE mean μ → ODE solver (fully deterministic).
-  2. **perceiver_stochastic** — PerceiverVE samples x₀ = μ + ε·σ → ODE solver.
-  3. **flow_stochastic** — PerceiverVE mean μ → SDE solver (noise-injected flow).
-
-For stochastic scenarios, runs ``max_trials`` forward passes (default 10),
-saves each individual pass, then computes metrics for each K in ``k_values``
-(default [1, 5, 10]) by averaging the first K passes.  This avoids redundant
-computation — 10 passes total instead of 1+5+10 = 16.
-
-Metrics:
+Metrics (rep-averaged GT, 1000 test images):
   - Per-voxel Pearson r (encoding metric, mean & median)
   - Profile Pearson r (mean)
   - MSE
@@ -32,15 +26,13 @@ from typing import Dict, List
 
 import numpy as np
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 from torch import autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data.factflow_fmri_dataset import FactFlowfMRIDataset
 from model.factflow_factory import build_models, build_transport, build_sampler
-from model.transport import Sampler
-from utils.checkpoint import load_checkpoint
 from utils.fmri_utils import auto_size_config, get_latent_size
 from utils.logging_utils import create_logger
 from utils.metrics import compute_full_metrics
@@ -55,33 +47,30 @@ class FactFlowEvaluator:
         # ── Config ────────────────────────────────────────────────────
         self.cfg = OmegaConf.load(args.config)
         # Per-subject native sizing — must match training (no-op unless
-        # data.auto_pad is set), so the model matches the checkpoint shapes.
+        # data.auto_pad is set) so the model matches the checkpoint shapes.
         _autosize_msg = auto_size_config(self.cfg)
         if _autosize_msg:
             logger.info(_autosize_msg)
         self.data_cfg = OmegaConf.to_container(self.cfg.data, resolve=True)
-        self.loss_cfg = OmegaConf.to_container(
-            self.cfg.get("losses", {}), resolve=True,
-        )
         self.args = args
 
-        # ── Scenario ──────────────────────────────────────────────────
-        self.scenario = getattr(args, "scenario", "deterministic")
+        # Scale of the Gaussian x₀. CLI --eval_noise_scale overrides config value.
+        _cfg_scale = float(self.cfg.get("eval_noise_scale", 1.0))
+        _cli_scale = getattr(args, "eval_noise_scale", None)
+        if _cli_scale is not None:
+            self.eval_noise_scale = float(_cli_scale)
+            logger.info(
+                "eval_noise_scale overridden by CLI: %.4f (config had %.4f)",
+                self.eval_noise_scale, _cfg_scale,
+            )
+        else:
+            self.eval_noise_scale = _cfg_scale
 
-        # For stochastic scenarios: run max_trials passes, then compute
-        # metrics for each K in k_values by averaging the first K passes.
-        self.max_trials = getattr(args, "max_trials", 10)
-        k_str = getattr(args, "k_values", "1,5,10")
-        self.k_values: List[int] = sorted(
-            int(x) for x in str(k_str).split(",")
-        )
 
-        if self.scenario == "deterministic":
-            # Deterministic: only 1 pass, only K=1 makes sense
-            self.max_trials = 1
-            self.k_values = [1]
-
-        # Ensure max_trials >= max(k_values)
+        # Number of stochastic passes; average the first K for each K in k_values.
+        self.max_trials = max(1, getattr(args, "max_trials", 1))
+        k_str = getattr(args, "k_values", "1")
+        self.k_values: List[int] = sorted(int(x) for x in str(k_str).split(","))
         self.max_trials = max(self.max_trials, max(self.k_values))
 
         # ── Device ────────────────────────────────────────────────────
@@ -92,18 +81,11 @@ class FactFlowEvaluator:
             dtype=torch.bfloat16,
             enabled=use_bf16,
         )
-
         self.logger = create_logger(name="factflow_eval")
 
-        # ── Data ──────────────────────────────────────────────────────
-        # Always use avg_reps=True for evaluation: 1000 images with
-        # rep-averaged GT (mean of 3 trials).  This matches the trainer's
-        # _validate() and published NSD benchmarks.
+        # ── Data (always rep-averaged GT: 1000 images, mean of 3 trials) ──
         dc = self.data_cfg
         self.n_voxels = dc["n_voxels"]
-        # ROI voxel ordering? Then the dataset reorders voxels by ROI; predictions
-        # are un-sorted back to anatomical order before metrics/saving so output
-        # is identical in layout to non-reordered runs.
         self.roi_order = bool(dc.get("roi_order", False))
         self.test_ds = FactFlowfMRIDataset(
             data_dir=dc["data_dir"],
@@ -133,37 +115,14 @@ class FactFlowEvaluator:
             pin_memory=True,
         )
 
-        # ── Geometry ──────────────────────────────────────────────────
+        # ── Geometry / model ──────────────────────────────────────────
         self.latent_size = get_latent_size(self.data_cfg)
         self.use_cross_attn = bool(
             self.cfg.stage_2.get("params", {}).get("use_cross_attn", False)
         )
-
-        # ── Source encoder config ─────────────────────────────────────
-        self.clip_logvar_min = float(self.loss_cfg.get("clip_logvar_min", -10.0))
-        self.clip_logvar_max = float(self.loss_cfg.get("clip_logvar_max", 10.0))
-
-        # ── Model ─────────────────────────────────────────────────────
         self.wrapper = build_models(self.cfg, self.device)
         self.transport = build_transport(self.cfg, self.latent_size)
-
-        # Build ODE sampler (always needed for scenarios 1 & 2)
-        self.sample_fn_ode = build_sampler(self.transport, self.cfg.sampler)
-
-        # Build SDE sampler (for scenario 3: flow_stochastic)
-        self.sample_fn_sde = None
-        if self.scenario == "flow_stochastic":
-            sde_num_steps = getattr(args, "sde_num_steps", 250)
-            sde_diffusion_norm = getattr(args, "sde_diffusion_norm", 1.0)
-            sde_sampler = Sampler(self.transport)
-            self.sample_fn_sde = sde_sampler.sample_sde(
-                sampling_method="euler",
-                diffusion_form="SBDM",
-                diffusion_norm=sde_diffusion_norm,
-                last_step="Mean",
-                last_step_size=0.04,
-                num_steps=sde_num_steps,
-            )
+        self.sample_fn = build_sampler(self.transport, self.cfg.sampler)
 
         # Load checkpoint
         ckpt = torch.load(args.ckpt, map_location="cpu")
@@ -172,77 +131,26 @@ class FactFlowEvaluator:
         del ckpt
         if str(self.device).startswith("cuda"):
             torch.cuda.empty_cache()
-
         self.wrapper.eval()
-
-    # ──────────────────────────────────────────────────────────────────
-    # Source encoding helpers
-    # ──────────────────────────────────────────────────────────────────
-
-    def _get_x0_deterministic(
-        self, clip_tokens: torch.Tensor, B: int,
-    ) -> torch.Tensor:
-        """Scenario 1 & 3: use PerceiverVE mean μ (no sampling)."""
-        _, mu, _ = self.wrapper.encode_source(clip_tokens)
-        return mu.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
-
-    def _get_x0_stochastic(
-        self, clip_tokens: torch.Tensor, B: int,
-    ) -> torch.Tensor:
-        """Scenario 2: sample x₀ = μ + ε·σ from PerceiverVE."""
-        _, mu, log_var = self.wrapper.encode_source(clip_tokens)
-        if log_var is not None:
-            log_var = torch.clamp(
-                log_var,
-                min=self.clip_logvar_min,
-                max=self.clip_logvar_max,
-            )
-            std = (0.5 * log_var).exp()
-            x0_tok = mu + torch.randn_like(mu) * std
-        else:
-            x0_tok = mu
-        return x0_tok.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
 
     # ──────────────────────────────────────────────────────────────────
     # Single-pass inference
     # ──────────────────────────────────────────────────────────────────
 
     def _run_single_pass(self) -> np.ndarray:
-        """Run one complete inference pass over the test set.
-
-        Returns:
-            ``(N, V)`` predicted voxels (unpadded).
-        """
+        """Run one inference pass over the test set. Returns ``(N, V)``."""
         all_preds = []
-
-        sample_fn = (
-            self.sample_fn_sde
-            if self.scenario == "flow_stochastic"
-            else self.sample_fn_ode
-        )
-
         for batch in tqdm(self.test_loader, desc="Inference", dynamic_ncols=True):
-            clip_tokens = batch["clip_tokens"].to(self.device)
             clip_pool = batch["clip_pool"].to(self.device)
             contexts = [c.to(self.device) for c in batch["contexts"]]
-            B = clip_tokens.shape[0]
+            B = clip_pool.shape[0]
 
-            # Source x₀
-            if self.scenario == "perceiver_stochastic":
-                x0 = self._get_x0_stochastic(clip_tokens, B)
-            else:
-                # deterministic or flow_stochastic: use μ
-                x0 = self._get_x0_deterministic(clip_tokens, B)
-
-            # Flow sampling (ODE or SDE)
+            x0 = self.eval_noise_scale * torch.randn(B, *self.latent_size, device=self.device)
             ctx = contexts if self.use_cross_attn else None
             with autocast(**self.autocast_kwargs):
-                traj = sample_fn(
-                    x0, self.wrapper.dit.forward, y=clip_pool, contexts=ctx,
-                )
+                traj = self.sample_fn(x0, self.wrapper.dit.forward, y=clip_pool, contexts=ctx)
             pred = traj[-1].float()
-            # Free all intermediate ODE/SDE steps immediately
-            del traj, x0, clip_tokens, clip_pool, contexts, ctx
+            del traj, x0, clip_pool, contexts, ctx
 
             pred_flat = pred.reshape(B, -1)[:, : self.n_voxels].cpu().numpy()
             if self.unsort_idx is not None:
@@ -250,36 +158,29 @@ class FactFlowEvaluator:
             del pred
             all_preds.append(pred_flat)
 
-        # Release GPU memory before returning to the next pass
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
         return np.concatenate(all_preds, axis=0)
 
     # ──────────────────────────────────────────────────────────────────
-    # Metrics helper
+    # Metrics helpers
     # ──────────────────────────────────────────────────────────────────
 
     def _compute_and_report(
-        self,
-        preds: np.ndarray,
-        targets: np.ndarray,
-        k: int,
+        self, preds: np.ndarray, targets: np.ndarray, k: int,
     ) -> Dict[str, float]:
-        """Compute metrics for a given K-averaged prediction and log results."""
+        """Compute metrics for a K-averaged prediction and log results."""
         metrics = compute_full_metrics(
             preds, targets,
             n_voxels=self.n_voxels,
             n_reps=1,
             n_images=self.test_ds.n_images,
         )
-
         self.logger.info("  ── K=%d ──", k)
         self.logger.info("    Per-voxel Pearson r (mean):   %.4f", metrics.mean_voxel_r)
         self.logger.info("    Per-voxel Pearson r (median): %.4f", metrics.median_voxel_r)
         self.logger.info("    Profile Pearson r (mean):     %.4f", metrics.mean_profile_r)
         self.logger.info("    MSE:                          %.6f", metrics.mse)
-
         return {
             "mean_voxel_r": metrics.mean_voxel_r,
             "median_voxel_r": metrics.median_voxel_r,
@@ -289,19 +190,15 @@ class FactFlowEvaluator:
             "profile_r": metrics.profile_r,
         }
 
-    def _append_csv(
-        self, k: int, result: Dict[str, float],
-    ) -> None:
+    def _append_csv(self, k: int, result: Dict[str, float]) -> None:
         """Append one CSV row for a given K."""
         csv_path = getattr(self.args, "csv_out", None)
         if not csv_path:
             return
         os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
         header = [
-            "scenario", "k_trials",
-            "mean_voxel_r", "median_voxel_r",
-            "mean_profile_r", "mse",
-            "ckpt",
+            "k_trials", "mean_voxel_r", "median_voxel_r",
+            "mean_profile_r", "mse", "ckpt",
         ]
         write_header = not os.path.exists(csv_path)
         with open(csv_path, "a", newline="") as f:
@@ -309,7 +206,6 @@ class FactFlowEvaluator:
             if write_header:
                 writer.writerow(header)
             writer.writerow([
-                self.scenario,
                 k,
                 f"{result['mean_voxel_r']:.6f}",
                 f"{result['median_voxel_r']:.6f}",
@@ -325,24 +221,18 @@ class FactFlowEvaluator:
 
     @torch.no_grad()
     def evaluate(self) -> Dict[str, float]:
-        """Run inference and compute all metrics.
-
-        For stochastic scenarios, runs ``max_trials`` forward passes, saves
-        each individual pass to ``.npz``, then computes metrics for each K
-        in ``k_values`` by averaging the first K passes.
-        """
+        """Run inference, average K passes, and compute all metrics."""
         self.logger.info("=" * 60)
         self.logger.info(
-            "Scenario: %s  |  max_trials: %d  |  k_values: %s",
-            self.scenario, self.max_trials, self.k_values,
+            "max_trials: %d  |  k_values: %s  |  eval_noise_scale: %.3g",
+            self.max_trials, self.k_values, self.eval_noise_scale,
         )
         self.logger.info(
-            "Running inference on %d test images (avg_reps=True)...",
-            len(self.test_ds),
+            "Running inference on %d test images (avg_reps=True)...", len(self.test_ds),
         )
         self.logger.info("=" * 60)
 
-        # ── Collect ground truth (once) ───────────────────────────────
+        # ── Ground truth (once) ───────────────────────────────────────
         all_targets = []
         for batch in self.test_loader:
             fmri_gt = batch["fmri"]
@@ -353,52 +243,34 @@ class FactFlowEvaluator:
             all_targets.append(gt_flat)
         targets = np.concatenate(all_targets, axis=0)  # (N, V)
 
-        # ── Run max_trials forward passes ─────────────────────────────
-        # Store each pass individually: list of (N, V) arrays
+        # ── Forward passes ────────────────────────────────────────────
         all_passes: List[np.ndarray] = []
         out_dir = getattr(self.args, "output", None)
-
         for t in range(self.max_trials):
-            self.logger.info(
-                "Pass %d / %d ...", t + 1, self.max_trials,
-            )
+            self.logger.info("Pass %d / %d ...", t + 1, self.max_trials)
             preds_t = self._run_single_pass()  # (N, V)
             all_passes.append(preds_t)
-
-            # Save individual pass
             if out_dir:
                 pass_dir = os.path.join(out_dir, "passes")
                 os.makedirs(pass_dir, exist_ok=True)
-                pass_path = os.path.join(pass_dir, f"pass_{t:02d}.npy")
-                np.save(pass_path, preds_t)
-                self.logger.info("  Saved pass %d → %s", t + 1, pass_path)
+                np.save(os.path.join(pass_dir, f"pass_{t:02d}.npy"), preds_t)
 
-        # ── Compute metrics for each K ────────────────────────────────
+        # ── Metrics per K ─────────────────────────────────────────────
         self.logger.info("=" * 60)
-        self.logger.info("EVALUATION RESULTS  (scenario=%s)", self.scenario)
+        self.logger.info("EVALUATION RESULTS")
         self.logger.info("=" * 60)
-
-        last_result = {}
+        last_result: Dict[str, float] = {}
         for k in self.k_values:
-            # Average first K passes
             preds_avg = np.stack(all_passes[:k], axis=0).mean(axis=0).astype(np.float32)
             result = self._compute_and_report(preds_avg, targets, k)
             self._append_csv(k, result)
-
-            # Save averaged prediction .npz
             if out_dir:
-                avg_path = os.path.join(out_dir, f"avg_k{k:02d}.npz")
                 np.savez(
-                    avg_path,
-                    preds=preds_avg,
-                    targets=targets,
-                    voxel_r=result["voxel_r"],
-                    profile_r=result["profile_r"],
+                    os.path.join(out_dir, f"avg_k{k:02d}.npz"),
+                    preds=preds_avg, targets=targets,
+                    voxel_r=result["voxel_r"], profile_r=result["profile_r"],
                 )
-                self.logger.info("    → Saved avg_k%d → %s", k, avg_path)
-
             last_result = result
-
         self.logger.info("=" * 60)
 
         return {

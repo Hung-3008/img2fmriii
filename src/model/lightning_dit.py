@@ -5,7 +5,7 @@ from timm.models.vision_transformer import PatchEmbed, Mlp
 import torch
 from torch import nn
 
-from .model_utils import VisionRotaryEmbeddingFast, SwiGLUFFN, RMSNorm, NormAttention, LabelEmbedder, get_2d_sincos_pos_embed, GaussianFourierEmbedding, modulate
+from .model_utils import VisionRotaryEmbeddingFast, SwiGLUFFN, RMSNorm, NormAttention, LabelEmbedder, get_2d_sincos_pos_embed, GaussianFourierEmbedding, modulate, StreamRouter
 
 
 class CrossAttention(nn.Module):
@@ -77,6 +77,7 @@ class LightningDiTBlock(nn.Module):
         use_rmsnorm=True,
         wo_shift=False,
         use_cross_attn=False,
+        n_streams_routed: int = 0,
         **block_kwargs
     ):
         super().__init__()
@@ -89,17 +90,31 @@ class LightningDiTBlock(nn.Module):
             self.norm1 = RMSNorm(hidden_size)
             self.norm2 = RMSNorm(hidden_size)
 
-        # Optional cross-attention to a context sequence (e.g. CLIP tokens).
-        # The output projection is zero-initialised (in the parent model's
-        # initialize_weights) so the block starts identical to a pooled-only
-        # DiT and learns to attend to the context.
-        self.use_cross_attn = use_cross_attn
+        # ── Cross-attention ───────────────────────────────────────────
+        # Two modes:
+        #   (a) n_streams_routed == 0  →  old homogeneous path: single
+        #       concatenated context tensor, one shared CrossAttention.
+        #   (b) n_streams_routed >= 2  →  ROI-routing path: one dedicated
+        #       CrossAttention head per stream; outputs are weighted by
+        #       per-patch stream_gates supplied at forward time.
+        self.use_cross_attn    = use_cross_attn
+        self.n_streams_routed  = n_streams_routed
         if use_cross_attn:
-            if not use_rmsnorm:
-                self.norm_cross = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            norm_cls = RMSNorm if use_rmsnorm else partial(
+                nn.LayerNorm, elementwise_affine=False, eps=1e-6
+            )
+            self.norm_cross = norm_cls(hidden_size)
+            if n_streams_routed >= 2:
+                # One CrossAttention head per context stream
+                self.cross_attns = nn.ModuleList([
+                    CrossAttention(hidden_size, num_heads, qk_norm=use_qknorm)
+                    for _ in range(n_streams_routed)
+                ])
+                # Alias kept for zero-init loop in DiT1D.initialize_weights
+                self.cross_attn = None
             else:
-                self.norm_cross = RMSNorm(hidden_size)
-            self.cross_attn = CrossAttention(hidden_size, num_heads, qk_norm=use_qknorm)
+                # Legacy single-stream path
+                self.cross_attn = CrossAttention(hidden_size, num_heads, qk_norm=use_qknorm)
 
         # Initialize attention layer
         self.attn = NormAttention(
@@ -138,7 +153,18 @@ class LightningDiTBlock(nn.Module):
             )
         self.wo_shift = wo_shift
 
-    def forward(self, x, c, feat_rope=None, context=None):
+    def forward(self, x, c, feat_rope=None, context=None,
+                contexts_list=None, stream_gates=None):
+        """Forward pass.
+
+        Args:
+            x:            (B, N, D) patch tokens
+            c:            (B, D) AdaLN conditioning (t + y)
+            feat_rope:    optional 1D RoPE
+            context:      (B, M, D) single concatenated context  [legacy path]
+            contexts_list: list of (B, Mᵢ, D) per-stream contexts [routing path]
+            stream_gates:  (B, N, n_streams) soft gate weights     [routing path]
+        """
         if self.wo_shift:
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(4, dim=1)
             shift_msa = None
@@ -146,8 +172,22 @@ class LightningDiTBlock(nn.Module):
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
-        if self.use_cross_attn and context is not None:
-            x = x + self.cross_attn(self.norm_cross(x), context)
+
+        if self.use_cross_attn:
+            xn = self.norm_cross(x)
+            if (self.n_streams_routed >= 2
+                    and contexts_list is not None
+                    and stream_gates is not None):
+                # ROI-routing path: weighted sum of per-stream cross-attention
+                ctx_out = sum(
+                    stream_gates[..., s:s+1] * self.cross_attns[s](xn, contexts_list[s])
+                    for s in range(self.n_streams_routed)
+                )
+                x = x + ctx_out
+            elif context is not None:
+                # Legacy homogeneous path
+                x = x + self.cross_attn(xn, context)
+
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 class LightningFinalLayer(nn.Module):
