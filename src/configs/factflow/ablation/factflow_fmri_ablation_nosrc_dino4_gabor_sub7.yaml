@@ -1,0 +1,123 @@
+# ==============================================================================
+# Ablation: NO SOURCE ENCODER + DINOv2(4L) + Gabor cross-attention
+# Subject 7
+# ------------------------------------------------------------------------------
+# Pure Gaussian noise x₀ during training (standard flow matching).
+# At eval time, x₀ ≈ 0 (eval_noise_scale=0.01) for near-deterministic
+# model selection — analogous to eval_use_mean in the source-encoder variant.
+#
+#   - source encoder: NONE (x₀ ~ N(0, I) at train, 0.01·N(0,I) at eval)
+#   - AdaLN conditioning  ← clip_pool = sdxl_clip_pool             (1280)
+#   - cross-attention      ← dinov2_vitg14_multilayer4p (4, 257, 1536) → 1028 tok
+#                          + gabor                     (256, 24)       →  256 tok
+# ==============================================================================
+use_source_encoder: false
+eval_noise_scale: 0.01
+data:
+  data_dir: NSD/data/nsd
+  subdirs:
+    fmri: fmri
+    sdxl_clip: clip
+    dinov2_vitg14_multilayer4p: dino
+    gabor: gabor
+  subject: 7
+  fmri_mode: zscore
+  clip_feature: sdxl_clip
+  n_voxels: 12682
+  pad_to: 12704
+  auto_pad: true
+  roi_order: true
+  avg_reps: true
+  context_features:
+  - dinov2_vitg14_multilayer4p
+  - gabor
+stage_2:
+  target: model.dit_1d.DiT1D
+  params:
+    seq_len: 12704
+    patch_size: 32
+    in_channels: 1
+    hidden_size: 512
+    depth: 12
+    num_heads: 8
+    mlp_ratio: 4.0
+    y_in_channels: 1280
+    learn_sigma: false
+    use_qknorm: true
+    use_swiglu: true
+    use_rmsnorm: true
+    use_rope: true
+    wo_shift: false
+    use_cross_attn: true
+source_encoder:
+  target: model.perceiver.PerceiverVE
+  params:
+    in_channels: 1664
+    out_channels: 64
+    hidden_size: 384
+    depth: 4
+    num_heads: 8
+    mlp_ratio: 4.0
+    dropout_prob: 0.0
+    num_queries: 198
+    max_input_len: 256
+    pos_emb_type: learned
+    use_qknorm: false
+    use_swiglu: true
+    use_rmsnorm: true
+    use_variational: true
+    use_per_token_logvar: false
+    init_logvar: 0.0
+    fixed_std: null
+transport:
+  params:
+    path_type: Linear
+    prediction: velocity
+    loss_weight: null
+    time_dist_type: logit-normal_-1.0_1.0
+    time_dist_shift: 12704
+sampler:
+  mode: ODE
+  params:
+    sampling_method: euler
+    num_steps: 50
+    atol: 1.0e-06
+    rtol: 0.001
+    reverse: false
+losses:
+  use_kld_loss: false
+  kld_loss_type: kld
+  kld_loss_weight: 0.0
+  kld_target_std: 1.0
+  kld_reduction: mean
+  clip_logvar_min: -1.4
+  clip_logvar_max: 10.0
+  use_align_loss: false
+  use_recon_loss: false
+  recon_loss_type: pearson
+  recon_loss_weight: 0.0
+  detach_ut: false
+  use_snr_weight: true
+training:
+  global_seed: 42
+  epochs: 50
+  batch_size: 32
+  grad_accum_steps: 8
+  num_workers: 2
+  pin_memory: false
+  log_every: 50
+  ckpt_every: 5000
+  sample_every: 2000
+  val_every: 5
+  optimizer:
+    lr: 0.0001
+    betas:
+    - 0.9
+    - 0.95
+    weight_decay: 0.01
+  base_lr: 0.0001
+  final_lr: 1.0e-05
+  schedule_type: cosine
+  warmup_steps: 500
+  clip_grad: 1.0
+  precision: bf16

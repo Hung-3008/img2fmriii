@@ -209,6 +209,9 @@ class FactFlowTrainer:
         self.use_source = bool(self.cfg.get("use_source_encoder", True))
         # Use the source-encoder mean (μ) instead of a sampled x₀ at eval time.
         self.eval_use_mean = bool(self.cfg.get("eval_use_mean", False))
+        # Scale factor for Gaussian x₀ at eval time when use_source=False.
+        # 1.0 = full noise (default), 0.01 = near-zero (analogous to eval_use_mean).
+        self.eval_noise_scale = float(self.cfg.get("eval_noise_scale", 1.0))
 
         # ── Cross-attention conditioning (CLIP / DINOv2 tokens → DiT) ──
         self.use_cross_attn = bool(
@@ -512,7 +515,7 @@ class FactFlowTrainer:
                 fmri_gt.reshape(n_eval, -1)[:, self.pad_mask].float(),
             ).mean().item()
         else:
-            x0 = torch.randn(n_eval, *self.latent_size, device=self.device)
+            x0 = self.eval_noise_scale * torch.randn(n_eval, *self.latent_size, device=self.device)
 
         # ODE sampling
         ctx = contexts if self.use_cross_attn else None
@@ -570,7 +573,7 @@ class FactFlowTrainer:
                 src = mu if self.eval_use_mean else self._reparam_source(mu, log_var)
                 x0 = src.permute(0, 2, 1).contiguous().view(B, *self.latent_size)
             else:
-                x0 = torch.randn(B, *self.latent_size, device=self.device)
+                x0 = self.eval_noise_scale * torch.randn(B, *self.latent_size, device=self.device)
 
             ctx = contexts if self.use_cross_attn else None
             with autocast(**self.autocast_kwargs):
