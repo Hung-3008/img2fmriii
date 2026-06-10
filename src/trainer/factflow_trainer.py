@@ -548,7 +548,7 @@ class FactFlowTrainer:
                     save_checkpoint(
                         os.path.join(self.ckpt_dir, f"{self.train_steps:07d}.pt"),
                         self.wrapper, self.optimizer, self.scheduler,
-                        self.train_steps, epoch, self.best_voxel_r,
+                        self.train_steps, epoch, self.best_metric,
                     )
 
                 # ── Rolling last checkpoint ──
@@ -556,7 +556,7 @@ class FactFlowTrainer:
                     save_rolling_last(
                         self.ckpt_dir, self.wrapper,
                         self.optimizer, self.scheduler,
-                        self.train_steps, epoch, self.best_voxel_r,
+                        self.train_steps, epoch, self.best_metric,
                     )
 
                 # ── Inline sample eval ──
@@ -612,7 +612,7 @@ class FactFlowTrainer:
         save_checkpoint(
             os.path.join(self.ckpt_dir, f"final-{self.train_steps}.pt"),
             self.wrapper, self.optimizer, self.scheduler,
-            self.train_steps, self.epochs, self.best_voxel_r,
+            self.train_steps, self.epochs, self.best_metric,
         )
         history_file.close()
         self.logger.info("Training complete. History: %s", history_path)
