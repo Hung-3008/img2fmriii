@@ -1,16 +1,17 @@
 """
 factflow_factory.py
 ===================
-Factory functions for the FactFlow fMRI stack (no-source flow matching):
+Factory functions for the FactFlow fMRI stack:
 
-1. **Model**: a single velocity network (DiT1D) wrapped in ``FactFlowWrapper``
-   for unified state-dict management.
+1. **Model**: a velocity network (DiT1D) + optional SourceEncoder, wrapped in
+   ``FactFlowWrapper`` for unified state-dict management.
 2. **Transport**: flow-matching transport with configurable path type and
    time-distribution shift.
 3. **Sampler**: ODE sampler for inference.
 
-The source x₀ is pure Gaussian noise (standard flow matching) — there is no
-learned source encoder.
+When ``source_encoder.enabled: true`` is set in the config, x₀ is sampled from
+a learned image-conditioned distribution N(μ_θ(c), σ_θ(c)²) instead of N(0, I).
+Otherwise the baseline pure-Gaussian source is used.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 
+from .source_encoder import SourceEncoder
 from .transport import create_transport, Sampler
 from utils.config_utils import instantiate_from_config
 
@@ -30,11 +32,12 @@ logger = logging.getLogger(__name__)
 
 
 class FactFlowWrapper(nn.Module):
-    """Thin container around the velocity DiT for unified state-dict handling."""
+    """Container around the velocity DiT (+ optional SourceEncoder)."""
 
-    def __init__(self, dit: nn.Module) -> None:
+    def __init__(self, dit: nn.Module, source_encoder: SourceEncoder | None = None) -> None:
         super().__init__()
         self.dit = dit
+        self.source_encoder = source_encoder
 
     def predict_velocity(
         self,
@@ -46,7 +49,7 @@ class FactFlowWrapper(nn.Module):
         """Run the velocity network.
 
         Args:
-            x: ``(B, C, H, W)`` noisy latent.
+            x: ``(B, 1, L)`` noisy fMRI signal.
             t: ``(B,)`` timestep.
             y: ``(B, D_pool)`` conditioning (CLIP pooled, AdaLN).
             contexts: list of ``(B, Mᵢ, Dᵢ)`` cross-attention streams (DINOv2,
@@ -54,9 +57,39 @@ class FactFlowWrapper(nn.Module):
                      ``use_cross_attn``.
 
         Returns:
-            ``(B, C, H, W)`` predicted velocity.
+            ``(B, 1, L)`` predicted velocity.
         """
         return self.dit(x=x, t=t, y=y, contexts=contexts)
+
+    def sample_source(
+        self,
+        z_pool: torch.Tensor,
+        C_dino: torch.Tensor | None,
+        noise_scale: float = 1.0,
+    ) -> torch.Tensor:
+        """Sample x₀ from the conditioned source distribution.
+
+        Delegates to ``self.source_encoder.sample()``.  The returned tensor is
+        **always detached** — the velocity DiT loss never backpropagates through
+        the source encoder.
+
+        Args:
+            z_pool:      (B, D_pool) CLIP pooled embedding.
+            C_dino:      (B, T, D_dino) DINOv2 tokens; may be None for CLIP-only.
+            noise_scale: 0.0 = deterministic (μ only); 1.0 = full stochastic.
+
+        Returns:
+            x₀: (B, 1, L) detached source sample.
+
+        Raises:
+            RuntimeError: if called when no source_encoder was built.
+        """
+        if self.source_encoder is None:
+            raise RuntimeError(
+                "sample_source() called but source_encoder is None. "
+                "Set source_encoder.enabled: true in the config."
+            )
+        return self.source_encoder.sample(z_pool, C_dino, noise_scale)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -65,11 +98,52 @@ class FactFlowWrapper(nn.Module):
 
 
 def build_models(cfg: DictConfig, device: str = "cpu") -> FactFlowWrapper:
-    """Instantiate the velocity DiT and wrap it, returning it on *device*."""
+    """Instantiate the velocity DiT (+ optional SourceEncoder) and wrap them.
+
+    The SourceEncoder is built when ``source_encoder.enabled: true`` appears in
+    the config.  All other keys in the ``source_encoder`` block are forwarded as
+    keyword arguments to :class:`SourceEncoder`.
+    """
     dit = instantiate_from_config(cfg.stage_2)
     dit_params = sum(p.numel() for p in dit.parameters())
     logger.info("DiT params: %.2fM", dit_params / 1e6)
-    return FactFlowWrapper(dit=dit).to(device)
+
+    source_enc: SourceEncoder | None = None
+    _se_raw = cfg.get("source_encoder", OmegaConf.create({}))
+    if not isinstance(_se_raw, DictConfig):
+        _se_raw = OmegaConf.create(_se_raw if isinstance(_se_raw, dict) else {})
+    se_cfg = OmegaConf.to_container(_se_raw, resolve=True)
+    if se_cfg.get("enabled", False):
+        # n_voxels: use pad_to from data config (authoritative after auto_pad)
+        n_voxels = int(cfg.data.get("pad_to", se_cfg.get("n_voxels", 15744)))
+
+        # dino_dim: prefer context_dims[0] injected by the dataset at runtime
+        # (e.g. dinov2_vitg14_multilayer4p: 4×257 tokens, dim=1536 per token).
+        # Fall back to se_cfg['dino_dim'] only when context_dims is not yet set.
+        context_dims = list(cfg.stage_2.params.get("context_dims") or [])
+        if context_dims:
+            dino_dim = int(context_dims[0])  # first stream = DINO
+        else:
+            dino_dim = int(se_cfg.get("dino_dim", 1024))
+
+        source_enc = SourceEncoder(
+            clip_dim   = int(se_cfg.get("clip_dim",   1280)),
+            dino_dim   = dino_dim,
+            hidden_dim = int(se_cfg.get("hidden_dim", 512)),
+            n_voxels   = n_voxels,
+            patch_size = int(se_cfg.get("patch_size",
+                             cfg.stage_2.params.get("patch_size", 32))),
+            use_dino   = bool(se_cfg.get("use_dino",  True)),
+        )
+        se_params = sum(p.numel() for p in source_enc.parameters())
+        logger.info(
+            "SourceEncoder enabled  params: %.2fM  use_dino=%s  dino_dim=%d  n_voxels=%d",
+            se_params / 1e6, se_cfg.get("use_dino", True), dino_dim, n_voxels,
+        )
+    else:
+        logger.info("SourceEncoder disabled — using pure Gaussian x₀ ~ N(0, I)")
+
+    return FactFlowWrapper(dit=dit, source_encoder=source_enc).to(device)
 
 
 def build_transport(cfg: DictConfig, latent_size: Tuple[int, int, int]) -> Any:

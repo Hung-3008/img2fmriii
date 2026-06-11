@@ -1,19 +1,23 @@
 """
 factflow_trainer.py
 ===================
-Training orchestrator for FactFlow fMRI synthesis (no-source flow matching).
+Training orchestrator for FactFlow fMRI synthesis.
 
-Pipeline:  Gaussian noise x₀  →  Flow Matching (velocity matching),
-           conditioned on CLIP-pooled (AdaLN) + cross-attention image features
-           (DINOv2, Gabor, …)  →  fMRI voxels.
+Supports two modes, controlled by ``source_encoder.enabled`` in the config:
 
-Details:
-  - Standard flow matching: x₀ ~ N(0, I), velocity-MSE objective.
-  - No source encoder, no auxiliary losses — just a (masked, SNR-weighted)
-    velocity loss on the real voxels.
-  - Validation against rep-averaged GT with noise_scale=0 (deterministic ceiling):
-    reports both voxel-wise (encoding) Pearson r and profile (pattern) Pearson r.
-    best.pt is selected by profile_r (directly comparable to SynBrain / published baselines).
+**Baseline (no source encoder):**
+  Standard flow matching: x₀ ~ N(0, I), velocity-MSE objective.
+
+**Source-Conditioned Flow Matching (SCFM):**
+  x₀ ~ N(μ_θ(z_CLIP, C_DINO), σ_θ²(…)) — image-conditioned source.
+  Source encoder trained with two auxiliary losses (independent of velocity path):
+    L_mu  = MSE(μ_θ, rep_averaged_fMRI)   — mean matches observed response
+    L_kl  = KL[N(μ,σ²) || N(0,1)]        — prevents σ collapse
+  x₀ is always detached before entering the flow path.
+
+Common:
+  - Validation uses noise_scale=0 (x₀ = μ_θ or 0): deterministic capacity ceiling.
+  - best.pt selected by profile_r (per-image Pearson across voxels).
   - Single-GPU, bf16-capable.
 """
 
@@ -161,6 +165,19 @@ class FactFlowTrainer:
         self.use_cross_attn = bool(
             self.cfg.stage_2.get("params", {}).get("use_cross_attn", False)
         )
+
+        # ── Source-Conditioned Flow Matching ──────────────────────────
+        self.use_source_encoder = self.wrapper.source_encoder is not None
+        if self.use_source_encoder:
+            se_cfg = OmegaConf.to_container(self.cfg.get("source_encoder", {}), resolve=True)
+            self.lambda_mu  = float(se_cfg.get("lambda_mu",  0.1))
+            self.lambda_kl  = float(se_cfg.get("lambda_kl",  0.001))
+            self.logger.info(
+                "SCFM mode ON: λ_mu=%.4f  λ_kl=%.4f",
+                self.lambda_mu, self.lambda_kl,
+            )
+        else:
+            self.lambda_mu = self.lambda_kl = 0.0
 
         # Per-voxel SNR (noise-ceiling) weight for the velocity loss.
         self.voxel_weight = self._build_voxel_weight()
@@ -349,21 +366,61 @@ class FactFlowTrainer:
         x1: torch.Tensor,
         clip_pool: torch.Tensor,
         contexts=None,
-    ) -> torch.Tensor:
-        """One flow-matching step: noise source → interpolate → velocity MSE."""
-        # 1) Pure Gaussian source x₀ (standard flow matching)
-        x0 = torch.randn_like(x1)
+    ) -> tuple[torch.Tensor, dict]:
+        """One training step: sample x₀, interpolate, compute all losses.
 
-        # 2) Sample timestep & interpolate along the flow path
+        Returns:
+            total_loss: scalar tensor (velocity loss + optional source losses)
+            log_dict:   {str: float} for logging (detached scalars)
+        """
+        ctx_for_vel = contexts if self.use_cross_attn else None
+
+        # ── Source x₀ ────────────────────────────────────────────────
+        if self.use_source_encoder:
+            # DINO tokens are the first context stream (context_features[0])
+            C_dino = contexts[0] if contexts else None
+            # sample() always returns a detached tensor — no grad through SE here
+            x0 = self.wrapper.sample_source(
+                z_pool=clip_pool,
+                C_dino=C_dino,
+                noise_scale=1.0,   # full stochastic during training
+            )
+        else:
+            x0 = torch.randn_like(x1)
+
+        # ── Velocity loss (flow matching objective) ────────────────
         t = self.transport.sample_timestep(x1)
         t, xt, ut = self.transport.path_sampler.plan(t, x0, x1)
+        v_pred = self.wrapper.predict_velocity(x=xt, t=t, y=clip_pool, contexts=ctx_for_vel)
+        loss_vel = masked_mse(v_pred, ut, self.pad_mask, weight=self.voxel_weight)
 
-        # 3) Predict velocity (cross-attend to context streams if enabled)
-        ctx = contexts if self.use_cross_attn else None
-        v_pred = self.wrapper.predict_velocity(x=xt, t=t, y=clip_pool, contexts=ctx)
+        # ── Auxiliary source-encoder losses (when SCFM enabled) ────
+        loss_src = torch.zeros((), device=self.device)
+        log_dict: dict = {"loss_vel": loss_vel.item()}
 
-        # 4) Velocity loss (masked, optionally SNR-weighted, MSE on real voxels)
-        return masked_mse(v_pred, ut, self.pad_mask, weight=self.voxel_weight)
+        if self.use_source_encoder:
+            C_dino = contexts[0] if contexts else None
+            # L_mu: MSE(μ_θ, x₁)  — x₁ is already rep-averaged (avg_reps=true)
+            loss_mu = self.wrapper.source_encoder.loss_mu(
+                z_pool=clip_pool,
+                C_dino=C_dino,
+                x1=x1,
+                pad_mask=self.pad_mask,
+            )
+            # L_kl: KL[N(μ, σ²) || N(0,1)]
+            loss_kl = self.wrapper.source_encoder.loss_kl(
+                z_pool=clip_pool,
+                C_dino=C_dino,
+                pad_mask=self.pad_mask,
+            )
+            loss_src = self.lambda_mu * loss_mu + self.lambda_kl * loss_kl
+            log_dict["loss_mu"]  = loss_mu.item()
+            log_dict["loss_kl"]  = loss_kl.item()
+            log_dict["loss_src"] = loss_src.item()
+
+        total_loss = loss_vel + loss_src
+        log_dict["loss_total"] = total_loss.item()
+        return total_loss, log_dict
 
     # ──────────────────────────────────────────────────────────────────
     # Inference helper (shared by inline eval & full validation)
@@ -371,15 +428,25 @@ class FactFlowTrainer:
 
     def _sample(self, model: torch.nn.Module, clip_pool, contexts, B: int,
                 noise_scale: float | None = None) -> torch.Tensor:
-        """ODE-sample fMRI from scaled Gaussian noise. Returns ``(B, *latent)``.
+        """ODE-sample fMRI from source (conditioned or Gaussian). Returns ``(B, *latent)``.
 
         Args:
-            noise_scale: Override the instance ``eval_noise_scale``.  Pass
-                ``0.0`` for a fully deterministic (ceiling) prediction.
+            noise_scale: 0.0 = fully deterministic (ceiling). None = use instance default.
         """
         scale = self.eval_noise_scale if noise_scale is None else noise_scale
-        x0 = scale * torch.randn(B, *self.latent_size, device=self.device)
         ctx = contexts if self.use_cross_attn else None
+
+        if model.source_encoder is not None:
+            C_dino = contexts[0] if contexts else None
+            with torch.no_grad():
+                x0 = model.sample_source(
+                    z_pool=clip_pool,
+                    C_dino=C_dino,
+                    noise_scale=scale,  # 0.0 → x₀=μ_θ (deterministic ceiling)
+                )
+        else:
+            x0 = scale * torch.randn(B, *self.latent_size, device=self.device)
+
         with autocast(**self.autocast_kwargs):
             traj = self.sample_fn(x0, model.dit.forward, y=clip_pool, contexts=ctx)
         return traj[-1].float()
@@ -498,18 +565,20 @@ class FactFlowTrainer:
                 contexts = [c.to(self.device) for c in batch["contexts"]]
 
                 with autocast(**self.autocast_kwargs):
-                    loss = self._compute_loss(x1, clip_pool, contexts)
+                    loss, log_dict = self._compute_loss(x1, clip_pool, contexts)
 
                 (loss / self.grad_accum).backward()
                 accum_counter += 1
 
-                micro_loss = loss.item() / self.grad_accum
+                micro_loss = log_dict["loss_total"] / self.grad_accum
                 running_loss += micro_loss
                 step_loss += micro_loss
-                pbar.set_postfix(
-                    loss=f"{loss.item():.4f}",
-                    lr=f"{self.scheduler.get_last_lr()[0]:.2e}",
-                )
+                postfix = {"loss": f"{loss.item():.4f}",
+                           "lr": f"{self.scheduler.get_last_lr()[0]:.2e}"}
+                if self.use_source_encoder:
+                    postfix["mu"] = f"{log_dict.get('loss_mu', 0):.4f}"
+                    postfix["kl"] = f"{log_dict.get('loss_kl', 0):.5f}"
+                pbar.set_postfix(postfix)
 
                 if accum_counter < self.grad_accum:
                     continue

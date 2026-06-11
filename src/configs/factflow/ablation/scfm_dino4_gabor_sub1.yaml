@@ -1,0 +1,125 @@
+# ==============================================================================
+# FactFlow — Source-Conditioned Flow Matching (SCFM), subject 1
+# ------------------------------------------------------------------------------
+# x₀ ~ N(μ_θ(z_CLIP, C_DINO), σ_θ²) instead of N(0, I).
+# SourceEncoder: CLIP-pool + DINOv2 mean-pool → μ and log_var in voxel space.
+#
+# Conditioning (DiT, unchanged from baseline):
+#   - AdaLN      ← clip_pool = sdxl_clip_pool                   (1280-d)
+#   - cross-attn ← dinov2_vitg14_multilayer4p (4×257, 1536-d)
+#                + gabor (256, 24-d)
+#
+# SourceEncoder auxiliary losses:
+#   L_mu  = λ_mu  × MSE(μ_θ, rep_avg_fMRI)   (λ=0.1)
+#   L_kl  = λ_kl  × KL[N(μ,σ²)||N(0,1)]      (λ=0.001)
+#
+# Validation: noise_scale=0 → x₀=μ_θ (deterministic ceiling, same semantics
+# as baseline noise_scale=0). Profile_r and voxel_r comparable to baseline.
+# ==============================================================================
+eval_noise_scale: 0.01
+
+# ── Source encoder ─────────────────────────────────────────────────────────────
+source_encoder:
+  enabled: true
+  # Feature dims (must match pre-extracted features)
+  clip_dim: 1280          # SDXL-CLIP pooled
+  dino_dim: 1024          # DINOv2 ViT-g/14 per-token dim (after multi-layer flatten)
+  # Architecture
+  hidden_dim: 512         # bottleneck (matches DiT hidden_size)
+  patch_size: 32          # must match stage_2.params.patch_size
+  use_dino: true          # false = CLIP-only ablation
+  # Auxiliary loss weights
+  lambda_mu: 0.1          # MSE(μ_θ, rep_avg_fMRI)
+  lambda_kl: 0.001        # KL[N(μ,σ²)||N(0,1)]
+
+# ── Data ───────────────────────────────────────────────────────────────────────
+data:
+  data_dir: NSD/data/nsd
+  subdirs:
+    fmri: fmri
+    sdxl_clip: clip
+    dinov2_vitg14_multilayer4p: dino
+    gabor: gabor
+  subject: 1
+  fmri_mode: zscore
+  clip_feature: sdxl_clip
+  n_voxels: 15724
+  pad_to: 15744
+  auto_pad: true
+  roi_order: true
+  avg_reps: true          # training uses rep-averaged fMRI (L_mu target = x₁)
+  context_features:
+  - dinov2_vitg14_multilayer4p   # contexts[0] → SourceEncoder C_dino input
+  - gabor                         # contexts[1] → DiT cross-attn only
+
+# ── Velocity network (DiT1D, identical to baseline RFR config) ─────────────────
+stage_2:
+  target: model.dit_1d.DiT1D
+  params:
+    seq_len: 15744
+    patch_size: 32
+    in_channels: 1
+    hidden_size: 512
+    depth: 12
+    num_heads: 8
+    mlp_ratio: 4.0
+    y_in_channels: 1280
+    learn_sigma: false
+    use_qknorm: true
+    use_swiglu: true
+    use_rmsnorm: true
+    use_rope: true
+    wo_shift: false
+    use_cross_attn: true
+    use_roi_routing: true
+    n_roi_buckets: 3
+    roi_emb_dim: 64
+    # context_dims: injected at runtime from dataset.context_dims
+
+# ── Transport ──────────────────────────────────────────────────────────────────
+transport:
+  params:
+    path_type: Linear
+    prediction: velocity
+    loss_weight: null
+    time_dist_type: logit-normal_-1.0_1.0
+    time_dist_shift: 15744
+
+# ── Sampler ────────────────────────────────────────────────────────────────────
+sampler:
+  mode: ODE
+  params:
+    sampling_method: euler
+    num_steps: 50
+    atol: 1.0e-06
+    rtol: 0.001
+    reverse: false
+
+# ── Loss flags ─────────────────────────────────────────────────────────────────
+losses:
+  use_snr_weight: true    # per-voxel noise-ceiling weighting (unchanged)
+
+# ── Training ───────────────────────────────────────────────────────────────────
+training:
+  global_seed: 42
+  epochs: 50
+  batch_size: 32
+  grad_accum_steps: 8
+  num_workers: 2
+  pin_memory: false
+  log_every: 50
+  ckpt_every: 5000
+  sample_every: 2000
+  val_every: 5
+  optimizer:
+    lr: 0.0001
+    betas:
+    - 0.9
+    - 0.95
+    weight_decay: 0.01
+  base_lr: 0.0001
+  final_lr: 1.0e-05
+  schedule_type: cosine
+  warmup_steps: 500
+  clip_grad: 1.0
+  precision: bf16
