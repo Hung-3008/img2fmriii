@@ -1,17 +1,12 @@
 # ==============================================================================
-# Ablation: NO SOURCE ENCODER + DINOv2(4L) + Gabor cross-attention
-# Subject 7
+# FactFlow fMRI synthesis — no-source flow matching, subject 7
 # ------------------------------------------------------------------------------
-# Pure Gaussian noise x₀ during training (standard flow matching).
-# At eval time, x₀ ≈ 0 (eval_noise_scale=0.01) for near-deterministic
-# model selection — analogous to eval_use_mean in the source-encoder variant.
-#
-#   - source encoder: NONE (x₀ ~ N(0, I) at train, 0.01·N(0,I) at eval)
-#   - AdaLN conditioning  ← clip_pool = sdxl_clip_pool             (1280)
-#   - cross-attention      ← dinov2_vitg14_multilayer4p (4, 257, 1536) → 1028 tok
-#                          + gabor                     (256, 24)       →  256 tok
+# Standard flow matching: x0 ~ N(0, I) -> velocity matching -> fMRI voxels.
+# Conditioning:
+#   - AdaLN      <- clip_pool = sdxl_clip_pool                  (1280)
+#   - cross-attn <- dinov2_vitg14_multilayer4p (4, 257, 1536) + gabor (256, 24)
+# At eval, x0 is scaled by eval_noise_scale (~0 -> near-deterministic selection).
 # ==============================================================================
-use_source_encoder: false
 eval_noise_scale: 0.01
 data:
   data_dir: NSD/data/nsd
@@ -49,26 +44,6 @@ stage_2:
     use_rope: true
     wo_shift: false
     use_cross_attn: true
-source_encoder:
-  target: model.perceiver.PerceiverVE
-  params:
-    in_channels: 1664
-    out_channels: 64
-    hidden_size: 384
-    depth: 4
-    num_heads: 8
-    mlp_ratio: 4.0
-    dropout_prob: 0.0
-    num_queries: 198
-    max_input_len: 256
-    pos_emb_type: learned
-    use_qknorm: false
-    use_swiglu: true
-    use_rmsnorm: true
-    use_variational: true
-    use_per_token_logvar: false
-    init_logvar: 0.0
-    fixed_std: null
 transport:
   params:
     path_type: Linear
@@ -85,18 +60,6 @@ sampler:
     rtol: 0.001
     reverse: false
 losses:
-  use_kld_loss: false
-  kld_loss_type: kld
-  kld_loss_weight: 0.0
-  kld_target_std: 1.0
-  kld_reduction: mean
-  clip_logvar_min: -1.4
-  clip_logvar_max: 10.0
-  use_align_loss: false
-  use_recon_loss: false
-  recon_loss_type: pearson
-  recon_loss_weight: 0.0
-  detach_ut: false
   use_snr_weight: true
 training:
   global_seed: 42

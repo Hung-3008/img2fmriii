@@ -25,10 +25,10 @@ class FactFlowfMRIDataset(Dataset):
     """Dataset pairing CLIP visual features with fMRI betas.
 
     Each sample returns:
-        fmri:        (1, V_pad) or (C, H, W) — fMRI beta-weights
-        clip_tokens: (T, D)    — CLIP spatial tokens (for PerceiverVE)
-        clip_pool:   (D_pool,) — CLIP pooled embedding (for DiT y-conditioning)
-        pad_mask:    (V_pad,)  — boolean, True for real voxels
+        fmri:      (1, V_pad) or (C, H, W) — fMRI beta-weights
+        clip_pool: (D_pool,) — CLIP pooled embedding (for DiT AdaLN conditioning)
+        pad_mask:  (V_pad,)  — boolean, True for real voxels
+        contexts:  list of (Tᵢ, Dᵢ) — cross-attention image-feature streams
     """
 
     def __init__(
@@ -86,13 +86,7 @@ class FactFlowfMRIDataset(Dataset):
         # avg_reps: treat each image as a single sample (mean across reps)
         self.n_samples = self.n_images if avg_reps else self.n_images * self.n_reps
 
-        # --- CLIP tokens: (N_images, T, D) ---
-        clip_tok_path = self._resolve(
-            f"nsd_{clip_feature}_{mode}_sub{subject}.npy", clip_feature
-        )
-        self.clip_tokens = np.load(clip_tok_path, mmap_mode="r")
-
-        # --- CLIP pooled: (N_images, D_pool) --- (lives alongside the clip tokens)
+        # --- CLIP pooled: (N_images, D_pool) --- (AdaLN conditioning) ---
         clip_pool_path = self._resolve(
             f"nsd_{clip_feature}_pool_{mode}_sub{subject}.npy", clip_feature
         )
@@ -118,7 +112,6 @@ class FactFlowfMRIDataset(Dataset):
         # Per-stream feature dim (last axis) — used to size the model embedders.
         self.context_dims = [int(m.shape[-1]) for m in self.context_mmaps]
 
-        assert self.clip_tokens.shape[0] == self.n_images
         assert self.clip_pool.shape[0] == self.n_images
 
         # --- Pad mask: True for real voxels ---
@@ -188,8 +181,7 @@ class FactFlowfMRIDataset(Dataset):
         else:
             fmri_out = padded[np.newaxis, :]  # (1, pad_to)
 
-        # --- CLIP features: same for all reps of same image ---
-        clip_tok = self.clip_tokens[image_idx].astype(np.float32)
+        # --- CLIP pooled: same for all reps of same image ---
         clip_p = self.clip_pool[image_idx].astype(np.float32)
 
         # --- Cross-attention context streams ---
@@ -200,22 +192,16 @@ class FactFlowfMRIDataset(Dataset):
                 arr = arr.reshape(-1, arr.shape[-1])
             contexts.append(torch.from_numpy(arr))
 
-        sample = {
+        return {
             "fmri": torch.from_numpy(fmri_out),
-            "clip_tokens": torch.from_numpy(clip_tok), # (T, D) — for source encoder
             "clip_pool": torch.from_numpy(clip_p),     # (D_pool,) — AdaLN conditioning
             "pad_mask": torch.from_numpy(self.pad_mask.copy()),  # (V_pad,)
             "contexts": contexts,              # list of (Tᵢ, Dᵢ) cross-attn streams
         }
-        return sample
 
     @property
     def voxel_count(self) -> int:
         return self.n_voxels
-
-    @property
-    def clip_token_dim(self) -> int:
-        return self.clip_tokens.shape[-1]
 
     @property
     def clip_pool_dim(self) -> int:

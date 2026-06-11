@@ -1,40 +1,26 @@
 """
 eval_factflow_fmri.py
 =====================
-Entry point for FactFlow fMRI synthesis evaluation.
+Entry point for FactFlow fMRI synthesis evaluation (no-source flow matching).
 
-Supports three inference scenarios:
-
-  1. ``deterministic`` — PerceiverVE uses μ (no sampling), ODE solver (no noise).
-  2. ``perceiver_stochastic`` — PerceiverVE samples x₀ = μ + ε·σ, ODE solver.
-  3. ``flow_stochastic`` — PerceiverVE uses μ, SDE solver (noise injection).
-
-For stochastic scenarios, runs ``--max_trials`` forward passes (default 10),
-saves each individual pass, then computes metrics for each K in ``--k_values``
-(default 1,5,10) by averaging the first K passes.
+The source x₀ is scaled Gaussian noise (``eval_noise_scale`` from the config)
+integrated with an ODE solver. With near-zero noise the prediction is
+deterministic (K=1); with full noise, ``--max_trials`` passes are averaged and
+metrics reported for each K in ``--k_values``.
 
 Usage::
 
-    # Scenario 1: fully deterministic
+    # Deterministic (eval_noise_scale ≈ 0 in config), single pass
     python src/eval_factflow_fmri.py \\
-        --config src/configs/factflow/srcdist_v2/factflow_fmri_cross_dino_srcdist_v2.yaml \\
+        --config src/configs/factflow/ablation/factflow_fmri_ablation_nosrc_dino4_gabor_sub1.yaml \\
         --ckpt exps/.../checkpoints/best.pt \\
-        --scenario deterministic \\
-        --output results/eval_deterministic
+        --output results/eval
 
-    # Scenario 2: perceiver stochastic, 10 passes → metrics for K=1,5,10
+    # Stochastic averaging: 10 passes → metrics for K=1,5,10
     python src/eval_factflow_fmri.py \\
         --config ... --ckpt ... \\
-        --scenario perceiver_stochastic \\
         --max_trials 10 --k_values 1,5,10 \\
-        --output results/eval_perceiver_stochastic
-
-    # Scenario 3: flow stochastic, 10 passes → metrics for K=1,5,10
-    python src/eval_factflow_fmri.py \\
-        --config ... --ckpt ... \\
-        --scenario flow_stochastic \\
-        --max_trials 10 --k_values 1,5,10 \\
-        --output results/eval_flow_stochastic
+        --output results/eval
 """
 
 import argparse
@@ -56,38 +42,22 @@ def main() -> None:
     parser.add_argument("--ckpt", type=str, required=True,
                         help="Checkpoint to evaluate")
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument(
+        "--eval_noise_scale", type=float, default=None,
+        help="Override eval_noise_scale from config (e.g. 0.5 for stochastic eval)",
+    )
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="",
                         help="Device (default: auto-detect)")
     parser.add_argument("--output", type=str, default=None,
                         help="Directory to save results (per-pass .npy + avg .npz)")
-
-    # ── Scenario arguments ────────────────────────────────────────────
     parser.add_argument(
-        "--scenario", type=str, default="deterministic",
-        choices=["deterministic", "perceiver_stochastic", "flow_stochastic"],
-        help=(
-            "Inference scenario: "
-            "'deterministic' = μ + ODE (fully deterministic), "
-            "'perceiver_stochastic' = sample x₀ + ODE, "
-            "'flow_stochastic' = μ + SDE (noise-injected flow)"
-        ),
+        "--max_trials", type=int, default=1,
+        help="Number of stochastic forward passes to run (default: 1)",
     )
     parser.add_argument(
-        "--max_trials", type=int, default=10,
-        help="Number of stochastic forward passes to run (default: 10)",
-    )
-    parser.add_argument(
-        "--k_values", type=str, default="1,5,10",
-        help="Comma-separated K values to average and report (default: 1,5,10)",
-    )
-    parser.add_argument(
-        "--sde_num_steps", type=int, default=250,
-        help="Number of SDE integration steps (for flow_stochastic scenario)",
-    )
-    parser.add_argument(
-        "--sde_diffusion_norm", type=float, default=1.0,
-        help="Diffusion coefficient magnitude for SDE (for flow_stochastic scenario)",
+        "--k_values", type=str, default="1",
+        help="Comma-separated K values to average and report (default: 1)",
     )
     parser.add_argument(
         "--csv_out", type=str, default=None,

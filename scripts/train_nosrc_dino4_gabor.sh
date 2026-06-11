@@ -5,8 +5,8 @@
 # Ablation: No source encoder (pure Gaussian x₀) + DINO4 + Gabor cross-attn.
 #
 # Training uses x₀ ~ N(0, I) (standard flow matching).
-# Eval uses x₀ ~ 0.01·N(0, I) for near-deterministic model selection
-# (analogous to eval_use_mean in the source-encoder variant).
+# Eval uses x₀ ~ 0.01·N(0, I) (eval_noise_scale) for near-deterministic
+# model selection.
 #
 # Runs subjects 1, 2, 5, 7 sequentially.
 # All experiments stored under exps/ablations/

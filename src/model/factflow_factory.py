@@ -1,18 +1,16 @@
 """
 factflow_factory.py
 ===================
-Factory functions for building the FactFlow model stack:
+Factory functions for the FactFlow fMRI stack (no-source flow matching):
 
-1. **Models**: LightningDiT (velocity network) + PerceiverVE (source encoder),
-   wrapped in a unified ``nn.Module`` for joint state-dict management.
-2. **Transport**: Flow-matching transport with configurable path type
-   and time distribution shift.
+1. **Model**: a single velocity network (DiT1D) wrapped in ``FactFlowWrapper``
+   for unified state-dict management.
+2. **Transport**: flow-matching transport with configurable path type and
+   time-distribution shift.
 3. **Sampler**: ODE sampler for inference.
 
-Architecture notes
-------------------
-We import the model classes (``LightningDiT``, ``PerceiverVE``) from
-the local modules. The *wiring* and *factory logic* is fully owned here.
+The source x₀ is pure Gaussian noise (standard flow matching) — there is no
+learned source encoder.
 """
 
 from __future__ import annotations
@@ -31,36 +29,12 @@ from utils.config_utils import instantiate_from_config
 logger = logging.getLogger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Unified wrapper — replaces original generic ``Wrapper``
-# ═══════════════════════════════════════════════════════════════════════════
-
-
 class FactFlowWrapper(nn.Module):
-    """Unified container for the velocity DiT and the source encoder.
+    """Thin container around the velocity DiT for unified state-dict handling."""
 
-    Advantages over the generic ``Wrapper``:
-    * Typed attributes (``self.dit``, ``self.source_encoder``) for IDE
-      auto-completion and static analysis.
-    * Direct method calls instead of string-based dispatch.
-    """
-
-    def __init__(self, dit: nn.Module, source_encoder: nn.Module) -> None:
+    def __init__(self, dit: nn.Module) -> None:
         super().__init__()
         self.dit = dit
-        self.source_encoder = source_encoder
-
-    def encode_source(self, clip_tokens: torch.Tensor):
-        """Run the source encoder (PerceiverVE).
-
-        Args:
-            clip_tokens: ``(B, T, D)`` CLIP spatial tokens.
-
-        Returns:
-            ``(x0_tok, mu, log_var)`` where ``x0_tok`` is
-            ``(B, num_queries, out_channels)``.
-        """
-        return self.source_encoder(text_tokens=clip_tokens)
 
     def predict_velocity(
         self,
@@ -69,15 +43,15 @@ class FactFlowWrapper(nn.Module):
         y: torch.Tensor,
         contexts=None,
     ) -> torch.Tensor:
-        """Run the velocity network (DiT).
+        """Run the velocity network.
 
         Args:
             x: ``(B, C, H, W)`` noisy latent.
             t: ``(B,)`` timestep.
-            y: ``(B, D_pool)`` conditioning (CLIP pooled).
-            contexts: list of ``(B, Mᵢ, Dᵢ)`` cross-attention streams (CLIP,
-                     DINOv2, multi-layer DINOv2, Gabor, …); ignored unless the
-                     DiT was built with ``use_cross_attn``.
+            y: ``(B, D_pool)`` conditioning (CLIP pooled, AdaLN).
+            contexts: list of ``(B, Mᵢ, Dᵢ)`` cross-attention streams (DINOv2,
+                     Gabor, …); ignored unless the DiT was built with
+                     ``use_cross_attn``.
 
         Returns:
             ``(B, C, H, W)`` predicted velocity.
@@ -90,36 +64,19 @@ class FactFlowWrapper(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def build_models(
-    cfg: DictConfig,
-    device: str = "cpu",
-) -> FactFlowWrapper:
-    """Instantiate DiT + SourceEncoder and wrap them.
-
-    Returns the *wrapper* on *device*.
-    """
+def build_models(cfg: DictConfig, device: str = "cpu") -> FactFlowWrapper:
+    """Instantiate the velocity DiT and wrap it, returning it on *device*."""
     dit = instantiate_from_config(cfg.stage_2)
-    source_encoder = instantiate_from_config(cfg.source_encoder)
-
     dit_params = sum(p.numel() for p in dit.parameters())
-    se_params = sum(p.numel() for p in source_encoder.parameters())
     logger.info("DiT params: %.2fM", dit_params / 1e6)
-    logger.info("SourceEncoder params: %.2fM", se_params / 1e6)
-    logger.info("Total trainable: %.2fM", (dit_params + se_params) / 1e6)
-
-    return FactFlowWrapper(dit=dit, source_encoder=source_encoder).to(device)
+    return FactFlowWrapper(dit=dit).to(device)
 
 
-def build_transport(
-    cfg: DictConfig,
-    latent_size: Tuple[int, int, int],
-) -> Any:
+def build_transport(cfg: DictConfig, latent_size: Tuple[int, int, int]) -> Any:
     """Create a flow-matching Transport object.
 
-    Computes the ``time_dist_shift`` from *latent_size* automatically
-    (matching the convention of sqrt(dim / shift_base)).
-
-    Returns a ``Transport`` instance.
+    Computes ``time_dist_shift`` from *latent_size* automatically
+    (sqrt(dim / shift_base)). Returns a ``Transport`` instance.
     """
     transport_cfg: Dict[str, Any] = OmegaConf.to_container(
         cfg.transport.get("params", {}), resolve=True,
@@ -141,7 +98,7 @@ def build_sampler(
     transport: Any,
     sampler_cfg: DictConfig | Dict[str, Any],
 ) -> Callable:
-    """Create an ODE/SDE sampling function from a Transport instance.
+    """Create an ODE sampling function from a Transport instance.
 
     Returns a callable ``sample_fn(x0, model_fn, **kwargs) → trajectory``.
     """
@@ -154,7 +111,4 @@ def build_sampler(
 
     if mode == "ODE":
         return sampler.sample_ode(**params)
-    elif mode == "SDE":
-        return sampler.sample_sde(**params)
-    else:
-        raise NotImplementedError(f"Sampler mode '{mode}' not supported")
+    raise NotImplementedError(f"Sampler mode '{mode}' not supported")
