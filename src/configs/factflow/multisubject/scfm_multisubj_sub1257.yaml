@@ -118,11 +118,13 @@ losses:
   use_snr_weight: true
 
 # ── Training ───────────────────────────────────────────────────────────────────
+# batch_size=16, grad_accum=16 → effective batch=256
+# (common_seq_len=15744 is 4× single-subject → need smaller batch to fit 24GB GPU)
 training:
   global_seed: 42
   epochs: 50
-  batch_size: 32
-  grad_accum_steps: 8
+  batch_size: 16
+  grad_accum_steps: 16
   num_workers: 2
   pin_memory: false
   log_every: 50

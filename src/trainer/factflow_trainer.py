@@ -105,6 +105,13 @@ class FactFlowTrainer:
         self._build_datasets()
 
         # ── Geometry ──────────────────────────────────────────────────
+        # Multi-subject: use common_seq_len as the shared padded space.
+        # pad_mask is all-True (each batch item has its own pad_mask from dataset).
+        if getattr(self, "is_multisubject", False):
+            self.data_cfg["pad_to"] = int(
+                self.data_cfg.get("common_seq_len", self.train_ds.common_seq_len)
+            )
+            self.data_cfg["n_voxels"] = self.data_cfg["pad_to"]
         self.latent_size = get_latent_size(self.data_cfg)
         self.pad_mask = create_pad_mask(
             self.data_cfg["n_voxels"], self.data_cfg["pad_to"], self.device,
@@ -215,7 +222,20 @@ class FactFlowTrainer:
 
         n_roi_buckets = int(self.cfg.stage_2.params.get("n_roi_buckets", 3))
         dc = self.data_cfg
-        subject = dc["subject"]
+
+        # Support both single-subject ('subject') and multi-subject ('subjects') configs
+        if "subject" in dc:
+            subject = dc["subject"]
+            n_voxels = dc["n_voxels"]
+            pad_to = dc["pad_to"]
+        else:
+            # Multi-subject: use the first (largest) subject for shared ROI bucket map
+            subjects_list = list(dc["subjects"])
+            subject = subjects_list[0]
+            sub_cfg = dc.get(f"sub{subject}", {})
+            n_voxels = int(sub_cfg.get("n_voxels", dc.get("n_voxels", 15724)))
+            pad_to = int(dc.get("common_seq_len", dc.get("pad_to", 15744)))
+
         roi_path = os.path.join(
             dc["data_dir"], f"subj0{subject}", f"roi_meta_sub{subject}.npz"
         )
@@ -236,7 +256,6 @@ class FactFlowTrainer:
             bucket[(roi_labels >= 7) & (roi_labels <= 15)] = 1         # mid V3A-PHC
         else:
             # No label info: divide voxels into equal thirds by sorted position
-            n_voxels = dc["n_voxels"]
             bucket = np.zeros(n_voxels, dtype=np.int64)
             third = n_voxels // 3
             bucket[third:2*third] = 1
@@ -252,16 +271,16 @@ class FactFlowTrainer:
 
         dit.set_roi_buckets(
             voxel_bucket_ids=bucket,
-            pad_to=dc["pad_to"],
+            pad_to=pad_to,
             n_roi_buckets=n_roi_buckets,
         )
         self.logger.info(
-            "ROI routing ON: buckets=%d  early=%d  mid=%d  high=%d  patches=%d",
+            "ROI routing ON: buckets=%d  early=%d  mid=%d  high=%d  patches=%d  (sub%d)",
             n_roi_buckets,
             int((bucket == 0).sum()), int((bucket == 1).sum()),
             int((bucket == 2).sum()),
-            dc["pad_to"] // self.data_cfg.get("patch_size",
-                self.cfg.stage_2.params.get("patch_size", 32)),
+            pad_to // int(self.cfg.stage_2.params.get("patch_size", 32)),
+            subject,
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -271,6 +290,13 @@ class FactFlowTrainer:
     def _build_voxel_weight(self) -> Optional[torch.Tensor]:
         """Per-voxel noise-ceiling weight over ``pad_to`` (None if disabled)."""
         if not self.cfg.get("losses", {}).get("use_snr_weight", False):
+            return None
+        # Multi-subject mode: per-voxel SNR weight undefined across subjects.
+        if getattr(self, "is_multisubject", False):
+            self.logger.warning(
+                "SNR-weighted loss disabled in multi-subject mode "
+                "(per-subject noise ceiling not yet supported)."
+            )
             return None
         nc = compute_voxel_reliability(
             self.train_ds.fmri_data, self.train_ds.n_reps,

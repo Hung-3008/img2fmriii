@@ -52,6 +52,12 @@ _N_ROI_BUCKETS = 3
 def _load_roi_profile(subj_dir: str, subject: int, n_voxels: int) -> torch.Tensor:
     """Load roi_meta and compute normalised bucket count vector.
 
+    ROI label → bucket mapping (matches _setup_roi_routing in trainer):
+        label 0 (other/unknown) → bucket 2 (high, conservative default)
+        label 1 (early: V1/V2/V3) → bucket 0 (early)
+        labels 2-4 (midventral/midlateral/midparietal) → bucket 1 (mid)
+        labels 5-7 (ventral/lateral/parietal) → bucket 2 (high)
+
     Returns a (n_buckets,) float tensor of [early_frac, mid_frac, high_frac].
     Falls back to uniform distribution if roi_meta is not found.
     """
@@ -64,12 +70,19 @@ def _load_roi_profile(subj_dir: str, subject: int, n_voxels: int) -> torch.Tenso
         return torch.full((_N_ROI_BUCKETS,), 1.0 / _N_ROI_BUCKETS)
 
     meta = np.load(roi_path)
-    bucket_ids = meta["bucket_ids"][:n_voxels]  # (n_voxels,) int
+    roi_labels = meta["roi_labels"][:n_voxels].astype(np.int64)  # (n_voxels,)
 
-    counts = np.bincount(bucket_ids.astype(int), minlength=_N_ROI_BUCKETS).astype(np.float32)
+    # Map 8 NSD-streams labels → 3 visual hierarchy buckets
+    bucket = np.full(n_voxels, 2, dtype=np.int64)          # default: high (2)
+    bucket[roi_labels == 1] = 0                             # early: label 1
+    bucket[(roi_labels >= 2) & (roi_labels <= 4)] = 1      # mid: labels 2-4
+    # labels 5-7 and 0 stay at bucket 2 (high / other)
+
+    counts = np.bincount(bucket, minlength=_N_ROI_BUCKETS).astype(np.float32)
     total = counts.sum()
     profile = counts / total if total > 0 else np.ones(_N_ROI_BUCKETS) / _N_ROI_BUCKETS
     return torch.from_numpy(profile)
+
 
 
 class MultiSubjectfMRIDataset(Dataset):
@@ -206,3 +219,37 @@ class MultiSubjectfMRIDataset(Dataset):
     def voxel_count(self) -> int:
         """Returns common_seq_len (the padded, shared sequence length)."""
         return self.common_seq_len
+
+    # ── Duck-type compatibility with FactFlowfMRIDataset ─────────────────────
+    # Trainer reads these attributes from train_ds. For multi-subject we
+    # delegate to datasets[0] (Sub1 — the reference subject used for ROI routing).
+
+    @property
+    def sort_idx(self):
+        """Sort index from the first (reference) subject for ROI permutation."""
+        return self.datasets[0].sort_idx
+
+    @property
+    def fmri_data(self):
+        """fMRI data array from the first subject (used by _build_voxel_weight,
+        which is disabled in multi-subject mode, so this is a safe fallback)."""
+        return self.datasets[0].fmri_data
+
+    @property
+    def n_reps(self) -> int:
+        return self.datasets[0].n_reps
+
+    @property
+    def n_voxels(self) -> int:
+        """n_voxels of the first (reference) subject."""
+        return self.datasets[0].n_voxels
+
+    @property
+    def pad_to(self) -> int:
+        """Common padded sequence length (alias for common_seq_len)."""
+        return self.common_seq_len
+
+    @property
+    def subject(self) -> int:
+        """Subject ID of the first (reference) subject."""
+        return self.datasets[0].subject
