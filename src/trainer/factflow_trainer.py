@@ -542,45 +542,116 @@ class FactFlowTrainer:
 
         Always uses **noise_scale=0** (deterministic ODE) so that the metric
         reflects the model's ceiling capacity, independent of stochastic
-        averaging.  Reports both voxel_r (encoding) and profile_r (pattern
-        correlation, comparable to SynBrain / MindSimulator).
+        averaging.
+
+        In multi-subject mode, computes per-subject metrics in addition to
+        the global average. Each sample's pad_mask is used (from the batch)
+        so that padding voxels of shorter subjects are properly excluded.
         """
         loader = DataLoader(
             self.val_ds, batch_size=32, shuffle=False, num_workers=0, drop_last=False,
         )
         self.wrapper.eval()
-        preds_all, gts_all = [], []
-        profile_rs = []
+
+        # ── Per-subject accumulators ────────────────────────────────────────
+        is_multi = getattr(self, "is_multisubject", False)
+        if is_multi:
+            subjects = self.val_ds.subjects
+            subj_profile_rs = {s: [] for s in subjects}
+            subj_mse_sum = {s: 0.0 for s in subjects}
+            subj_n = {s: 0 for s in subjects}
+        else:
+            subjects = None
+
+        # ── Global accumulators ─────────────────────────────────────────────
+        all_profile_rs = []
         mse_sum, n = 0.0, 0
+
         for batch in loader:
             fmri_gt = batch["fmri"].to(self.device)
             clip_pool = batch["clip_pool"].to(self.device)
             contexts = [c.to(self.device) for c in batch["contexts"]]
             B = fmri_gt.shape[0]
 
+            # Subject conditioning
+            subject_ids = batch["subject_id"].to(self.device) if "subject_id" in batch else None
+            roi_profile = batch["roi_profile"].to(self.device) if "roi_profile" in batch else None
+
             # Deterministic (noise_scale=0): ceiling prediction E[x|c]
-            pred = self._sample(self.wrapper, clip_pool, contexts, B, noise_scale=0.0)
-            mse_sum += masked_mse(pred, fmri_gt, self.pad_mask).item() * B
-            n += B
-            preds_all.append(pred.reshape(B, -1)[:, self.pad_mask].cpu())
-            gts_all.append(fmri_gt.reshape(B, -1)[:, self.pad_mask].cpu())
-            # Profile r: per-image, across voxels (same as SynBrain metric)
-            profile_rs.append(
-                pearson_corr_per_sample(pred, fmri_gt, self.pad_mask).cpu()
+            pred = self._sample(
+                self.wrapper, clip_pool, contexts, B, noise_scale=0.0,
+                subject_ids=subject_ids, roi_profile=roi_profile,
             )
 
-        preds_cat = torch.cat(preds_all)   # (N, V)
-        gts_cat   = torch.cat(gts_all)     # (N, V)
-        val_voxel_r   = voxel_pearson(preds_cat, gts_cat).mean().item()
-        val_profile_r = torch.cat(profile_rs).mean().item()
-        val_mse       = mse_sum / n
-        self.logger.info(
-            "  [Val epoch=%d] voxel_r=%.4f  profile_r=%.4f  mse=%.5f  n=%d  "
-            "(noise_scale=0, deterministic)",
-            epoch + 1, val_voxel_r, val_profile_r, val_mse, n,
-        )
+            # ── Per-sample metrics using per-sample pad_mask ─────────────
+            if is_multi and "pad_mask" in batch:
+                batch_pad_mask = batch["pad_mask"]  # (B, L) bool
+                batch_subj_ids = batch["subject_id"]  # (B,) long
+                for i in range(B):
+                    pm = batch_pad_mask[i].to(self.device)  # (L,) bool
+                    p_i = pred[i].reshape(-1)[pm]            # (V_real,)
+                    g_i = fmri_gt[i].reshape(-1)[pm]         # (V_real,)
+                    # Profile r
+                    p_c = p_i - p_i.mean()
+                    g_c = g_i - g_i.mean()
+                    num = (p_c * g_c).sum()
+                    den = torch.sqrt((p_c**2).sum() * (g_c**2).sum()) + 1e-8
+                    pr = (num / den).item()
+                    # MSE
+                    mse_i = ((p_i - g_i)**2).mean().item()
+
+                    all_profile_rs.append(pr)
+                    mse_sum += mse_i
+                    n += 1
+
+                    # Per-subject tracking
+                    subj_idx = batch_subj_ids[i].item()
+                    subj = subjects[subj_idx]
+                    subj_profile_rs[subj].append(pr)
+                    subj_mse_sum[subj] += mse_i
+                    subj_n[subj] += 1
+            else:
+                # Single-subject: use global pad_mask
+                mse_sum += masked_mse(pred, fmri_gt, self.pad_mask).item() * B
+                n += B
+                profile_rs = pearson_corr_per_sample(pred, fmri_gt, self.pad_mask).cpu()
+                all_profile_rs.extend(profile_rs.tolist())
+
+        # ── Aggregate ───────────────────────────────────────────────────────
+        val_profile_r = float(np.mean(all_profile_rs)) if all_profile_rs else 0.0
+        val_mse = mse_sum / max(n, 1)
+
+        result = {
+            "mse": val_mse,
+            "profile_r": val_profile_r,
+            "n": n,
+        }
+
+        if is_multi:
+            self.logger.info(
+                "  [Val epoch=%d] GLOBAL profile_r=%.4f  mse=%.5f  n=%d  "
+                "(noise_scale=0, deterministic)",
+                epoch + 1, val_profile_r, val_mse, n,
+            )
+            for s in subjects:
+                s_pr = float(np.mean(subj_profile_rs[s])) if subj_profile_rs[s] else 0.0
+                s_mse = subj_mse_sum[s] / max(subj_n[s], 1)
+                result[f"profile_r_sub{s}"] = s_pr
+                result[f"mse_sub{s}"] = s_mse
+                self.logger.info(
+                    "    Sub%d: profile_r=%.4f  mse=%.5f  n=%d",
+                    s, s_pr, s_mse, subj_n[s],
+                )
+        else:
+            self.logger.info(
+                "  [Val epoch=%d] profile_r=%.4f  mse=%.5f  n=%d  "
+                "(noise_scale=0, deterministic)",
+                epoch + 1, val_profile_r, val_mse, n,
+            )
+
         self.wrapper.train()
-        return {"mse": val_mse, "voxel_r": val_voxel_r, "profile_r": val_profile_r, "n": n}
+        return result
+
 
     # ──────────────────────────────────────────────────────────────────
     # Main training loop
@@ -593,10 +664,12 @@ class FactFlowTrainer:
         history_file = open(history_path, "a", newline="")
         history_writer = csv.writer(history_file)
         if not history_exists:
-            history_writer.writerow(
-                ["epoch", "step", "train_loss",
-                 "val_mse", "val_voxel_r", "val_profile_r", "lr"]
-            )
+            header = ["epoch", "step", "train_loss",
+                      "val_mse", "val_profile_r", "lr"]
+            if getattr(self, "is_multisubject", False):
+                for s in self.val_ds.subjects:
+                    header.extend([f"profile_r_sub{s}", f"mse_sub{s}"])
+            history_writer.writerow(header)
             history_file.flush()
 
         running_loss = 0.0   # since last log_every
@@ -713,14 +786,19 @@ class FactFlowTrainer:
                 val = self._validate(epoch)
                 lr = self.scheduler.get_last_lr()[0]
                 ep_n = max(1, epoch_steps)
-                history_writer.writerow([
+                row = [
                     epoch + 1, self.train_steps,
                     f"{epoch_loss / ep_n:.6f}",
                     f"{val['mse']:.6f}",
-                    f"{val['voxel_r']:.6f}",
                     f"{val['profile_r']:.6f}",
                     f"{lr:.2e}",
-                ])
+                ]
+                # Append per-subject columns in multi-subject mode
+                if getattr(self, "is_multisubject", False):
+                    for s in self.val_ds.subjects:
+                        row.append(f"{val.get(f'profile_r_sub{s}', 0.0):.6f}")
+                        row.append(f"{val.get(f'mse_sub{s}', 0.0):.6f}")
+                history_writer.writerow(row)
                 history_file.flush()
                 epoch_loss = 0.0
                 epoch_steps = 0
@@ -736,8 +814,8 @@ class FactFlowTrainer:
                         val_mse=val["mse"],
                     )
                     self.logger.info(
-                        "New best profile_r: %.4f  (voxel_r: %.4f)",
-                        self.best_metric, val["voxel_r"],
+                        "New best profile_r: %.4f",
+                        self.best_metric,
                     )
 
             if hit_max:
