@@ -24,6 +24,7 @@ from .model_utils import (
     get_1d_sincos_pos_embed,
     modulate,
 )
+from .subject_embedder import SubjectEmbedder, ZeroShotSubjectEmbedder
 
 
 # ─── 1D Patch Embedding ──────────────────────────────────────────────
@@ -107,6 +108,12 @@ class DiT1D(nn.Module):
         use_roi_routing: bool = False,
         n_roi_buckets: int = 3,
         roi_emb_dim: int = 64,
+        # ── Subject conditioning ──────────────────────────────
+        use_subject_cond: bool = False,
+        n_subjects: int = 8,
+        subject_dropout: float = 0.1,
+        subject_cond_mode: str = "learned",  # "learned" | "zero_shot"
+        n_roi_buckets_profile: int = 3,       # only for zero_shot mode
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -147,9 +154,6 @@ class DiT1D(nn.Module):
             ])
 
         # ── ROI-Stratified Feature Routing ──────────────────────
-        # StreamRouter maps ROI bucket id → soft gate over n_streams.
-        # bucket_ids is a (1, N) buffer of patch-level ROI bucket indices,
-        # populated once via set_roi_buckets() before training starts.
         self.stream_router = None
         if self.use_roi_routing:
             n_streams = len(self.context_dims)
@@ -166,6 +170,21 @@ class DiT1D(nn.Module):
             )
         else:
             self.bucket_ids = None
+
+        # ── Subject conditioning ──────────────────────────────────
+        self.subject_embedder = None
+        if use_subject_cond:
+            if subject_cond_mode == "learned":
+                self.subject_embedder = SubjectEmbedder(
+                    n_subjects=n_subjects,
+                    hidden_size=hidden_size,
+                    dropout_prob=subject_dropout,
+                )
+            elif subject_cond_mode == "zero_shot":
+                self.subject_embedder = ZeroShotSubjectEmbedder(
+                    profile_dim=n_roi_buckets_profile,
+                    hidden_size=hidden_size,
+                )
 
         # 1D positional embedding (fixed sin-cos)
         self.pos_embed = nn.Parameter(
@@ -310,18 +329,18 @@ class DiT1D(nn.Module):
             return embedded               # keep separate for per-stream cross-attn
         return torch.cat(embedded, dim=1) if len(embedded) > 1 else embedded[0]
 
-    def forward(self, x, t=None, y=None, contexts=None):
+    def forward(self, x, t=None, y=None, contexts=None,
+                subject_ids=None, roi_profile=None):
         """
         Forward pass of DiT1D.
 
         Args:
-            x: (B, C, L) — 1D fMRI signal (C=1 typically)
-            t: (B,) — diffusion timestep
-            y: (B, D_pool) — CLIP pooled conditioning
-            contexts: list of (B, Mᵢ, Dᵢ) cross-attention streams (CLIP, DINOv2,
-                     multi-layer DINOv2, Gabor, …).  In legacy mode these are
-                     embedded and concatenated; in ROI-routing mode they stay
-                     separate and are gated per patch position.
+            x:           (B, C, L) — 1D fMRI signal (C=1 typically)
+            t:           (B,) — diffusion timestep
+            y:           (B, D_pool) — CLIP pooled conditioning
+            contexts:    list of (B, Mᵢ, Dᵢ) cross-attention streams.
+            subject_ids: (B,) long — 0-indexed subject ID (for learned mode).
+            roi_profile: (B, n_buckets) float — normalised ROI profile (for zero_shot mode).
 
         Returns:
             (B, C, L) — predicted velocity
@@ -331,6 +350,23 @@ class DiT1D(nn.Module):
         t = self.t_embedder(t)                      # (B, D)
         y = self.y_embedder(y)                      # (B, D)
         c = t + y                                    # (B, D)
+
+        # Subject conditioning: c = t + y + s_emb
+        if self.subject_embedder is not None:
+            if isinstance(self.subject_embedder, SubjectEmbedder):
+                # Learned: needs subject_ids
+                if subject_ids is None:
+                    # Fallback: unconditional (null token) — safe for single-subject configs
+                    subject_ids = torch.full(
+                        (B,), self.subject_embedder.null_id,
+                        dtype=torch.long, device=x.device,
+                    )
+                s_emb = self.subject_embedder(subject_ids, self.training)  # (B, D)
+            else:
+                # Zero-shot: needs roi_profile
+                assert roi_profile is not None, "roi_profile required for zero_shot subject embedder"
+                s_emb = self.subject_embedder(roi_profile)                 # (B, D)
+            c = c + s_emb
 
         ctx = self._embed_contexts(contexts)
 

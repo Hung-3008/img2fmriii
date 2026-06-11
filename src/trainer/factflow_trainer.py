@@ -37,6 +37,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data.factflow_fmri_dataset import FactFlowfMRIDataset
+from data.multisubject_fmri_dataset import MultiSubjectfMRIDataset
 from model.factflow_factory import build_models, build_transport, build_sampler
 from utils.checkpoint import (
     load_checkpoint,
@@ -161,12 +162,18 @@ class FactFlowTrainer:
         # best.pt reflects the true model capacity, independent of K-averaging.
         self.eval_noise_scale = float(self.cfg.get("eval_noise_scale", 1.0))
 
-        # Cross-attention conditioning (DINOv2 / Gabor tokens → DiT).
-        self.use_cross_attn = bool(
-            self.cfg.stage_2.get("params", {}).get("use_cross_attn", False)
+        # ── Subject-Conditioned Flow Matching ────────────────────────────
+        self.use_subject_cond = (
+            self.wrapper.dit.subject_embedder is not None
         )
-
-        # ── Source-Conditioned Flow Matching ──────────────────────────
+        if self.use_subject_cond:
+            sc_cfg = OmegaConf.to_container(self.cfg.get("subject_cond", OmegaConf.create({})), resolve=True)
+            self.logger.info(
+                "Subject-cond ON: mode=%s  n_subjects=%d  dropout=%.2f",
+                sc_cfg.get("mode", "learned"),
+                int(sc_cfg.get("n_subjects", 4)),
+                float(sc_cfg.get("subject_dropout", 0.1)),
+            )
         self.use_source_encoder = self.wrapper.source_encoder is not None
         if self.use_source_encoder:
             se_cfg = OmegaConf.to_container(self.cfg.get("source_encoder", {}), resolve=True)
@@ -179,7 +186,11 @@ class FactFlowTrainer:
         else:
             self.lambda_mu = self.lambda_kl = 0.0
 
-        # Per-voxel SNR (noise-ceiling) weight for the velocity loss.
+        # Cross-attention conditioning (DINOv2 / Gabor tokens → DiT).
+        self.use_cross_attn = bool(
+            self.cfg.stage_2.get("params", {}).get("use_cross_attn", False)
+        )
+
         self.voxel_weight = self._build_voxel_weight()
 
         self.wrapper.train()
@@ -288,32 +299,69 @@ class FactFlowTrainer:
 
     def _build_datasets(self) -> None:
         dc = self.data_cfg
-        ds_kwargs = dict(
-            data_dir=dc["data_dir"],
-            subject=dc["subject"],
-            fmri_mode=dc["fmri_mode"],
-            clip_feature=dc["clip_feature"],
-            n_voxels=dc["n_voxels"],
-            pad_to=dc["pad_to"],
-            fmri_channels=dc.get("fmri_channels", 1),
-            fmri_spatial=dc.get("fmri_spatial", None),
-            avg_reps=dc.get("avg_reps", False),
-            dino_feature=dc.get("dino_feature", None),
-            roi_order=self.roi_order,
-            context_features=dc.get("context_features", None),
-            subdirs=dc.get("subdirs", None),
+        subjects_cfg = dc.get("subjects", None)  # multi-subject mode
+
+        common_kwargs = dict(
+            data_dir   = dc["data_dir"],
+            fmri_mode  = dc["fmri_mode"],
+            clip_feature = dc["clip_feature"],
+            fmri_channels = dc.get("fmri_channels", 1),
+            fmri_spatial  = dc.get("fmri_spatial", None),
+            avg_reps      = dc.get("avg_reps", False),
+            dino_feature  = dc.get("dino_feature", None),
+            roi_order     = self.roi_order,
+            context_features = dc.get("context_features", None),
+            subdirs       = dc.get("subdirs", None),
         )
-        self.train_ds = FactFlowfMRIDataset(mode="train", **ds_kwargs)
-        self.test_ds = FactFlowfMRIDataset(mode="test", **ds_kwargs)
 
-        # Single source of truth: the dataset's loaded context streams define the
-        # per-stream embedder dims, injected into the DiT config before build.
+        if subjects_cfg and len(subjects_cfg) > 1:
+            # ── Multi-subject mode ────────────────────────────────────
+            subjects = list(subjects_cfg)
+            per_subject_kwargs = {}
+            for s in subjects:
+                sk = dc.get(f"sub{s}", dc.get(f"subject_{s}", {}))
+                per_subject_kwargs[s] = dict(sk) if sk else {}
+                # Apply global n_voxels / pad_to unless overridden per-subject
+                if "n_voxels" not in per_subject_kwargs[s]:
+                    per_subject_kwargs[s]["n_voxels"] = dc["n_voxels"]
+                if "pad_to" not in per_subject_kwargs[s]:
+                    per_subject_kwargs[s]["pad_to"] = dc["pad_to"]
+
+            common_seq_len = int(dc.get("common_seq_len", dc["pad_to"]))
+            patch_size = int(self.cfg.stage_2.params.get("patch_size", 32))
+
+            self.train_ds = MultiSubjectfMRIDataset(
+                subjects=subjects, mode="train",
+                common_seq_len=common_seq_len, patch_size=patch_size,
+                per_subject_kwargs=per_subject_kwargs, **common_kwargs,
+            )
+            self.test_ds = MultiSubjectfMRIDataset(
+                subjects=subjects, mode="test",
+                common_seq_len=common_seq_len, patch_size=patch_size,
+                per_subject_kwargs=per_subject_kwargs, **common_kwargs,
+            )
+            self.val_ds = MultiSubjectfMRIDataset(
+                subjects=subjects, mode="test",
+                common_seq_len=common_seq_len, patch_size=patch_size,
+                per_subject_kwargs=per_subject_kwargs,
+                **{**common_kwargs, "avg_reps": True},
+            )
+            self.is_multisubject = True
+        else:
+            # ── Single-subject mode (original) ───────────────────────────
+            ds_kwargs = dict(
+                subject=dc["subject"],
+                n_voxels=dc["n_voxels"],
+                pad_to=dc["pad_to"],
+                **common_kwargs,
+            )
+            self.train_ds = FactFlowfMRIDataset(mode="train", **ds_kwargs)
+            self.test_ds  = FactFlowfMRIDataset(mode="test",  **ds_kwargs)
+            self.val_ds   = FactFlowfMRIDataset(mode="test",  **{**ds_kwargs, "avg_reps": True})
+            self.is_multisubject = False
+
+        # Inject context_dims into DiT config before model build
         self.cfg.stage_2.params.context_dims = list(self.train_ds.context_dims)
-
-        # Always validate against rep-averaged GT (mean of 3 reps): removes
-        # measurement noise so the metric reflects true signal (ceiling R ≈ 0.62)
-        # and is comparable to published NSD benchmarks.
-        self.val_ds = FactFlowfMRIDataset(mode="test", **{**ds_kwargs, "avg_reps": True})
 
         batch_size = int(self.train_cfg.get("batch_size", 64))
         num_workers = int(self.train_cfg.get("num_workers", 4))
@@ -366,52 +414,41 @@ class FactFlowTrainer:
         x1: torch.Tensor,
         clip_pool: torch.Tensor,
         contexts=None,
+        subject_ids=None,
+        roi_profile=None,
     ) -> tuple[torch.Tensor, dict]:
-        """One training step: sample x₀, interpolate, compute all losses.
-
-        Returns:
-            total_loss: scalar tensor (velocity loss + optional source losses)
-            log_dict:   {str: float} for logging (detached scalars)
-        """
+        """One training step: sample x₀, interpolate, compute all losses."""
         ctx_for_vel = contexts if self.use_cross_attn else None
 
         # ── Source x₀ ────────────────────────────────────────────────
         if self.use_source_encoder:
-            # DINO tokens are the first context stream (context_features[0])
             C_dino = contexts[0] if contexts else None
-            # sample() always returns a detached tensor — no grad through SE here
             x0 = self.wrapper.sample_source(
-                z_pool=clip_pool,
-                C_dino=C_dino,
-                noise_scale=1.0,   # full stochastic during training
+                z_pool=clip_pool, C_dino=C_dino, noise_scale=1.0,
             )
         else:
             x0 = torch.randn_like(x1)
 
-        # ── Velocity loss (flow matching objective) ────────────────
+        # ── Velocity loss ─────────────────────────────────────────
         t = self.transport.sample_timestep(x1)
         t, xt, ut = self.transport.path_sampler.plan(t, x0, x1)
-        v_pred = self.wrapper.predict_velocity(x=xt, t=t, y=clip_pool, contexts=ctx_for_vel)
+        v_pred = self.wrapper.predict_velocity(
+            x=xt, t=t, y=clip_pool, contexts=ctx_for_vel,
+            subject_ids=subject_ids, roi_profile=roi_profile,
+        )
         loss_vel = masked_mse(v_pred, ut, self.pad_mask, weight=self.voxel_weight)
 
-        # ── Auxiliary source-encoder losses (when SCFM enabled) ────
+        # ── Auxiliary source-encoder losses ────────────────────────
         loss_src = torch.zeros((), device=self.device)
         log_dict: dict = {"loss_vel": loss_vel.item()}
 
         if self.use_source_encoder:
             C_dino = contexts[0] if contexts else None
-            # L_mu: MSE(μ_θ, x₁)  — x₁ is already rep-averaged (avg_reps=true)
             loss_mu = self.wrapper.source_encoder.loss_mu(
-                z_pool=clip_pool,
-                C_dino=C_dino,
-                x1=x1,
-                pad_mask=self.pad_mask,
+                z_pool=clip_pool, C_dino=C_dino, x1=x1, pad_mask=self.pad_mask,
             )
-            # L_kl: KL[N(μ, σ²) || N(0,1)]
             loss_kl = self.wrapper.source_encoder.loss_kl(
-                z_pool=clip_pool,
-                C_dino=C_dino,
-                pad_mask=self.pad_mask,
+                z_pool=clip_pool, C_dino=C_dino, pad_mask=self.pad_mask,
             )
             loss_src = self.lambda_mu * loss_mu + self.lambda_kl * loss_kl
             log_dict["loss_mu"]  = loss_mu.item()
@@ -427,12 +464,9 @@ class FactFlowTrainer:
     # ──────────────────────────────────────────────────────────────────
 
     def _sample(self, model: torch.nn.Module, clip_pool, contexts, B: int,
-                noise_scale: float | None = None) -> torch.Tensor:
-        """ODE-sample fMRI from source (conditioned or Gaussian). Returns ``(B, *latent)``.
-
-        Args:
-            noise_scale: 0.0 = fully deterministic (ceiling). None = use instance default.
-        """
+                noise_scale: float | None = None,
+                subject_ids=None, roi_profile=None) -> torch.Tensor:
+        """ODE-sample fMRI. Returns ``(B, *latent)``."""
         scale = self.eval_noise_scale if noise_scale is None else noise_scale
         ctx = contexts if self.use_cross_attn else None
 
@@ -440,15 +474,16 @@ class FactFlowTrainer:
             C_dino = contexts[0] if contexts else None
             with torch.no_grad():
                 x0 = model.sample_source(
-                    z_pool=clip_pool,
-                    C_dino=C_dino,
-                    noise_scale=scale,  # 0.0 → x₀=μ_θ (deterministic ceiling)
+                    z_pool=clip_pool, C_dino=C_dino, noise_scale=scale,
                 )
         else:
             x0 = scale * torch.randn(B, *self.latent_size, device=self.device)
 
         with autocast(**self.autocast_kwargs):
-            traj = self.sample_fn(x0, model.dit.forward, y=clip_pool, contexts=ctx)
+            traj = self.sample_fn(
+                x0, model.dit.forward, y=clip_pool, contexts=ctx,
+                subject_ids=subject_ids, roi_profile=roi_profile,
+            )
         return traj[-1].float()
 
     @torch.no_grad()
@@ -563,9 +598,14 @@ class FactFlowTrainer:
                 x1 = batch["fmri"].to(self.device)
                 clip_pool = batch["clip_pool"].to(self.device)
                 contexts = [c.to(self.device) for c in batch["contexts"]]
+                subject_ids = batch["subject_id"].to(self.device) if "subject_id" in batch else None
+                roi_profile = batch["roi_profile"].to(self.device) if "roi_profile" in batch else None
 
                 with autocast(**self.autocast_kwargs):
-                    loss, log_dict = self._compute_loss(x1, clip_pool, contexts)
+                    loss, log_dict = self._compute_loss(
+                        x1, clip_pool, contexts,
+                        subject_ids=subject_ids, roi_profile=roi_profile,
+                    )
 
                 (loss / self.grad_accum).backward()
                 accum_counter += 1

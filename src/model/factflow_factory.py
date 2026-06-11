@@ -45,21 +45,26 @@ class FactFlowWrapper(nn.Module):
         t: torch.Tensor,
         y: torch.Tensor,
         contexts=None,
+        subject_ids=None,
+        roi_profile=None,
     ) -> torch.Tensor:
         """Run the velocity network.
 
         Args:
-            x: ``(B, 1, L)`` noisy fMRI signal.
-            t: ``(B,)`` timestep.
-            y: ``(B, D_pool)`` conditioning (CLIP pooled, AdaLN).
-            contexts: list of ``(B, Mᵢ, Dᵢ)`` cross-attention streams (DINOv2,
-                     Gabor, …); ignored unless the DiT was built with
-                     ``use_cross_attn``.
+            x:           ``(B, 1, L)`` noisy fMRI signal.
+            t:           ``(B,)`` timestep.
+            y:           ``(B, D_pool)`` conditioning (CLIP pooled, AdaLN).
+            contexts:    list of ``(B, Mᵢ, Dᵢ)`` cross-attention streams.
+            subject_ids: ``(B,)`` long — 0-indexed subject ID (learned mode).
+            roi_profile: ``(B, n_buckets)`` float — ROI profile (zero-shot mode).
 
         Returns:
             ``(B, 1, L)`` predicted velocity.
         """
-        return self.dit(x=x, t=t, y=y, contexts=contexts)
+        return self.dit(
+            x=x, t=t, y=y, contexts=contexts,
+            subject_ids=subject_ids, roi_profile=roi_profile,
+        )
 
     def sample_source(
         self,
