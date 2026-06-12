@@ -38,7 +38,9 @@ def masked_mse(
 
     Args:
         pred, target: ``(B, C, H, W)`` — predicted and ground-truth fMRI.
-        pad_mask: ``(V_pad,)`` boolean — ``True`` for real voxels.
+        pad_mask: boolean — ``True`` for real voxels. Either ``(V_pad,)``
+            (shared across the batch) or ``(B, V_pad)`` (per-sample, e.g.
+            multi-subject where each item has a different real-voxel count).
         weight: optional ``(V_pad,)`` per-voxel weight (e.g. noise-ceiling
             reliability). When given, the loss becomes a weighted average —
             voxels with low reliability contribute less, focusing capacity on
@@ -51,10 +53,13 @@ def masked_mse(
     pred_flat = pred.reshape(B, -1)
     target_flat = target.reshape(B, -1)
     mask = pad_mask.to(pred.device).float()
+    if mask.dim() == 1:
+        mask = mask.unsqueeze(0)               # (1, V_pad) → broadcast over batch
     if weight is not None:
         mask = mask * weight.to(pred.device).float()
-    diff_sq = (pred_flat - target_flat) ** 2
-    return (diff_sq * mask.unsqueeze(0)).sum() / (mask.sum() * B + 1e-8)
+    diff_sq = (pred_flat - target_flat) ** 2   # (B, V_pad)
+    mask = mask.expand_as(diff_sq)             # (B, V_pad); 1-D mask → real·B count
+    return (diff_sq * mask).sum() / (mask.sum() + 1e-8)
 
 
 def compute_voxel_reliability(
@@ -96,16 +101,24 @@ def pearson_corr_per_sample(
 
     Args:
         pred, target: ``(B, C, H, W)``
-        pad_mask: ``(V_pad,)`` boolean
+        pad_mask: boolean — ``(V_pad,)`` (shared) or ``(B, V_pad)`` (per-sample,
+            e.g. multi-subject with different real-voxel counts per item).
 
     Returns:
         ``(B,)`` tensor of Pearson *r* values.
     """
     B = pred.shape[0]
-    pred_flat = pred.reshape(B, -1)[:, pad_mask]
-    target_flat = target.reshape(B, -1)[:, pad_mask]
-    p = pred_flat - pred_flat.mean(dim=1, keepdim=True)
-    t = target_flat - target_flat.mean(dim=1, keepdim=True)
+    pred_flat = pred.reshape(B, -1)
+    target_flat = target.reshape(B, -1)
+    mask = pad_mask.to(pred.device)
+    if mask.dim() == 1:
+        mask = mask.unsqueeze(0).expand(B, -1)
+    mask = mask.float()
+    n = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+    pm = (pred_flat * mask).sum(dim=1, keepdim=True) / n
+    tm = (target_flat * mask).sum(dim=1, keepdim=True) / n
+    p = (pred_flat - pm) * mask
+    t = (target_flat - tm) * mask
     num = (p * t).sum(dim=1)
     den = torch.sqrt((p ** 2).sum(dim=1) * (t ** 2).sum(dim=1))
     return num / (den + 1e-8)

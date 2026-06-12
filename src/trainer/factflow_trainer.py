@@ -442,9 +442,16 @@ class FactFlowTrainer:
         contexts=None,
         subject_ids=None,
         roi_profile=None,
+        pad_mask=None,
     ) -> tuple[torch.Tensor, dict]:
-        """One training step: sample x₀, interpolate, compute all losses."""
+        """One training step: sample x₀, interpolate, compute all losses.
+
+        ``pad_mask`` may be a per-sample ``(B, L)`` mask (multi-subject: each
+        item has a different real-voxel count). Falls back to the shared
+        ``self.pad_mask`` when None (single-subject).
+        """
         ctx_for_vel = contexts if self.use_cross_attn else None
+        vel_mask = pad_mask if pad_mask is not None else self.pad_mask
 
         # ── Source x₀ ────────────────────────────────────────────────
         if self.use_source_encoder:
@@ -462,7 +469,7 @@ class FactFlowTrainer:
             x=xt, t=t, y=clip_pool, contexts=ctx_for_vel,
             subject_ids=subject_ids, roi_profile=roi_profile,
         )
-        loss_vel = masked_mse(v_pred, ut, self.pad_mask, weight=self.voxel_weight)
+        loss_vel = masked_mse(v_pred, ut, vel_mask, weight=self.voxel_weight)
 
         # ── Auxiliary source-encoder losses ────────────────────────
         loss_src = torch.zeros((), device=self.device)
@@ -542,116 +549,98 @@ class FactFlowTrainer:
 
         Always uses **noise_scale=0** (deterministic ODE) so that the metric
         reflects the model's ceiling capacity, independent of stochastic
-        averaging.
-
-        In multi-subject mode, computes per-subject metrics in addition to
-        the global average. Each sample's pad_mask is used (from the batch)
-        so that padding voxels of shorter subjects are properly excluded.
+        averaging.  Reports both voxel_r (encoding) and profile_r (pattern
+        correlation, comparable to SynBrain / MindSimulator).
         """
         loader = DataLoader(
             self.val_ds, batch_size=32, shuffle=False, num_workers=0, drop_last=False,
         )
         self.wrapper.eval()
-
-        # ── Per-subject accumulators ────────────────────────────────────────
-        is_multi = getattr(self, "is_multisubject", False)
-        if is_multi:
-            subjects = self.val_ds.subjects
-            subj_profile_rs = {s: [] for s in subjects}
-            subj_mse_sum = {s: 0.0 for s in subjects}
-            subj_n = {s: 0 for s in subjects}
-        else:
-            subjects = None
-
-        # ── Global accumulators ─────────────────────────────────────────────
-        all_profile_rs = []
+        preds_all, gts_all, subj_all = [], [], []
+        profile_rs = []
         mse_sum, n = 0.0, 0
-
         for batch in loader:
             fmri_gt = batch["fmri"].to(self.device)
             clip_pool = batch["clip_pool"].to(self.device)
             contexts = [c.to(self.device) for c in batch["contexts"]]
             B = fmri_gt.shape[0]
-
-            # Subject conditioning
             subject_ids = batch["subject_id"].to(self.device) if "subject_id" in batch else None
             roi_profile = batch["roi_profile"].to(self.device) if "roi_profile" in batch else None
+            # Per-sample mask in multi-subject (different voxel counts per item).
+            vmask = (
+                batch["pad_mask"].to(self.device)
+                if (self.is_multisubject and "pad_mask" in batch) else self.pad_mask
+            )
 
             # Deterministic (noise_scale=0): ceiling prediction E[x|c]
             pred = self._sample(
                 self.wrapper, clip_pool, contexts, B, noise_scale=0.0,
                 subject_ids=subject_ids, roi_profile=roi_profile,
             )
-
-            # ── Per-sample metrics using per-sample pad_mask ─────────────
-            if is_multi and "pad_mask" in batch:
-                batch_pad_mask = batch["pad_mask"]  # (B, L) bool
-                batch_subj_ids = batch["subject_id"]  # (B,) long
-                for i in range(B):
-                    pm = batch_pad_mask[i].to(self.device)  # (L,) bool
-                    p_i = pred[i].reshape(-1)[pm]            # (V_real,)
-                    g_i = fmri_gt[i].reshape(-1)[pm]         # (V_real,)
-                    # Profile r
-                    p_c = p_i - p_i.mean()
-                    g_c = g_i - g_i.mean()
-                    num = (p_c * g_c).sum()
-                    den = torch.sqrt((p_c**2).sum() * (g_c**2).sum()) + 1e-8
-                    pr = (num / den).item()
-                    # MSE
-                    mse_i = ((p_i - g_i)**2).mean().item()
-
-                    all_profile_rs.append(pr)
-                    mse_sum += mse_i
-                    n += 1
-
-                    # Per-subject tracking
-                    subj_idx = batch_subj_ids[i].item()
-                    subj = subjects[subj_idx]
-                    subj_profile_rs[subj].append(pr)
-                    subj_mse_sum[subj] += mse_i
-                    subj_n[subj] += 1
-            else:
-                # Single-subject: use global pad_mask
-                mse_sum += masked_mse(pred, fmri_gt, self.pad_mask).item() * B
-                n += B
-                profile_rs = pearson_corr_per_sample(pred, fmri_gt, self.pad_mask).cpu()
-                all_profile_rs.extend(profile_rs.tolist())
-
-        # ── Aggregate ───────────────────────────────────────────────────────
-        val_profile_r = float(np.mean(all_profile_rs)) if all_profile_rs else 0.0
-        val_mse = mse_sum / max(n, 1)
-
-        result = {
-            "mse": val_mse,
-            "profile_r": val_profile_r,
-            "n": n,
-        }
-
-        if is_multi:
-            self.logger.info(
-                "  [Val epoch=%d] GLOBAL profile_r=%.4f  mse=%.5f  n=%d  "
-                "(noise_scale=0, deterministic)",
-                epoch + 1, val_profile_r, val_mse, n,
+            mse_sum += masked_mse(pred, fmri_gt, vmask).item() * B
+            n += B
+            # Profile r: per-image, across (real) voxels (same as SynBrain metric)
+            profile_rs.append(
+                pearson_corr_per_sample(pred, fmri_gt, vmask).cpu()
             )
-            for s in subjects:
-                s_pr = float(np.mean(subj_profile_rs[s])) if subj_profile_rs[s] else 0.0
-                s_mse = subj_mse_sum[s] / max(subj_n[s], 1)
-                result[f"profile_r_sub{s}"] = s_pr
-                result[f"mse_sub{s}"] = s_mse
-                self.logger.info(
-                    "    Sub%d: profile_r=%.4f  mse=%.5f  n=%d",
-                    s, s_pr, s_mse, subj_n[s],
-                )
+            if self.is_multisubject:
+                # Keep padded; voxel_r is computed per-subject below (voxel
+                # columns are not comparable across subjects).
+                preds_all.append(pred.reshape(B, -1).cpu())
+                gts_all.append(fmri_gt.reshape(B, -1).cpu())
+                subj_all.append(subject_ids.cpu())
+            else:
+                preds_all.append(pred.reshape(B, -1)[:, self.pad_mask].cpu())
+                gts_all.append(fmri_gt.reshape(B, -1)[:, self.pad_mask].cpu())
+
+        per_subject: Dict[int, Dict[str, float]] = {}
+        if self.is_multisubject:
+            preds_cat = torch.cat(preds_all)   # (N, L) padded
+            gts_cat   = torch.cat(gts_all)     # (N, L) padded
+            subj_cat  = torch.cat(subj_all)    # (N,)
+            prof_cat  = torch.cat(profile_rs)  # (N,)
+            vr_list, pr_list = [], []
+            for si, sid in enumerate(self.val_ds.subjects):
+                rows = subj_cat == si
+                if int(rows.sum()) < 2:
+                    continue
+                m = self.val_ds.subject_pad_masks[si]   # (L,) bool — real voxels
+                vr = voxel_pearson(preds_cat[rows][:, m], gts_cat[rows][:, m]).mean().item()
+                pr = prof_cat[rows].mean().item()
+                mse_s = masked_mse(preds_cat[rows], gts_cat[rows], m).item()
+                per_subject[sid] = {"voxel_r": vr, "profile_r": pr, "mse": mse_s, "n": int(rows.sum())}
+                vr_list.append(vr)
+                pr_list.append(pr)
+            # Aggregate = mean over subjects (equal weight per subject)
+            val_voxel_r   = float(np.mean(vr_list)) if vr_list else 0.0
+            val_profile_r = float(np.mean(pr_list)) if pr_list else 0.0
+        else:
+            preds_cat = torch.cat(preds_all)   # (N, V)
+            gts_cat   = torch.cat(gts_all)     # (N, V)
+            val_voxel_r   = voxel_pearson(preds_cat, gts_cat).mean().item()
+            val_profile_r = torch.cat(profile_rs).mean().item()
+        val_mse = mse_sum / n
+        if per_subject:
+            breakdown = "  ".join(
+                f"sub{sid}:vr={d['voxel_r']:.3f}/pr={d['profile_r']:.3f}/mse={d['mse']:.3f}"
+                for sid, d in per_subject.items()
+            )
+            self.logger.info(
+                "  [Val epoch=%d] voxel_r=%.4f  profile_r=%.4f  mse=%.5f  n=%d  "
+                "(noise_scale=0) | %s",
+                epoch + 1, val_voxel_r, val_profile_r, val_mse, n, breakdown,
+            )
         else:
             self.logger.info(
-                "  [Val epoch=%d] profile_r=%.4f  mse=%.5f  n=%d  "
+                "  [Val epoch=%d] voxel_r=%.4f  profile_r=%.4f  mse=%.5f  n=%d  "
                 "(noise_scale=0, deterministic)",
-                epoch + 1, val_profile_r, val_mse, n,
+                epoch + 1, val_voxel_r, val_profile_r, val_mse, n,
             )
-
         self.wrapper.train()
-        return result
-
+        return {
+            "mse": val_mse, "voxel_r": val_voxel_r, "profile_r": val_profile_r,
+            "n": n, "per_subject": per_subject,
+        }
 
     # ──────────────────────────────────────────────────────────────────
     # Main training loop
@@ -663,13 +652,19 @@ class FactFlowTrainer:
         history_exists = os.path.exists(history_path)
         history_file = open(history_path, "a", newline="")
         history_writer = csv.writer(history_file)
+        # Dynamic columns: only emit what this run actually produces. Per-subject
+        # voxel_r/profile_r columns are added in multi-subject mode.
+        self.history_columns = [
+            "epoch", "step", "train_loss",
+            "val_mse", "val_voxel_r", "val_profile_r", "lr",
+        ]
+        if self.is_multisubject:
+            for sid in self.val_ds.subjects:
+                self.history_columns += [
+                    f"val_voxel_r_sub{sid}", f"val_profile_r_sub{sid}", f"val_mse_sub{sid}",
+                ]
         if not history_exists:
-            header = ["epoch", "step", "train_loss",
-                      "val_mse", "val_profile_r", "lr"]
-            if getattr(self, "is_multisubject", False):
-                for s in self.val_ds.subjects:
-                    header.extend([f"profile_r_sub{s}", f"mse_sub{s}"])
-            history_writer.writerow(header)
+            history_writer.writerow(self.history_columns)
             history_file.flush()
 
         running_loss = 0.0   # since last log_every
@@ -699,11 +694,18 @@ class FactFlowTrainer:
                 contexts = [c.to(self.device) for c in batch["contexts"]]
                 subject_ids = batch["subject_id"].to(self.device) if "subject_id" in batch else None
                 roi_profile = batch["roi_profile"].to(self.device) if "roi_profile" in batch else None
+                # Multi-subject: each item has its own real-voxel mask (different
+                # voxel counts). Single-subject keeps the shared self.pad_mask.
+                pad_mask = (
+                    batch["pad_mask"].to(self.device)
+                    if (self.is_multisubject and "pad_mask" in batch) else None
+                )
 
                 with autocast(**self.autocast_kwargs):
                     loss, log_dict = self._compute_loss(
                         x1, clip_pool, contexts,
                         subject_ids=subject_ids, roi_profile=roi_profile,
+                        pad_mask=pad_mask,
                     )
 
                 (loss / self.grad_accum).backward()
@@ -786,19 +788,20 @@ class FactFlowTrainer:
                 val = self._validate(epoch)
                 lr = self.scheduler.get_last_lr()[0]
                 ep_n = max(1, epoch_steps)
-                row = [
-                    epoch + 1, self.train_steps,
-                    f"{epoch_loss / ep_n:.6f}",
-                    f"{val['mse']:.6f}",
-                    f"{val['profile_r']:.6f}",
-                    f"{lr:.2e}",
-                ]
-                # Append per-subject columns in multi-subject mode
-                if getattr(self, "is_multisubject", False):
-                    for s in self.val_ds.subjects:
-                        row.append(f"{val.get(f'profile_r_sub{s}', 0.0):.6f}")
-                        row.append(f"{val.get(f'mse_sub{s}', 0.0):.6f}")
-                history_writer.writerow(row)
+                row = {
+                    "epoch": epoch + 1,
+                    "step": self.train_steps,
+                    "train_loss": f"{epoch_loss / ep_n:.6f}",
+                    "val_mse": f"{val['mse']:.6f}",
+                    "val_voxel_r": f"{val['voxel_r']:.6f}",
+                    "val_profile_r": f"{val['profile_r']:.6f}",
+                    "lr": f"{lr:.2e}",
+                }
+                for sid, d in val.get("per_subject", {}).items():
+                    row[f"val_voxel_r_sub{sid}"] = f"{d['voxel_r']:.6f}"
+                    row[f"val_profile_r_sub{sid}"] = f"{d['profile_r']:.6f}"
+                    row[f"val_mse_sub{sid}"] = f"{d['mse']:.6f}"
+                history_writer.writerow([row.get(c, "") for c in self.history_columns])
                 history_file.flush()
                 epoch_loss = 0.0
                 epoch_steps = 0
@@ -814,8 +817,8 @@ class FactFlowTrainer:
                         val_mse=val["mse"],
                     )
                     self.logger.info(
-                        "New best profile_r: %.4f",
-                        self.best_metric,
+                        "New best profile_r: %.4f  (voxel_r: %.4f)",
+                        self.best_metric, val["voxel_r"],
                     )
 
             if hit_max:
