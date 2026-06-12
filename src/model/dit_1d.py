@@ -107,6 +107,13 @@ class DiT1D(nn.Module):
         use_roi_routing: bool = False,
         n_roi_buckets: int = 3,
         roi_emb_dim: int = 64,
+        # ── Multi-subject (shared trunk + per-subject adapters) ──
+        # When n_subjects > 1, the input patch-embed and output readout become
+        # per-subject (selected by ``subject_id`` in forward), while the whole
+        # transformer trunk and all conditioning embedders are shared. Every
+        # subject is padded to the same ``seq_len`` (e.g. 16384), so the patch
+        # grid is identical and only the native-facing adapters differ.
+        n_subjects: int = 1,
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -120,11 +127,25 @@ class DiT1D(nn.Module):
         self.depth = depth
         self.use_cross_attn = use_cross_attn
         self.use_roi_routing = use_roi_routing and use_cross_attn
+        self.n_subjects = int(n_subjects)
+        if self.n_subjects > 1 and self.use_roi_routing:
+            raise ValueError(
+                "ROI routing is not supported in multi-subject mode "
+                "(n_subjects > 1); set use_roi_routing: false."
+            )
 
         num_patches = seq_len // patch_size
 
         # ── Input stem ────────────────────────────────────────────────
-        self.x_embedder = PatchEmbed1D(seq_len, patch_size, in_channels, hidden_size)
+        # Per-subject input patch-embed + output readout when n_subjects > 1;
+        # otherwise the original singular modules (backward compatible).
+        if self.n_subjects == 1:
+            self.x_embedder = PatchEmbed1D(seq_len, patch_size, in_channels, hidden_size)
+        else:
+            self.x_embedders = nn.ModuleList([
+                PatchEmbed1D(seq_len, patch_size, in_channels, hidden_size)
+                for _ in range(self.n_subjects)
+            ])
         self.t_embedder = GaussianFourierEmbedding(hidden_size)
         self.y_embedder = VectorEmbedder(y_in_channels, hidden_size)
 
@@ -195,11 +216,32 @@ class DiT1D(nn.Module):
         ])
 
         # ── Output head ──────────────────────────────────────────────
-        self.final_layer = DiT1DFinalLayer(
-            hidden_size, patch_size, self.out_channels, use_rmsnorm=use_rmsnorm
-        )
+        # Per-subject readout when n_subjects > 1 (maps shared tokens back to
+        # that subject's native voxel patches); singular otherwise.
+        if self.n_subjects == 1:
+            self.final_layer = DiT1DFinalLayer(
+                hidden_size, patch_size, self.out_channels, use_rmsnorm=use_rmsnorm
+            )
+        else:
+            self.final_layers = nn.ModuleList([
+                DiT1DFinalLayer(
+                    hidden_size, patch_size, self.out_channels, use_rmsnorm=use_rmsnorm
+                )
+                for _ in range(self.n_subjects)
+            ])
 
         self.initialize_weights()
+
+    # ── Per-subject adapter selection ───────────────────────────────────
+    def _x_embedder(self, subject_id):
+        if self.n_subjects == 1:
+            return self.x_embedder
+        return self.x_embedders[int(subject_id)]
+
+    def _final_layer(self, subject_id):
+        if self.n_subjects == 1:
+            return self.final_layer
+        return self.final_layers[int(subject_id)]
 
     def initialize_weights(self):
         # Xavier init for all linear layers
@@ -215,10 +257,14 @@ class DiT1D(nn.Module):
         pos_embed = get_1d_sincos_pos_embed(self.hidden_size, num_patches)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
-        # Patch embed like nn.Linear
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
+        # Patch embed like nn.Linear (loop over per-subject embedders)
+        x_embedders = (
+            [self.x_embedder] if self.n_subjects == 1 else list(self.x_embedders)
+        )
+        for xe in x_embedders:
+            w = xe.proj.weight.data
+            nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+            nn.init.constant_(xe.proj.bias, 0)
 
         # Timestep embedding MLP
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -233,10 +279,14 @@ class DiT1D(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        final_layers = (
+            [self.final_layer] if self.n_subjects == 1 else list(self.final_layers)
+        )
+        for fl in final_layers:
+            nn.init.constant_(fl.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(fl.adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(fl.linear.weight, 0)
+            nn.init.constant_(fl.linear.bias, 0)
 
         # Zero-out cross-attention output proj → block starts as pooled-only
         # DiT, then learns to use context.  Handles both legacy (cross_attn)
@@ -310,7 +360,7 @@ class DiT1D(nn.Module):
             return embedded               # keep separate for per-stream cross-attn
         return torch.cat(embedded, dim=1) if len(embedded) > 1 else embedded[0]
 
-    def forward(self, x, t=None, y=None, contexts=None):
+    def forward(self, x, t=None, y=None, contexts=None, subject_id=None):
         """
         Forward pass of DiT1D.
 
@@ -322,12 +372,16 @@ class DiT1D(nn.Module):
                      multi-layer DINOv2, Gabor, …).  In legacy mode these are
                      embedded and concatenated; in ROI-routing mode they stay
                      separate and are gated per patch position.
+            subject_id: int contiguous subject index selecting the per-subject
+                     input patch-embed and output readout (multi-subject mode).
+                     Ignored when n_subjects == 1.  Batches are subject-homogeneous,
+                     so a single scalar applies to the whole batch.
 
         Returns:
             (B, C, L) — predicted velocity
         """
         B = x.shape[0]
-        x = self.x_embedder(x) + self.pos_embed   # (B, N, D)
+        x = self._x_embedder(subject_id)(x) + self.pos_embed   # (B, N, D)
         t = self.t_embedder(t)                      # (B, D)
         y = self.y_embedder(y)                      # (B, D)
         c = t + y                                    # (B, D)
@@ -345,7 +399,7 @@ class DiT1D(nn.Module):
             for block in self.blocks:
                 x = block(x, c, feat_rope=self.feat_rope, context=ctx)
 
-        x = self.final_layer(x, c)   # (B, N, P*C)
+        x = self._final_layer(subject_id)(x, c)   # (B, N, P*C)
         x = self.unpatchify(x)       # (B, C, L)
 
         if self.learn_sigma:

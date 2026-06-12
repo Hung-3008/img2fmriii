@@ -42,6 +42,7 @@ class FactFlowWrapper(nn.Module):
         t: torch.Tensor,
         y: torch.Tensor,
         contexts=None,
+        subject_id=None,
     ) -> torch.Tensor:
         """Run the velocity network.
 
@@ -52,11 +53,13 @@ class FactFlowWrapper(nn.Module):
             contexts: list of ``(B, Mᵢ, Dᵢ)`` cross-attention streams (DINOv2,
                      Gabor, …); ignored unless the DiT was built with
                      ``use_cross_attn``.
+            subject_id: contiguous subject index for per-subject input/output
+                     adapters (multi-subject mode); ignored when n_subjects == 1.
 
         Returns:
             ``(B, C, H, W)`` predicted velocity.
         """
-        return self.dit(x=x, t=t, y=y, contexts=contexts)
+        return self.dit(x=x, t=t, y=y, contexts=contexts, subject_id=subject_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
