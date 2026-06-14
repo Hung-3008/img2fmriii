@@ -119,6 +119,9 @@ class FactFlowMultiSubjectTrainer:
         self.transport = build_transport(self.cfg, self.latent_size)
         self.sample_fn = build_sampler(self.transport, self.cfg.sampler)
 
+        # Per-subject ROI-stratified feature routing (no-op unless enabled).
+        self._setup_roi_routing()
+
         # ── Optimizer & scheduler ─────────────────────────────────────
         self.grad_accum = int(self.train_cfg.get("grad_accum_steps", 1))
         self.steps_per_epoch = max(len(self.batch_sampler) // self.grad_accum, 1)
@@ -208,6 +211,72 @@ class FactFlowMultiSubjectTrainer:
             "Train: %d samples over %d subjects, %d batches/epoch (bs=%d)",
             len(self.train_ds), self.n_subjects, len(self.batch_sampler), batch_size,
         )
+
+    def _setup_roi_routing(self) -> None:
+        """Build PER-SUBJECT patch-level ROI bucket IDs and register them in the DiT.
+
+        Only active when ``use_roi_routing: true``. The StreamRouter is shared
+        across subjects (the early/mid/high buckets are universal); only the
+        patch->bucket map differs per subject, since each has its own roi_order
+        voxel layout. Bucket scheme (NSD streams atlas):
+
+            0 = early visual  (V1v/d, V2v/d, V3v/d)
+            1 = mid visual    (V3A, V3B, hV4, VO1, VO2, PHC)
+            2 = high visual   (everything else: LO, FFA, PPA, OPA, …)
+        """
+        dit = self.wrapper.dit
+        if not getattr(dit, "use_roi_routing", False):
+            return
+
+        n_roi_buckets = int(self.cfg.stage_2.params.get("n_roi_buckets", 3))
+        dc = self.data_cfg
+        for sidx, s in enumerate(self.subjects):
+            ds = self.train_dss[sidx]
+            roi_path = os.path.join(
+                dc["data_dir"], f"subj0{s}", f"roi_meta_sub{s}.npz"
+            )
+            meta = np.load(roi_path) if os.path.exists(roi_path) else {}
+
+            if "roi_labels" in meta:
+                roi_labels = meta["roi_labels"].astype(np.int64)  # (n_voxels,)
+                bucket = np.full_like(roi_labels, 2)                    # default: high
+                if int(roi_labels.max()) <= 7:
+                    # NSD "streams" atlas (0=unknown, 1=early, 2-4=mid{ventral,
+                    # lateral,parietal}, 5-7={ventral,lateral,parietal}=high).
+                    bucket[roi_labels == 1] = 0                          # early
+                    bucket[(roi_labels >= 2) & (roi_labels <= 4)] = 1   # mid
+                    # labels 5-7 and 0(unknown) keep default high (2)
+                else:
+                    # Legacy finer atlas (labels up to ~34).
+                    bucket[(roi_labels >= 1) & (roi_labels <= 6)] = 0   # early
+                    bucket[(roi_labels >= 7) & (roi_labels <= 15)] = 1  # mid
+            else:
+                n_voxels = ds.n_voxels
+                bucket = np.zeros(n_voxels, dtype=np.int64)
+                third = n_voxels // 3
+                bucket[third:2 * third] = 1
+                bucket[2 * third:] = 2
+                self.logger.warning(
+                    "subj%d roi_meta missing 'roi_labels' — using positional "
+                    "thirds as ROI buckets (less accurate).", s,
+                )
+
+            # Match the permutation applied to fMRI voxels in the dataset.
+            if self.roi_order and ds.sort_idx is not None:
+                bucket = bucket[ds.sort_idx]
+
+            dit.set_roi_buckets(
+                voxel_bucket_ids=bucket,
+                pad_to=self.pad_to,
+                n_roi_buckets=n_roi_buckets,
+                subject_idx=sidx,
+            )
+            self.logger.info(
+                "ROI routing subj%d (idx=%d): early=%d  mid=%d  high=%d",
+                s, sidx,
+                int((bucket == 0).sum()), int((bucket == 1).sum()),
+                int((bucket == 2).sum()),
+            )
 
     def _build_voxel_weights(self) -> Dict[int, Optional[torch.Tensor]]:
         weights: Dict[int, Optional[torch.Tensor]] = {}

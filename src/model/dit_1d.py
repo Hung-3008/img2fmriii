@@ -128,11 +128,10 @@ class DiT1D(nn.Module):
         self.use_cross_attn = use_cross_attn
         self.use_roi_routing = use_roi_routing and use_cross_attn
         self.n_subjects = int(n_subjects)
-        if self.n_subjects > 1 and self.use_roi_routing:
-            raise ValueError(
-                "ROI routing is not supported in multi-subject mode "
-                "(n_subjects > 1); set use_roi_routing: false."
-            )
+        # ROI routing in multi-subject mode keeps a SHARED StreamRouter (the 3
+        # early/mid/high buckets are universal across subjects) but a PER-SUBJECT
+        # patch->bucket map, because each subject has a different roi_order voxel
+        # layout. The bucket_ids buffer therefore has one row per subject.
 
         num_patches = seq_len // patch_size
 
@@ -179,10 +178,10 @@ class DiT1D(nn.Module):
                 n_buckets=n_roi_buckets,
                 emb_dim=roi_emb_dim,
             )
-            # Placeholder; will be filled by set_roi_buckets()
+            # Placeholder; one row per subject, filled by set_roi_buckets().
             self.register_buffer(
                 "bucket_ids",
-                torch.zeros(1, num_patches, dtype=torch.long),
+                torch.zeros(max(1, self.n_subjects), num_patches, dtype=torch.long),
                 persistent=True,
             )
         else:
@@ -318,18 +317,21 @@ class DiT1D(nn.Module):
         voxel_bucket_ids: np.ndarray,
         pad_to: int,
         n_roi_buckets: int,
+        subject_idx: int = 0,
     ) -> None:
-        """Precompute and cache patch-level ROI bucket IDs.
+        """Precompute and cache patch-level ROI bucket IDs for one subject.
 
-        Called once after the model is built, before training begins.
-        Aggregates voxel-level bucket ids to patch level by majority-vote
-        (mean → round), then stores as a ``(1, N)`` buffer on the model device.
+        Called once per subject after the model is built, before training
+        begins. Aggregates voxel-level bucket ids to patch level by majority-vote
+        (mean → round), then writes row ``subject_idx`` of the ``(n_subjects, N)``
+        ``bucket_ids`` buffer.
 
         Args:
             voxel_bucket_ids: int array (n_voxels,) — ROI bucket per voxel
                               in the sorted (roi_order) space.
             pad_to:           padded sequence length (must match self.seq_len)
             n_roi_buckets:    total number of buckets (clips values to [0, n-1])
+            subject_idx:      contiguous subject index (row of bucket_ids to fill)
         """
         if self.stream_router is None:
             return
@@ -341,10 +343,8 @@ class DiT1D(nn.Module):
         n_patches = pad_to // P
         patch_buckets = padded.reshape(n_patches, P).mean(axis=1).round().astype(np.int64)
         patch_buckets = np.clip(patch_buckets, 0, n_roi_buckets - 1)
-        buf = torch.from_numpy(patch_buckets).long().unsqueeze(0)  # (1, N)
-        # Store on same device as model
-        self.bucket_ids = buf.to(self.pos_embed.device)
-        self.register_buffer("bucket_ids", self.bucket_ids, persistent=True)
+        row = torch.from_numpy(patch_buckets).long().to(self.bucket_ids.device)
+        self.bucket_ids[subject_idx] = row
 
     def _embed_contexts(self, contexts):
         """Project each context stream to hidden dim.
@@ -389,8 +389,10 @@ class DiT1D(nn.Module):
         ctx = self._embed_contexts(contexts)
 
         if self.use_roi_routing and self.stream_router is not None:
-            # Expand bucket_ids to batch dimension: (1, N) → (B, N)
-            bids = self.bucket_ids.expand(B, -1)          # (B, N)
+            # Select this subject's patch->bucket row, expand to batch: (B, N).
+            # Batches are subject-homogeneous, so a single scalar applies.
+            sid = 0 if subject_id is None else int(subject_id)
+            bids = self.bucket_ids[sid].unsqueeze(0).expand(B, -1)   # (B, N)
             stream_gates = self.stream_router(bids)        # (B, N, S)
             for block in self.blocks:
                 x = block(x, c, feat_rope=self.feat_rope,
