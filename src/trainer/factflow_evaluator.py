@@ -85,35 +85,31 @@ class FactFlowEvaluator:
 
         # ── Data (always rep-averaged GT: 1000 images, mean of 3 trials) ──
         dc = self.data_cfg
-        self.n_voxels = dc["n_voxels"]
         self.roi_order = bool(dc.get("roi_order", False))
-        self.test_ds = FactFlowfMRIDataset(
-            data_dir=dc["data_dir"],
-            subject=dc["subject"],
-            mode="test",
-            fmri_mode=dc["fmri_mode"],
-            clip_feature=dc["clip_feature"],
-            n_voxels=dc["n_voxels"],
-            pad_to=dc["pad_to"],
-            fmri_channels=dc.get("fmri_channels", 1),
-            fmri_spatial=dc.get("fmri_spatial", None),
-            dino_feature=dc.get("dino_feature", None),
-            avg_reps=True,
-            roi_order=self.roi_order,
-            context_features=dc.get("context_features", None),
-            subdirs=dc.get("subdirs", None),
-        )
-        # Index that maps ROI-sorted voxels back to anatomical order (or None).
-        self.unsort_idx = self.test_ds.unsort_idx if self.roi_order else None
+
+        # Multi-subject mode: config provides ``subjects`` + ``n_voxels_map``
+        # instead of a single ``subject`` / ``n_voxels``. The checkpoint then
+        # carries per-subject input/output adapters selected by a contiguous
+        # ``subject_id`` (the subject's index in the ``subjects`` list).
+        self.multisubject = ("n_voxels_map" in dc) and ("subject" not in dc)
+        if self.multisubject:
+            self.subjects = [int(s) for s in dc["subjects"]]
+            self.n_voxels_map = {int(k): int(v) for k, v in dc["n_voxels_map"].items()}
+            sel = getattr(args, "subject", None)
+            if sel is not None:
+                self.eval_subjects = [int(s) for s in str(sel).split(",")]
+            else:
+                self.eval_subjects = list(self.subjects)
+        else:
+            self.subjects = None
+            self.n_voxels_map = {int(dc["subject"]): int(dc["n_voxels"])}
+            self.eval_subjects = [int(dc["subject"])]
+
+        # Build the first eval subject's data so the model embedder dims
+        # (context_dims) and geometry are known before constructing the model.
+        self._set_subject(self.eval_subjects[0])
         # Context streams define the per-stream embedder dims (matches training).
         self.cfg.stage_2.params.context_dims = list(self.test_ds.context_dims)
-        self.test_loader = DataLoader(
-            self.test_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-        )
 
         # ── Geometry / model ──────────────────────────────────────────
         self.latent_size = get_latent_size(self.data_cfg)
@@ -134,6 +130,48 @@ class FactFlowEvaluator:
         self.wrapper.eval()
 
     # ──────────────────────────────────────────────────────────────────
+    # Subject selection (single- or multi-subject)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _set_subject(self, subject: int) -> None:
+        """Build the test set/loader for ``subject`` and set its geometry.
+
+        Sets ``self.n_voxels``, ``self.subject_id`` (contiguous adapter index,
+        ``None`` in single-subject mode), ``self.test_ds``, ``self.test_loader``
+        and ``self.unsort_idx``.
+        """
+        dc = self.data_cfg
+        subject = int(subject)
+        self.subject = subject
+        self.n_voxels = self.n_voxels_map[subject]
+        self.subject_id = self.subjects.index(subject) if self.multisubject else None
+        self.test_ds = FactFlowfMRIDataset(
+            data_dir=dc["data_dir"],
+            subject=subject,
+            mode="test",
+            fmri_mode=dc["fmri_mode"],
+            clip_feature=dc["clip_feature"],
+            n_voxels=self.n_voxels,
+            pad_to=dc["pad_to"],
+            fmri_channels=dc.get("fmri_channels", 1),
+            fmri_spatial=dc.get("fmri_spatial", None),
+            dino_feature=dc.get("dino_feature", None),
+            avg_reps=True,
+            roi_order=self.roi_order,
+            context_features=dc.get("context_features", None),
+            subdirs=dc.get("subdirs", None),
+        )
+        # Index that maps ROI-sorted voxels back to anatomical order (or None).
+        self.unsort_idx = self.test_ds.unsort_idx if self.roi_order else None
+        self.test_loader = DataLoader(
+            self.test_ds,
+            batch_size=self.args.batch_size,
+            shuffle=False,
+            num_workers=self.args.num_workers,
+            pin_memory=True,
+        )
+
+    # ──────────────────────────────────────────────────────────────────
     # Single-pass inference
     # ──────────────────────────────────────────────────────────────────
 
@@ -148,7 +186,10 @@ class FactFlowEvaluator:
             x0 = self.eval_noise_scale * torch.randn(B, *self.latent_size, device=self.device)
             ctx = contexts if self.use_cross_attn else None
             with autocast(**self.autocast_kwargs):
-                traj = self.sample_fn(x0, self.wrapper.dit.forward, y=clip_pool, contexts=ctx)
+                traj = self.sample_fn(
+                    x0, self.wrapper.dit.forward, y=clip_pool, contexts=ctx,
+                    subject_id=self.subject_id,
+                )
             pred = traj[-1].float()
             del traj, x0, clip_pool, contexts, ctx
 
@@ -190,14 +231,14 @@ class FactFlowEvaluator:
             "profile_r": metrics.profile_r,
         }
 
-    def _append_csv(self, k: int, result: Dict[str, float]) -> None:
-        """Append one CSV row for a given K."""
+    def _append_csv(self, k: int, result: Dict[str, float], subject) -> None:
+        """Append one CSV row for a given K and subject (``"avg"`` for mean)."""
         csv_path = getattr(self.args, "csv_out", None)
         if not csv_path:
             return
         os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
         header = [
-            "k_trials", "mean_voxel_r", "median_voxel_r",
+            "subject", "k_trials", "mean_voxel_r", "median_voxel_r",
             "mean_profile_r", "mse", "ckpt",
         ]
         write_header = not os.path.exists(csv_path)
@@ -206,6 +247,7 @@ class FactFlowEvaluator:
             if write_header:
                 writer.writerow(header)
             writer.writerow([
+                subject,
                 k,
                 f"{result['mean_voxel_r']:.6f}",
                 f"{result['median_voxel_r']:.6f}",
@@ -220,17 +262,13 @@ class FactFlowEvaluator:
     # ──────────────────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def evaluate(self) -> Dict[str, float]:
-        """Run inference, average K passes, and compute all metrics."""
-        self.logger.info("=" * 60)
+    def _evaluate_one_subject(self) -> Dict[int, Dict[str, float]]:
+        """Run inference + per-K metrics for the currently active subject."""
         self.logger.info(
-            "max_trials: %d  |  k_values: %s  |  eval_noise_scale: %.3g",
-            self.max_trials, self.k_values, self.eval_noise_scale,
+            "Running inference on %d test images (subject=%s, subject_id=%s, "
+            "avg_reps=True)...",
+            len(self.test_ds), self.subject, self.subject_id,
         )
-        self.logger.info(
-            "Running inference on %d test images (avg_reps=True)...", len(self.test_ds),
-        )
-        self.logger.info("=" * 60)
 
         # ── Ground truth (once) ───────────────────────────────────────
         all_targets = []
@@ -246,36 +284,69 @@ class FactFlowEvaluator:
         # ── Forward passes ────────────────────────────────────────────
         all_passes: List[np.ndarray] = []
         out_dir = getattr(self.args, "output", None)
+        sub_tag = f"sub{self.subject}"
         for t in range(self.max_trials):
-            self.logger.info("Pass %d / %d ...", t + 1, self.max_trials)
+            self.logger.info("  Pass %d / %d ...", t + 1, self.max_trials)
             preds_t = self._run_single_pass()  # (N, V)
             all_passes.append(preds_t)
             if out_dir:
-                pass_dir = os.path.join(out_dir, "passes")
+                pass_dir = os.path.join(out_dir, sub_tag, "passes")
                 os.makedirs(pass_dir, exist_ok=True)
                 np.save(os.path.join(pass_dir, f"pass_{t:02d}.npy"), preds_t)
 
         # ── Metrics per K ─────────────────────────────────────────────
-        self.logger.info("=" * 60)
-        self.logger.info("EVALUATION RESULTS")
-        self.logger.info("=" * 60)
-        last_result: Dict[str, float] = {}
+        results: Dict[int, Dict[str, float]] = {}
         for k in self.k_values:
             preds_avg = np.stack(all_passes[:k], axis=0).mean(axis=0).astype(np.float32)
             result = self._compute_and_report(preds_avg, targets, k)
-            self._append_csv(k, result)
+            self._append_csv(k, result, subject=self.subject)
             if out_dir:
+                os.makedirs(os.path.join(out_dir, sub_tag), exist_ok=True)
                 np.savez(
-                    os.path.join(out_dir, f"avg_k{k:02d}.npz"),
+                    os.path.join(out_dir, sub_tag, f"avg_k{k:02d}.npz"),
                     preds=preds_avg, targets=targets,
                     voxel_r=result["voxel_r"], profile_r=result["profile_r"],
                 )
-            last_result = result
+            results[k] = result
+        return results
+
+    @torch.no_grad()
+    def evaluate(self) -> Dict[str, float]:
+        """Run inference for all selected subjects; report per-subject + average."""
+        self.logger.info("=" * 60)
+        self.logger.info(
+            "max_trials: %d  |  k_values: %s  |  eval_noise_scale: %.3g",
+            self.max_trials, self.k_values, self.eval_noise_scale,
+        )
+        self.logger.info("Subjects to evaluate: %s", self.eval_subjects)
         self.logger.info("=" * 60)
 
-        return {
-            "mean_voxel_r": last_result.get("mean_voxel_r", 0.0),
-            "median_voxel_r": last_result.get("median_voxel_r", 0.0),
-            "mean_profile_r": last_result.get("mean_profile_r", 0.0),
-            "mse": last_result.get("mse", 0.0),
-        }
+        # subject -> {k -> result}
+        per_subject: Dict[int, Dict[int, Dict[str, float]]] = {}
+        for subject in self.eval_subjects:
+            self.logger.info("─" * 60)
+            self.logger.info("SUBJECT %s", subject)
+            self._set_subject(subject)
+            per_subject[subject] = self._evaluate_one_subject()
+
+        # ── Average across subjects per K ─────────────────────────────
+        metric_keys = ["mean_voxel_r", "median_voxel_r", "mean_profile_r", "mse"]
+        avg_by_k: Dict[int, Dict[str, float]] = {}
+        self.logger.info("=" * 60)
+        self.logger.info("AVERAGE OVER SUBJECTS %s", self.eval_subjects)
+        self.logger.info("=" * 60)
+        for k in self.k_values:
+            avg = {mk: float(np.mean([per_subject[s][k][mk] for s in self.eval_subjects]))
+                   for mk in metric_keys}
+            avg_by_k[k] = avg
+            self.logger.info("  ── K=%d (avg) ──", k)
+            self.logger.info("    Per-voxel Pearson r (mean):   %.4f", avg["mean_voxel_r"])
+            self.logger.info("    Profile Pearson r (mean):     %.4f", avg["mean_profile_r"])
+            self.logger.info("    MSE:                          %.6f", avg["mse"])
+            if len(self.eval_subjects) > 1:
+                self._append_csv(k, {**avg, "voxel_r": None, "profile_r": None},
+                                 subject="avg")
+        self.logger.info("=" * 60)
+
+        last_k = self.k_values[-1]
+        return avg_by_k[last_k]

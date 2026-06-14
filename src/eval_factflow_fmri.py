@@ -43,6 +43,12 @@ def main() -> None:
                         help="Checkpoint to evaluate")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument(
+        "--subject", type=str, default=None,
+        help="Multi-subject configs only: comma-separated subject id(s) to "
+             "evaluate (e.g. '1' or '1,2,5,7'). Default: all subjects in the "
+             "config's `subjects` list (per-subject metrics + average).",
+    )
+    parser.add_argument(
         "--eval_noise_scale", type=float, default=None,
         help="Override eval_noise_scale from config (e.g. 0.5 for stochastic eval)",
     )
