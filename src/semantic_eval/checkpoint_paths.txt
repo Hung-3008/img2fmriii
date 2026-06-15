@@ -1,0 +1,20 @@
+# Checkpoint paths used by src/semantic_eval/ (StimFlow MindEye2 semantic eval)
+# Repo root: /media/hung/data1/codes/img2fmri_02/img2fmriii
+# CKPT_DIR : NSD/checkpoints
+# Verified present: 2026-06-15
+
+## MindEye2 per-subject (40-session) -- loaded via mindeye_ckpt()
+/media/hung/data1/codes/img2fmri_02/img2fmriii/NSD/checkpoints/mindeye2/train_logs/final_subj01_pretrained_40sess_24bs/last.pth
+/media/hung/data1/codes/img2fmri_02/img2fmriii/NSD/checkpoints/mindeye2/train_logs/final_subj02_pretrained_40sess_24bs/last.pth
+/media/hung/data1/codes/img2fmri_02/img2fmriii/NSD/checkpoints/mindeye2/train_logs/final_subj05_pretrained_40sess_24bs/last.pth
+/media/hung/data1/codes/img2fmri_02/img2fmriii/NSD/checkpoints/mindeye2/train_logs/final_subj07_pretrained_40sess_24bs/last.pth
+
+## SDXL unCLIP (base reconstruction pipeline)
+/media/hung/data1/codes/img2fmri_02/img2fmriii/NSD/checkpoints/sdxl_unclip/unclip6_epoch0_step110000.ckpt
+/media/hung/data1/codes/img2fmri_02/img2fmriii/NSD/checkpoints/sdxl_unclip/unclip6.yaml
+/media/hung/data1/codes/img2fmri_02/img2fmriii/NSD/checkpoints/sdxl_unclip/open_clip_pytorch_model.bin
+
+## Enhanced pipeline (refinement)
+/media/hung/data1/codes/img2fmri_02/img2fmriii/NSD/checkpoints/zavychromaxl_v30.safetensors
+/media/hung/data1/codes/img2fmri_02/img2fmriii/NSD/checkpoints/bigG_to_L_epoch8.pth
+/media/hung/data1/codes/img2fmri_02/img2fmriii/NSD/checkpoints/sd_image_var_autoenc.pth

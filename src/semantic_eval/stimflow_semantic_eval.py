@@ -76,6 +76,11 @@ for p in (REPO, MINDEYE_SRC, os.path.join(MINDEYE_SRC, "generative_models")):
 CKPT_DIR = os.path.join(REPO, "NSD", "checkpoints")
 SDXL_CKPT = os.path.join(CKPT_DIR, "sdxl_unclip", "unclip6_epoch0_step110000.ckpt")
 SDXL_CFG = os.path.join(CKPT_DIR, "sdxl_unclip", "unclip6.yaml")
+SDXL_BASE_CFG = os.path.join(MINDEYE_SRC, "generative_models", "configs", "inference", "sd_xl_base.yaml")
+SDXL_BASE_CKPT = os.path.join(CKPT_DIR, "zavychromaxl_v30.safetensors")
+BIGG_TO_L_CKPT = os.path.join(CKPT_DIR, "bigG_to_L_epoch8.pth")
+BLURRY_AUTOENC_CKPT = os.path.join(CKPT_DIR, "sd_image_var_autoenc.pth")
+OPENCLIP_BIGG_BIN = os.path.join(CKPT_DIR, "sdxl_unclip", "open_clip_pytorch_model.bin")
 MINDEYE_NSD = os.path.join(REPO, "NSD", "data", "mindeye_nsd")
 COCO_HDF5 = os.path.join(REPO, "NSD", "data", "coco_images_224_float16.hdf5")
 EXPDESIGN = os.path.join(REPO, "NSD", "data", "nsddata", "experiments", "nsd", "nsd_expdesign.mat")
@@ -83,14 +88,17 @@ VOXELS = {1: 15724, 2: 14278, 5: 13039, 7: 12682}
 
 
 def mindeye_ckpt(subject):
-    cands = [os.path.join(CKPT_DIR, "mindeye2", "train_logs",
-                          f"final_subj0{subject}_pretrained_40sess_24bs", "last.pth")]
-    if subject == 1:
-        cands.append(os.path.join(CKPT_DIR, "mindeye2", "last.pth"))
-    for c in cands:
-        if os.path.exists(c):
-            return c
-    raise FileNotFoundError(f"MindEye2 ckpt not found for subj{subject}: {cands}")
+    # Only the canonical published 40-session per-subject checkpoint. The old
+    # top-level mindeye2/last.pth is a DIFFERENT (weaker) model and silently
+    # using it for subj01 sandbagged the absolute metrics — never fall back to it.
+    c = os.path.join(CKPT_DIR, "mindeye2", "train_logs",
+                     f"final_subj0{subject}_pretrained_40sess_24bs", "last.pth")
+    if os.path.exists(c):
+        return c
+    raise FileNotFoundError(
+        f"MindEye2 40sess ckpt not found for subj{subject}: {c}. "
+        f"Download via hf_hub_download('pscotti/mindeyev2', "
+        f"'train_logs/final_subj0{subject}_pretrained_40sess_24bs/last.pth').")
 
 
 # ── Model definitions (mirror recon_inference.py) ───────────────────────────
@@ -133,11 +141,9 @@ def load_mindeye(subject, device):
     print(f"[mindeye2] loading {path}")
     ckpt = torch.load(path, map_location="cpu")
     state = ckpt["model_state_dict"]
-    try:
-        model.load_state_dict(state, strict=True)
-    except Exception as e:
-        print(f"[mindeye2] strict load failed ({str(e)[:80]}...), retrying strict=False")
-        model.load_state_dict(state, strict=False)
+    # strict=True only: a partial load silently degrades semantics (renders fine,
+    # CLIP/Incep tank). If keys mismatch we want a hard failure, not a fallback.
+    model.load_state_dict(state, strict=True)
     del ckpt
     model.eval().requires_grad_(False)
     return model
@@ -193,35 +199,233 @@ def load_unclip(device):
     return engine, vector_suffix
 
 
-# ── Decode: fMRI -> reconstructed images ────────────────────────────────────
+# ── Enhanced-pipeline model loaders (caption + blurry + SDXL-base refiner) ────
+class CLIPConverter(nn.Module):
+    """Maps MindEye2 bigG prior output (256,1664) -> CLIP-L caption tokens (257,1024)."""
+    def __init__(self, clip_seq_dim=256, clip_emb_dim=1664,
+                 clip_text_seq_dim=257, clip_text_emb_dim=1024):
+        super().__init__()
+        self.linear1 = nn.Linear(clip_seq_dim, clip_text_seq_dim)
+        self.linear2 = nn.Linear(clip_emb_dim, clip_text_emb_dim)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.linear1(x)
+        x = self.linear2(x.permute(0, 2, 1))
+        return x
+
+
+def load_caption_models():
+    """GIT caption model + bigG->L converter, kept on CPU to save VRAM."""
+    # transformers>=5 dropped this util; modeling_git imports it (only used in an
+    # unused prune_heads path), so shim it before importing modeling_git.
+    import transformers.pytorch_utils as _ptu
+    if not hasattr(_ptu, "find_pruneable_heads_and_indices"):
+        def _fphi(heads, n_heads, head_size, already_pruned_heads):
+            mask = torch.ones(n_heads, head_size)
+            heads = set(heads) - already_pruned_heads
+            for h in heads:
+                h = h - sum(1 for x in already_pruned_heads if x < h)
+                mask[h] = 0
+            mask = mask.view(-1).contiguous().eq(1)
+            return heads, torch.arange(len(mask))[mask].long()
+        _ptu.find_pruneable_heads_and_indices = _fphi
+    from transformers import AutoProcessor
+    from modeling_git import GitForCausalLMClipEmb
+    processor = AutoProcessor.from_pretrained("microsoft/git-large-coco")
+    git_model = GitForCausalLMClipEmb.from_pretrained("microsoft/git-large-coco")
+    git_model.eval().requires_grad_(False)
+    clip_convert = CLIPConverter()
+    sd = torch.load(BIGG_TO_L_CKPT, map_location="cpu")["model_state_dict"]
+    clip_convert.load_state_dict(sd, strict=True)
+    clip_convert.eval().requires_grad_(False)
+    return clip_convert, processor, git_model
+
+
+def load_blurry_autoenc(device):
+    from diffusers import AutoencoderKL
+    autoenc = AutoencoderKL(
+        down_block_types=["DownEncoderBlock2D"] * 4,
+        up_block_types=["UpDecoderBlock2D"] * 4,
+        block_out_channels=[128, 256, 512, 512], layers_per_block=2, sample_size=256)
+    autoenc.load_state_dict(torch.load(BLURRY_AUTOENC_CKPT, map_location="cpu"))
+    autoenc.eval().requires_grad_(False).to(device)
+    return autoenc
+
+
 @torch.no_grad()
-def decode(fmri, model, engine, vector_suffix, device):
-    """fmri: (N, n_rep, V) torch on CPU. Returns recons (N,3,256,256), clipvox (N,256,1664)."""
+def gen_caption(prior_out, clip_convert, processor, git_model):
+    emb = clip_convert(prior_out.cpu().float())          # (1,257,1024) on CPU
+    ids = git_model.generate(pixel_values=emb, max_length=20)
+    return processor.batch_decode(ids, skip_special_tokens=True)[0]
+
+
+@torch.no_grad()
+def gen_blurry(blurry_enc, autoenc, device):
+    """blurry_enc: (1,4,h,w) latent -> (3,256,256) image in [0,1]."""
+    img = (autoenc.decode(blurry_enc.to(device) / 0.18215).sample / 2 + 0.5).clamp(0, 1)
+    return transforms.Resize((256, 256))(img)[0].cpu()
+
+
+NEG_PROMPT = ("painting, extra fingers, mutated hands, poorly drawn hands, poorly drawn "
+              "face, deformed, ugly, blurry, bad anatomy, bad proportions, extra limbs, "
+              "cloned face, skinny, glitchy, double torso, extra arms, extra hands, "
+              "mangled fingers, missing lips, ugly face, distorted face, extra legs, anime")
+
+
+def _sdxl_batch(txt, device):
+    return {"txt": txt,
+            "original_size_as_tuple": torch.ones(1, 2, device=device) * 768,
+            "crop_coords_top_left": torch.zeros(1, 2, device=device),
+            "target_size_as_tuple": torch.ones(1, 2, device=device) * 1024}
+
+
+def load_sdxl_base(device):
+    """SDXL-base (zavychromaxl) img2img refiner. The engine's own conditioner
+    (CLIP-L + bigG text) produces exactly the SDXL crossattn+vector we need, so
+    we keep it on the GPU and call it per-image (no separate embedders). UNet +
+    conditioner are cast to fp16 to fit 24GB; the VAE stays fp32.
+
+    Returns (engine, uc) where uc is the fixed negative-prompt conditioning."""
+    import utils as me_utils
+    me_utils.device = device
+    from omegaconf import OmegaConf
+    from sgm.models.diffusion import DiffusionEngine
+
+    # transformers>=4.48 CLIPTextModel defaults to SDPA attention, which trips on
+    # the (77,77) causal mask sgm's FrozenCLIPEmbedder passes. Force eager attn.
+    import transformers as _tf
+    if not getattr(_tf.CLIPTextModel, "_eager_patched", False):
+        _orig_fp = _tf.CLIPTextModel.from_pretrained
+        def _fp(*a, **k):
+            k.setdefault("attn_implementation", "eager")
+            return _orig_fp(*a, **k)
+        _tf.CLIPTextModel.from_pretrained = staticmethod(_fp)
+        _tf.CLIPTextModel._eager_patched = True
+
+    un = OmegaConf.to_container(OmegaConf.load(SDXL_CFG), resolve=True)["model"]["params"]
+    sampler_config = un["sampler_config"]
+    sampler_config["params"]["num_steps"] = 38
+
+    cfg = OmegaConf.to_container(OmegaConf.load(SDXL_BASE_CFG), resolve=True)["model"]["params"]
+    ddc = cfg["first_stage_config"].get("params", {}).get("ddconfig", {})
+    if ddc.get("attn_type") == "vanilla-xformers":
+        ddc["attn_type"] = "vanilla"
+    for emb in cfg["conditioner_config"]["params"]["emb_models"]:
+        ep = emb.get("params", {})
+        if ep.get("arch") == "ViT-bigG-14":
+            ep["version"] = OPENCLIP_BIGG_BIN       # local bigG, avoid 10GB download
+
+    print(f"[sdxl-base] loading {SDXL_BASE_CKPT}")
+    engine = DiffusionEngine(
+        network_config=cfg["network_config"], denoiser_config=cfg["denoiser_config"],
+        first_stage_config=cfg["first_stage_config"], conditioner_config=cfg["conditioner_config"],
+        sampler_config=sampler_config, scale_factor=cfg["scale_factor"],
+        disable_first_stage_autocast=cfg["disable_first_stage_autocast"],
+        ckpt_path=SDXL_BASE_CKPT)
+    engine.eval().requires_grad_(False)
+    engine.model.half()           # fp16 UNet + text conditioner to fit 24GB;
+    engine.conditioner.half()     # VAE (first_stage_model) stays fp32 for stability
+    engine.to(device)
+    try:
+        engine.sampler.guider.scale = 5
+    except Exception:
+        pass
+    with torch.no_grad():
+        uc = dict(engine.conditioner(_sdxl_batch(NEG_PROMPT, device)))
+    torch.cuda.empty_cache()
+    return engine, uc
+
+
+# ── Decode: fMRI -> reconstructed images ────────────────────────────────────
+def _load_png(path):
+    from PIL import Image
+    return transforms.functional.to_tensor(Image.open(path).convert("RGB"))
+
+
+@torch.no_grad()
+def decode(fmri, gt_images, model, engine, vector_suffix, device, out_dir,
+           save_gt_pngs=True, caption_models=None, autoenc=None):
+    """Decode (N,n_rep,V) fMRI -> images, saving EACH image as it is produced.
+
+    Per-image artifacts (enable resume + bounded RAM + the enhanced phase):
+      out_dir/recons/{i:04d}.png    base reconstruction
+      out_dir/clipvox/{i:04d}.npy   retrieval embedding (256,1664)
+      out_dir/gt/{i:04d}.png        ground-truth stimulus (if save_gt_pngs)
+      out_dir/captions/{i:04d}.txt  predicted caption (if caption_models)
+      out_dir/blurry/{i:04d}.png    low-level blurry recon (if autoenc)
+    An index is "done" only when all required artifacts exist, so resume also
+    fills in caption/blurry. Returns (recons, clipvox) reloaded from disk.
+    """
     from utils import unclip_recon
+    from torchvision.utils import save_image
     resize = transforms.Resize((256, 256))
-    recons, clipvox = [], []
+    recons_dir = os.path.join(out_dir, "recons"); os.makedirs(recons_dir, exist_ok=True)
+    cv_dir = os.path.join(out_dir, "clipvox"); os.makedirs(cv_dir, exist_ok=True)
+    gt_dir = os.path.join(out_dir, "gt")
+    cap_dir = os.path.join(out_dir, "captions")
+    blur_dir = os.path.join(out_dir, "blurry")
+    if save_gt_pngs:
+        os.makedirs(gt_dir, exist_ok=True)
+    if caption_models is not None:
+        os.makedirs(cap_dir, exist_ok=True)
+    if autoenc is not None:
+        os.makedirs(blur_dir, exist_ok=True)
     N = fmri.shape[0]
+    n_skip = 0
     with torch.cuda.amp.autocast(dtype=torch.float16):
         for i in range(N):
+            rpath = os.path.join(recons_dir, f"{i:04d}.png")
+            cpath = os.path.join(cv_dir, f"{i:04d}.npy")
+            cap_path = os.path.join(cap_dir, f"{i:04d}.txt")
+            blur_path = os.path.join(blur_dir, f"{i:04d}.png")
+            done = os.path.exists(rpath) and os.path.exists(cpath)
+            if caption_models is not None:
+                done = done and os.path.exists(cap_path)
+            if autoenc is not None:
+                done = done and os.path.exists(blur_path)
+            if done:
+                n_skip += 1
+                continue
             voxel = fmri[i:i + 1].to(device).float()       # (1, n_rep, V)
             nrep = voxel.shape[1]
-            backbone = clipv = None
+            backbone = clipv = blurry = None
             for rep in range(nrep):
                 vr = model.ridge(voxel[:, [rep]], 0)
-                bb, cv, _ = model.backbone(vr)
+                bb, cv, b = model.backbone(vr)
                 backbone = bb if backbone is None else backbone + bb
                 clipv = cv if clipv is None else clipv + cv
+                be = b[0] if isinstance(b, (tuple, list)) else b
+                blurry = be if blurry is None else blurry + be
             backbone = backbone / nrep
             clipv = clipv / nrep
-            clipvox.append(clipv.cpu())
             prior_out = model.diffusion_prior.p_sample_loop(
                 backbone.shape, text_cond=dict(text_embed=backbone),
                 cond_scale=1.0, timesteps=20)
-            img = unclip_recon(prior_out[[0]], engine, vector_suffix, num_samples=1)
-            recons.append(resize(img).float().cpu())
+            img = resize(unclip_recon(prior_out[[0]], engine, vector_suffix,
+                                      num_samples=1)).float().cpu()[0].clamp(0, 1)
+            np.save(cpath + ".tmp.npy", clipv.cpu().numpy()[0])
+            os.replace(cpath + ".tmp.npy", cpath)
+            save_image(img, rpath)
+            if save_gt_pngs:
+                save_image(gt_images[i].float().clamp(0, 1),
+                           os.path.join(gt_dir, f"{i:04d}.png"))
+            if autoenc is not None:
+                save_image(gen_blurry(blurry / nrep, autoenc, device), blur_path)
+            if caption_models is not None:
+                cap = gen_caption(prior_out, *caption_models)
+                with open(cap_path + ".tmp", "w") as f:
+                    f.write(cap)
+                os.replace(cap_path + ".tmp", cap_path)
             if (i + 1) % 25 == 0:
                 print(f"  decoded {i + 1}/{N}", flush=True)
-    return torch.cat(recons, 0), torch.cat(clipvox, 0)
+    if n_skip:
+        print(f"  [resume] skipped {n_skip}/{N} already-decoded images", flush=True)
+    recons = torch.stack([_load_png(os.path.join(recons_dir, f"{i:04d}.png"))
+                          for i in range(N)])
+    clipvox = torch.from_numpy(np.stack([np.load(os.path.join(cv_dir, f"{i:04d}.npy"))
+                                         for i in range(N)]))
+    return recons, clipvox
 
 
 # ── Image-similarity metrics (MindEye2/SynBrain protocol) ────────────────────
@@ -364,48 +568,128 @@ def assemble_stimflow(subject, synth_npz, pred_key):
     return fmri, gt
 
 
-def save_images_png(tensor, out_dir):
-    """Save (N,3,H,W) float[0,1] tensor as zero-padded PNGs."""
-    from torchvision.utils import save_image
-    os.makedirs(out_dir, exist_ok=True)
-    t = tensor.detach().float().clamp(0, 1)
-    for i in range(len(t)):
-        save_image(t[i], os.path.join(out_dir, f"{i:04d}.png"))
-
-
-def decode_and_metrics(tag, fmri, gt_images, model, engine, vector_suffix,
-                       device, out_dir, save_pngs):
-    """Decode one fMRI set, save recons (+PNGs), compute & save metrics."""
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"\n[{tag}] fmri {tuple(fmri.shape)}  gt_images {tuple(gt_images.shape)}", flush=True)
-    recons, clip_voxels = decode(fmri, model, engine, vector_suffix, device)
-    torch.save(recons, os.path.join(out_dir, f"{tag}_recons.pt"))
-    torch.save(clip_voxels, os.path.join(out_dir, f"{tag}_clipvoxels.pt"))
-    if save_pngs:
-        save_images_png(recons, os.path.join(out_dir, "recons"))
-        save_images_png(gt_images, os.path.join(out_dir, "gt"))
-
+def _report_metrics(tag, kind, recons, gt_images, device, mpath):
     metrics = compute_image_metrics(gt_images, recons, device)
     print("=" * 48)
-    print(f"SEMANTIC METRICS  ({tag}, n={len(recons)})")
+    print(f"SEMANTIC METRICS  ({tag} {kind}, n={len(recons)})")
     print("=" * 48)
     for k in ["PixCorr", "SSIM", "Alex_2", "Alex_5", "Incep", "CLIP", "Eff", "SwAV"]:
         print(f"  {k:<10} {metrics[k]:.4f}")
-    with open(os.path.join(out_dir, f"{tag}_metrics.json"), "w") as f:
+    with open(mpath, "w") as f:   # written last = the (tag,kind)-complete marker
         json.dump({k: float(v) for k, v in metrics.items()}, f, indent=2)
-    print(f"[saved] {out_dir}/{tag}_metrics.json", flush=True)
+    print(f"[saved] {mpath}", flush=True)
     return metrics
+
+
+def base_decode_and_metrics(tag, fmri, gt_images, model, engine, vector_suffix,
+                            device, out_dir, save_pngs, caption_models=None, autoenc=None):
+    """Phase A: base reconstruction (+ caption/blurry for the enhanced phase),
+    incremental save + resume, then BASE metrics -> {tag}_base_metrics.json."""
+    os.makedirs(out_dir, exist_ok=True)
+    mpath = os.path.join(out_dir, f"{tag}_base_metrics.json")
+    if os.path.exists(mpath) and os.path.isdir(os.path.join(out_dir, "recons")):
+        print(f"[{tag}] base already complete; skipping decode", flush=True)
+        return json.load(open(mpath))
+    print(f"\n[{tag}] base: fmri {tuple(fmri.shape)}  gt {tuple(gt_images.shape)}", flush=True)
+    recons, clip_voxels = decode(fmri, gt_images, model, engine, vector_suffix,
+                                 device, out_dir, save_gt_pngs=True,
+                                 caption_models=caption_models, autoenc=autoenc)
+    torch.save(clip_voxels, os.path.join(out_dir, f"{tag}_clipvoxels.pt"))
+    torch.save(recons, os.path.join(out_dir, f"{tag}_recons.pt"))
+    return _report_metrics(tag, "base", recons, gt_images, device, mpath)
+
+
+@torch.no_grad()
+def enhance_and_metrics(tag, sdxl, device, out_dir, img2img_timepoint=13):
+    """Phase B: SDXL-base img2img refine of the base recons using the predicted
+    caption (per-image save + resume), then ENHANCED metrics on the
+    enhanced*0.75 + blurry*0.25 blend -> {tag}_enhanced_metrics.json."""
+    from sgm.util import append_dims
+    from torchvision.utils import save_image
+    engine, uc0 = sdxl
+    mpath = os.path.join(out_dir, f"{tag}_enhanced_metrics.json")
+    if os.path.exists(mpath):
+        print(f"[{tag}] enhanced already complete; skipping", flush=True)
+        return json.load(open(mpath))
+
+    recons_dir = os.path.join(out_dir, "recons")
+    enh_dir = os.path.join(out_dir, "enhanced"); os.makedirs(enh_dir, exist_ok=True)
+    cap_dir = os.path.join(out_dir, "captions")
+    blur_dir = os.path.join(out_dir, "blurry")
+    gt_dir = os.path.join(out_dir, "gt")
+    N = len([f for f in os.listdir(recons_dir) if f.endswith(".png")])
+    resize768 = transforms.Resize((768, 768))
+    resize256 = transforms.Resize((256, 256))
+    print(f"\n[{tag}] enhanced: refining {N} base recons", flush=True)
+
+    def denoiser(x, sigma, cc):
+        return engine.denoiser(engine.model, x, sigma, cc)
+
+    n_skip = 0
+    with torch.cuda.amp.autocast(dtype=torch.float16), engine.ema_scope():
+        for i in range(N):
+            epath = os.path.join(enh_dir, f"{i:04d}.png")
+            if os.path.exists(epath):
+                n_skip += 1
+                continue
+            image = resize768(_load_png(os.path.join(recons_dir, f"{i:04d}.png")))[None].to(device)
+            prompt = open(os.path.join(cap_dir, f"{i:04d}.txt")).read()
+            z = engine.encode_first_stage(image * 2 - 1)
+            # engine.conditioner produces the SDXL crossattn+vector for this prompt
+            c = dict(engine.conditioner(_sdxl_batch(prompt, device)))
+            uc = {k: v.clone() for k, v in uc0.items()}
+
+            engine.sampler.num_steps = 25
+            sigmas = engine.sampler.discretization(engine.sampler.num_steps).to(device)
+            init_z = (z + torch.randn_like(z) * append_dims(sigmas[-img2img_timepoint], z.ndim)
+                      ) / torch.sqrt(1.0 + sigmas[0] ** 2.0)
+            sigmas = sigmas[-img2img_timepoint:]
+            engine.sampler.num_steps = sigmas.shape[-1] - 1
+            noised_z, _, _, _, c, uc = engine.sampler.prepare_sampling_loop(
+                init_z, cond=c, uc=uc, num_steps=engine.sampler.num_steps)
+            for t in range(engine.sampler.num_steps):
+                # sigmas[t] would be 0-D; the CFG guider needs a 1-D sigma (it does
+                # torch.cat([s]*2)). Slice to keep shape (1,) as in MindEye2's loop.
+                noised_z = engine.sampler.sampler_step(
+                    sigmas[t:t + 1], sigmas[t + 1:t + 2], denoiser, noised_z,
+                    cond=c, uc=uc, gamma=0)
+            x = engine.decode_first_stage(noised_z)
+            samp = resize256(torch.clamp((x + 1.0) / 2.0, 0.0, 1.0))[0].cpu()
+            save_image(samp, epath)
+            if (i + 1) % 25 == 0:
+                print(f"  enhanced {i + 1}/{N}", flush=True)
+    if n_skip:
+        print(f"  [resume] skipped {n_skip}/{N} already-enhanced", flush=True)
+
+    enhanced = torch.stack([_load_png(os.path.join(enh_dir, f"{i:04d}.png")) for i in range(N)])
+    blurry = torch.stack([_load_png(os.path.join(blur_dir, f"{i:04d}.png")) for i in range(N)])
+    gt = torch.stack([_load_png(os.path.join(gt_dir, f"{i:04d}.png")) for i in range(N)])
+    blended = (enhanced * 0.75 + blurry * 0.25).clamp(0, 1)   # MindEye2 final blend
+    torch.save(enhanced, os.path.join(out_dir, f"{tag}_enhanced_recons.pt"))
+    return _report_metrics(tag, "enhanced", blended, gt, device, mpath)
 
 
 def build_job(kind, subject, synth_npz=None, pred_key="preds"):
     if kind == "gt":
-        fmri, gt = assemble_gt_sanity(subject)
-    else:
-        fmri, gt = assemble_stimflow(subject, synth_npz, pred_key)
-    return fmri, gt
+        return assemble_gt_sanity(subject)
+    return assemble_stimflow(subject, synth_npz, pred_key)
+
+
+def _tag_list(args, S):
+    tags = []
+    if args.do_gt:
+        tags.append(("gt", None))
+    for k, tag in (("01", "T1"), ("05", "T5")):
+        npz = os.path.join(args.synth_dir, f"sub{S}", f"avg_k{k}.npz")
+        if os.path.exists(npz):
+            tags.append((tag, npz))
+        else:
+            print(f"[warn] missing {npz}, skipping {tag}")
+    return tags
 
 
 def main():
+    import gc
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", action="store_true",
                     help="Load models once for --subject and run GT(optional)+T1+T5.")
@@ -419,6 +703,8 @@ def main():
                     help="Batch mode: results written to {out_root}/sub{S}_{tag}/")
     ap.add_argument("--pred_key", type=str, default="preds")
     ap.add_argument("--do_gt", action="store_true", help="Batch mode: also run GT upper bound.")
+    ap.add_argument("--enhanced", action="store_true",
+                    help="Also run the MindEye2 enhanced (SDXL-base img2img) phase.")
     ap.add_argument("--save_pngs", action="store_true")
     ap.add_argument("--max_images", type=int, default=-1)
     ap.add_argument("--device", type=str, default="cuda:0")
@@ -426,43 +712,75 @@ def main():
     device = args.device
     S = args.subject
 
-    # ── Batch: one model load per subject, decode GT(optional)+T1+T5 ──
     if args.batch:
-        model = load_mindeye(S, device)
-        engine, vector_suffix = load_unclip(device)
-        jobs = []
-        if args.do_gt:
-            jobs.append(("gt", *build_job("gt", S)))
-        for k, tag in (("01", "T1"), ("05", "T5")):
-            npz = os.path.join(args.synth_dir, f"sub{S}", f"avg_k{k}.npz")
-            if os.path.exists(npz):
-                jobs.append((tag, *build_job("stimflow", S, npz, args.pred_key)))
-            else:
-                print(f"[warn] missing {npz}, skipping {tag}")
-        for tag, fmri, gt in jobs:
-            if args.max_images > 0:
-                fmri, gt = fmri[:args.max_images], gt[:args.max_images]
-            out_dir = os.path.join(args.out_root, f"sub{S}_{tag}")
-            decode_and_metrics(tag, fmri, gt, model, engine, vector_suffix,
-                               device, out_dir, args.save_pngs)
+        tags = _tag_list(args, S)
+        out_dir = lambda tag: os.path.join(args.out_root, f"sub{S}_{tag}")
+
+        def base_done(tag):
+            d = out_dir(tag)
+            ok = (os.path.exists(os.path.join(d, f"{tag}_base_metrics.json"))
+                  and os.path.isdir(os.path.join(d, "recons")))
+            if args.enhanced:   # enhanced needs captions + blurry from phase A
+                ok = ok and os.path.isdir(os.path.join(d, "captions")) \
+                    and os.path.isdir(os.path.join(d, "blurry"))
+            return ok
+
+        # ── Phase A: base recon (+ caption/blurry if enhanced) ──
+        # Only load the heavy decoders if some tag still needs base decoding.
+        need = [(tag, npz) for tag, npz in tags if not base_done(tag)]
+        if need:
+            model = load_mindeye(S, device)
+            engine, vector_suffix = load_unclip(device)
+            caption_models = load_caption_models() if args.enhanced else None
+            autoenc = load_blurry_autoenc(device) if args.enhanced else None
+            for tag, npz in need:
+                fmri, gt = build_job("gt" if tag == "gt" else "stimflow", S, npz, args.pred_key)
+                if args.max_images > 0:
+                    fmri, gt = fmri[:args.max_images], gt[:args.max_images]
+                base_decode_and_metrics(tag, fmri, gt, model, engine, vector_suffix,
+                                        device, out_dir(tag), args.save_pngs,
+                                        caption_models, autoenc)
+                del fmri, gt
+            del model, engine, caption_models, autoenc
+            gc.collect(); torch.cuda.empty_cache()
+        else:
+            print("[phase A] all base tags already complete; skipping decoders")
+
+        # ── Phase B: enhanced (separate model load to fit VRAM) ──
+        # Fail-safe: any error here must NOT lose the base results above.
+        if args.enhanced:
+            try:
+                sdxl = load_sdxl_base(device)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                print(f"[enhanced] DISABLED — SDXL-base failed to load in this env "
+                      f"({type(e).__name__}: {str(e)[:120]}). Base results are intact.",
+                      flush=True)
+                sdxl = None
+            if sdxl is not None:
+                for tag, _ in tags:
+                    try:
+                        enhance_and_metrics(tag, sdxl, device, out_dir(tag))
+                    except Exception as e:
+                        import traceback; traceback.print_exc()
+                        print(f"[enhanced][{tag}] FAILED ({type(e).__name__}: {str(e)[:120]}); "
+                              f"skipping. Base results for {tag} are intact.", flush=True)
+                del sdxl
+                gc.collect(); torch.cuda.empty_cache()
         print(f"\n[done] subject {S} batch complete.")
         return
 
-    # ── Single run ──
+    # ── Single run (base only; use --batch for enhanced) ──
     assert args.mode and args.out_dir, "single mode needs --mode and --out_dir"
-    if args.mode == "gt_sanity":
-        fmri, gt_images = build_job("gt", S)
-        tag = "gt"
-    else:
-        assert args.synth_npz, "--synth_npz required for --mode stimflow"
-        fmri, gt_images = build_job("stimflow", S, args.synth_npz, args.pred_key)
-        tag = "stimflow"
+    kind = "gt" if args.mode == "gt_sanity" else "stimflow"
+    fmri, gt_images = build_job(kind, S, args.synth_npz, args.pred_key)
+    tag = "gt" if kind == "gt" else "stimflow"
     if args.max_images > 0:
         fmri, gt_images = fmri[:args.max_images], gt_images[:args.max_images]
     model = load_mindeye(S, device)
     engine, vector_suffix = load_unclip(device)
-    decode_and_metrics(tag, fmri, gt_images, model, engine, vector_suffix,
-                       device, args.out_dir, args.save_pngs)
+    base_decode_and_metrics(tag, fmri, gt_images, model, engine, vector_suffix,
+                            device, args.out_dir, args.save_pngs)
 
 
 if __name__ == "__main__":

@@ -35,41 +35,36 @@ for S in "${SUBJECTS[@]}"; do
   echo "############################################################"
   $PY "$SCRIPT" --batch --subject "$S" \
       --synth_dir "$SYNTH_DIR" --out_root "$OUT_ROOT" \
-      --do_gt --save_pngs --device "$DEVICE" --max_images "$MAX_IMAGES" \
+      --do_gt --enhanced --save_pngs --device "$DEVICE" --max_images "$MAX_IMAGES" \
       2>&1 | tee "$LOG_DIR/sub${S}.log"
 done
 
 echo ""
 echo "=== ALL SUBJECTS DONE ($(date '+%F %T')) ==="
 
-# ---- summary table over all *_metrics.json ----
+# ---- summary table: base + enhanced, per run + per-tag average ----
 $PY - <<'PYEOF'
-import json, glob, os
-rows = []
-for d in sorted(glob.glob("results/semantic_eval/sub*_*")):
-    js = glob.glob(os.path.join(d, "*_metrics.json"))
-    if not js:
+import json, glob, os, collections
+KS = ["PixCorr", "SSIM", "Alex_2", "Alex_5", "Incep", "CLIP", "Eff", "SwAV"]
+def line(name, m):
+    return (f"{name:<20}" + "".join(f"{m[k]:>7.3f}" for k in KS))
+for kind in ("base", "enhanced"):
+    rows = []
+    for d in sorted(glob.glob("results/semantic_eval/sub*_*")):
+        jf = os.path.join(d, f"{os.path.basename(d).split('_')[-1]}_{kind}_metrics.json")
+        if os.path.exists(jf):
+            rows.append((f"{os.path.basename(d)}", json.load(open(jf))))
+    if not rows:
         continue
-    m = json.load(open(js[0]))
-    rows.append((os.path.basename(d), m))
-if rows:
-    print("\n==================== SUMMARY ====================")
-    print(f"{'run':<12}{'PixCorr':>8}{'SSIM':>7}{'Alex2':>7}{'Alex5':>7}"
-          f"{'Incep':>7}{'CLIP':>7}{'Eff':>7}{'SwAV':>7}")
+    print(f"\n================ SUMMARY ({kind}) ================")
+    print(f"{'run':<20}" + "".join(f"{k:>7}" for k in ["PixC","SSIM","Alex2","Alex5","Incep","CLIP","Eff","SwAV"]))
     for name, m in rows:
-        print(f"{name:<12}{m['PixCorr']:>8.3f}{m['SSIM']:>7.3f}{m['Alex_2']:>7.3f}"
-              f"{m['Alex_5']:>7.3f}{m['Incep']:>7.3f}{m['CLIP']:>7.3f}"
-              f"{m['Eff']:>7.3f}{m['SwAV']:>7.3f}")
-    # averages across subjects per tag (T1/T5/gt)
-    import collections
+        print(line(name, m))
     agg = collections.defaultdict(list)
     for name, m in rows:
-        tag = name.split("_")[-1]
-        agg[tag].append(m)
-    print("\n---- average over subjects ----")
+        agg[name.split("_")[-1]].append(m)
+    print(f"---- average over subjects ({kind}) ----")
     for tag, ms in sorted(agg.items()):
-        avg = {k: sum(x[k] for x in ms) / len(ms) for k in ms[0]}
-        print(f"{tag:<12}{avg['PixCorr']:>8.3f}{avg['SSIM']:>7.3f}{avg['Alex_2']:>7.3f}"
-              f"{avg['Alex_5']:>7.3f}{avg['Incep']:>7.3f}{avg['CLIP']:>7.3f}"
-              f"{avg['Eff']:>7.3f}{avg['SwAV']:>7.3f}")
+        avg = {k: sum(x[k] for x in ms) / len(ms) for k in KS}
+        print(line(f"avg_{tag}", avg))
 PYEOF
