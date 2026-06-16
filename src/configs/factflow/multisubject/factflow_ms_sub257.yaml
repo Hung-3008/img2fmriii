@@ -2,7 +2,8 @@
 # FactFlow fMRI — MULTI-SUBJECT (shared trunk + per-subject adapters)
 # ------------------------------------------------------------------------------
 # Leave-one-out: TRAIN on subjects {2, 5, 7}; subject 1 is held out for the
-# few-shot head-fit evaluation (see eval_factflow_fewshot.py).
+# few-shot adaptation (train_factflow_multisubject.py --fewshot_held_out;
+# driven by scripts/train_fewshot_1h_all.sh).
 #
 # Shared trunk = transformer blocks + t/CLIP/cross-attn embedders.
 # Per-subject  = input patch-embed + output readout (selected by subject_id).

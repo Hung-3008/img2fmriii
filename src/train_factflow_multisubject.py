@@ -43,7 +43,39 @@ def main() -> None:
                         help="Device (default: auto-detect)")
     parser.add_argument("--max_steps", type=int, default=None,
                         help="Stop after N optimizer steps (for debugging)")
+
+    # ── Few-shot mode (adapt the trunk to a HELD-OUT subject) ──────────
+    fs = parser.add_argument_group("few-shot adaptation")
+    fs.add_argument("--fewshot_held_out", type=int, default=None,
+                    help="Enable few-shot mode: held-out subject id to adapt to.")
+    fs.add_argument("--fewshot_pretrained", type=str, default=None,
+                    help="Multi-subject checkpoint to adapt from (trunk + adapters).")
+    fs.add_argument("--fewshot_hours", type=float, default=1.0,
+                    help="Hours of adaptation data (1h = 750 single-rep trials).")
+    fs.add_argument("--fewshot_val_trials", type=int, default=250,
+                    help="Disjoint single-rep trials held out for per-epoch val.")
+    fs.add_argument("--fewshot_epochs", type=int, default=80,
+                    help="Number of adaptation epochs (eval every epoch).")
+    fs.add_argument("--adapt_lr", type=float, default=3e-3)
+    fs.add_argument("--adapt_bs", type=int, default=32)
+    fs.add_argument("--adapt_wd", type=float, default=0.0)
+    fs.add_argument("--no_warm_start", action="store_true",
+                    help="Disable warm-starting the new adapter from the mean "
+                         "of the trained adapters.")
+    fs.add_argument("--noise_scale", type=float, default=0.2,
+                    help="Gaussian source scale at inference (test + val).")
+    fs.add_argument("--trials", type=int, nargs="+", default=[1, 5],
+                    help="Inference sampling repetitions for the final test eval.")
+    fs.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    if args.fewshot_held_out is not None:
+        if not args.fewshot_pretrained:
+            parser.error("--fewshot_held_out requires --fewshot_pretrained")
+        from trainer.factflow_fewshot_trainer import FactFlowFewShotTrainer
+        trainer = FactFlowFewShotTrainer(args)
+        trainer.train()
+        return
 
     trainer = FactFlowMultiSubjectTrainer(args)
     trainer.train()

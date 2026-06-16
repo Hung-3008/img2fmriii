@@ -27,7 +27,6 @@ from typing import Dict, List
 import numpy as np
 import torch
 from omegaconf import OmegaConf
-from torch import autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -36,6 +35,8 @@ from model.factflow_factory import build_models, build_transport, build_sampler
 from utils.fmri_utils import auto_size_config, get_latent_size
 from utils.logging_utils import create_logger
 from utils.metrics import compute_full_metrics
+
+from trainer.factflow_core import build_ds_kwargs, ode_sample
 
 logger = logging.getLogger(__name__)
 
@@ -146,20 +147,11 @@ class FactFlowEvaluator:
         self.n_voxels = self.n_voxels_map[subject]
         self.subject_id = self.subjects.index(subject) if self.multisubject else None
         self.test_ds = FactFlowfMRIDataset(
-            data_dir=dc["data_dir"],
-            subject=subject,
             mode="test",
-            fmri_mode=dc["fmri_mode"],
-            clip_feature=dc["clip_feature"],
-            n_voxels=self.n_voxels,
-            pad_to=dc["pad_to"],
-            fmri_channels=dc.get("fmri_channels", 1),
-            fmri_spatial=dc.get("fmri_spatial", None),
-            dino_feature=dc.get("dino_feature", None),
-            avg_reps=True,
-            roi_order=self.roi_order,
-            context_features=dc.get("context_features", None),
-            subdirs=dc.get("subdirs", None),
+            **build_ds_kwargs(
+                dc, pad_to=dc["pad_to"], roi_order=self.roi_order,
+                subject=subject, n_voxels=self.n_voxels, avg_reps=True,
+            ),
         )
         # Index that maps ROI-sorted voxels back to anatomical order (or None).
         self.unsort_idx = self.test_ds.unsort_idx if self.roi_order else None
@@ -183,15 +175,15 @@ class FactFlowEvaluator:
             contexts = [c.to(self.device) for c in batch["contexts"]]
             B = clip_pool.shape[0]
 
-            x0 = self.eval_noise_scale * torch.randn(B, *self.latent_size, device=self.device)
-            ctx = contexts if self.use_cross_attn else None
-            with autocast(**self.autocast_kwargs):
-                traj = self.sample_fn(
-                    x0, self.wrapper.dit.forward, y=clip_pool, contexts=ctx,
-                    subject_id=self.subject_id,
-                )
-            pred = traj[-1].float()
-            del traj, x0, clip_pool, contexts, ctx
+            pred = ode_sample(
+                sample_fn=self.sample_fn, wrapper=self.wrapper,
+                clip_pool=clip_pool,
+                contexts=contexts if self.use_cross_attn else None,
+                B=B, latent_size=self.latent_size, device=self.device,
+                autocast_kwargs=self.autocast_kwargs,
+                noise_scale=self.eval_noise_scale, subject_id=self.subject_id,
+            )
+            del clip_pool, contexts
 
             pred_flat = pred.reshape(B, -1)[:, : self.n_voxels].cpu().numpy()
             if self.unsort_idx is not None:
