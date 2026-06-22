@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader, Subset
 
 from data.factflow_fmri_dataset import FactFlowfMRIDataset
 from model.factflow_factory import build_models
+from model.lora import apply_lora_to_blocks
 from utils.checkpoint import save_checkpoint
 from utils.fmri_utils import create_pad_mask, get_latent_size
 from utils.logging_utils import create_logger
@@ -173,8 +174,35 @@ class FactFlowFewShotTrainer(FactFlowBase):
         if not self.args.no_warm_start:
             warm_start_adapter(self.wrapper.dit, self.held_idx)
 
+        # Optional LoRA on the last trunk block(s): lets the frozen shared trunk
+        # specialise to the held-out subject (the linear readout alone saturates
+        # with ~1h of data). Applied AFTER load + warm-start, BEFORE freezing.
+        self.use_lora = bool(getattr(self.args, "lora", False))
+        if self.use_lora:
+            n_wrapped = apply_lora_to_blocks(
+                self.wrapper.dit.blocks,
+                n_last=int(getattr(self.args, "lora_blocks", 1)),
+                rank=int(getattr(self.args, "lora_rank", 8)),
+                alpha=float(getattr(self.args, "lora_alpha", 16.0)),
+                dropout=float(getattr(self.args, "lora_dropout", 0.0)),
+            )
+            self.wrapper.to(self.device)   # new LoRA params → device
+
         trainable = freeze_to_adapter(self.wrapper, self.held_idx)
         n_params = sum(p.numel() for p in trainable)
+        if self.use_lora:
+            n_lora = 0
+            for name, p in self.wrapper.named_parameters():
+                if "lora_A" in name or "lora_B" in name:
+                    p.requires_grad = True
+                    n_lora += p.numel()
+            self.logger.info(
+                "[lora] wrapped %d Linear layers in last %d block(s) "
+                "(rank=%d alpha=%.1f) — +%.3fM trainable",
+                n_wrapped, int(getattr(self.args, "lora_blocks", 1)),
+                int(getattr(self.args, "lora_rank", 8)),
+                float(getattr(self.args, "lora_alpha", 16.0)), n_lora / 1e6,
+            )
         self.logger.info(
             "[freeze] trainable adapter params: %.3fM (held_idx=%d)",
             n_params / 1e6, self.held_idx,
@@ -201,10 +229,13 @@ class FactFlowFewShotTrainer(FactFlowBase):
         )
 
     def _adapter_state(self) -> dict:
+        # Keep the held-out readout AND (when enabled) the LoRA residuals, so the
+        # best-epoch restore captures everything that was trained.
         return copy.deepcopy({
             k: v.detach().cpu() for k, v in self.wrapper.state_dict().items()
             if f"x_embedders.{self.held_idx}." in k
             or f"final_layers.{self.held_idx}." in k
+            or "lora_A" in k or "lora_B" in k
         })
 
     # ── Train ──────────────────────────────────────────────────────────

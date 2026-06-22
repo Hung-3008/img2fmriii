@@ -66,6 +66,14 @@ def main() -> None:
                     help="Gaussian source scale at inference (test + val).")
     fs.add_argument("--trials", type=int, nargs="+", default=[1, 5],
                     help="Inference sampling repetitions for the final test eval.")
+    fs.add_argument("--lora", action="store_true",
+                    help="Also adapt the last trunk block(s) via LoRA (lets the "
+                         "frozen shared trunk specialise to the held-out subject).")
+    fs.add_argument("--lora_blocks", type=int, default=1,
+                    help="Number of trailing trunk blocks to LoRA-adapt.")
+    fs.add_argument("--lora_rank", type=int, default=8)
+    fs.add_argument("--lora_alpha", type=float, default=16.0)
+    fs.add_argument("--lora_dropout", type=float, default=0.0)
     fs.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
