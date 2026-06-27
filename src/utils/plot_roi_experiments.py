@@ -68,8 +68,7 @@ def plot_backbone_gap(gap_csv: str, out: str) -> None:
     ax1.bar(x + w / 2, clip, w, label="CLIP only (semantic)", color=C_CLIP)
     ax1.set_xticks(x)
     ax1.set_xticklabels(labels, fontsize=8)
-    ax1.set_ylabel("Encoding Pearson $r$")
-    ax1.set_title("(a) Per-stream encoding accuracy")
+    ax1.set_ylabel("Pearson correlation $r$")
     ax1.legend(fontsize=8, frameon=False, loc="upper right")
     ax1.set_ylim(0, max(dino.max(), clip.max()) * 1.18)
     ax1.grid(axis="y", ls=":", alpha=0.4)
@@ -80,7 +79,6 @@ def plot_backbone_gap(gap_csv: str, out: str) -> None:
     ax2.set_xticks(x)
     ax2.set_xticklabels(labels, fontsize=8)
     ax2.set_ylabel(r"Gap  $r_{\mathrm{DINOv2}}-r_{\mathrm{CLIP}}$")
-    ax2.set_title("(b) Structural$-$semantic crossover")
     ax2.grid(axis="y", ls=":", alpha=0.4)
     pad = (gap.max() - gap.min()) * 0.12 + 1e-3
     ax2.set_ylim(gap.min() - pad - 0.004, gap.max() + pad + 0.004)
@@ -91,7 +89,7 @@ def plot_backbone_gap(gap_csv: str, out: str) -> None:
              ha="center", va="top", color=C_NEG)
 
     fig.tight_layout()
-    fig.savefig(out, dpi=200, bbox_inches="tight")
+    fig.savefig(out, bbox_inches="tight")
     plt.close(fig)
     print(f"→ {out}")
 
@@ -124,14 +122,12 @@ def plot_ms_fidelity(ms_csv: str, out: str) -> None:
         ax.text(xi, v + 0.012, f"{frac:.0f}%", ha="center", fontsize=7, color="#222")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=8)
-    ax.set_ylabel("Encoding Pearson $r$")
-    ax.set_title("Per-stream fidelity of multi-subject StimFlow "
-                 "(mean $\\pm$ std over subjects 1/2/5/7)")
+    ax.set_ylabel("Pearson correlation $r$")
     ax.legend(fontsize=8, frameon=False, loc="upper right")
     ax.set_ylim(0, cr_mean.max() * 1.2)
     ax.grid(axis="y", ls=":", alpha=0.4)
     fig.tight_layout()
-    fig.savefig(out, dpi=200, bbox_inches="tight")
+    fig.savefig(out, bbox_inches="tight")
     plt.close(fig)
     print(f"→ {out}")
 
@@ -144,9 +140,9 @@ def main() -> None:
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
     if os.path.exists(args.gap_csv):
-        plot_backbone_gap(args.gap_csv, os.path.join(args.outdir, "roi_backbone_gap.png"))
+        plot_backbone_gap(args.gap_csv, os.path.join(args.outdir, "roi_backbone_gap.pdf"))
     if os.path.exists(args.ms_csv):
-        plot_ms_fidelity(args.ms_csv, os.path.join(args.outdir, "roi_ms_fidelity.png"))
+        plot_ms_fidelity(args.ms_csv, os.path.join(args.outdir, "roi_ms_fidelity.pdf"))
 
 
 if __name__ == "__main__":

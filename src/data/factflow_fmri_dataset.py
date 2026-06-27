@@ -45,6 +45,8 @@ class FactFlowfMRIDataset(Dataset):
         avg_reps: bool = False,
         dino_feature: str = None,
         roi_order: bool = False,
+        voxel_order: str = "default",
+        voxel_perm_seed: int = 0,
         context_features=None,
         subdirs=None,
     ):
